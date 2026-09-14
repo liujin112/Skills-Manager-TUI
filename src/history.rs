@@ -215,6 +215,11 @@ pub enum MetaChange {
     /// merge drops the old entry in favour of the target's, and moving the
     /// target's entry "back" would steal it.
     TagEntry { from: String, to: String },
+    /// Creation/removal with a snapshot to protect subsequent external edits.
+    PresetExistence {
+        preset: crate::preset::Preset,
+        present: bool,
+    },
     /// Members of one preset.
     Preset {
         name: String,
@@ -271,6 +276,10 @@ impl MetaChange {
                 before: after,
                 after: before,
             },
+            MetaChange::PresetExistence { preset, present } => MetaChange::PresetExistence {
+                preset,
+                present: !present,
+            },
             MetaChange::Preset {
                 name,
                 added,
@@ -318,6 +327,11 @@ impl MetaChange {
                 Some(s) => format!("set the source of {skill} to {}", s.summary()),
                 None => format!("clear the source of {skill}"),
             },
+            MetaChange::PresetExistence { preset, present } => format!(
+                "{} preset {}",
+                if *present { "create" } else { "remove" },
+                preset.name
+            ),
             MetaChange::Preset {
                 name,
                 added,
@@ -395,6 +409,19 @@ impl MetaChange {
                     "the source of {skill} was changed since"
                 ))),
             },
+            MetaChange::PresetExistence { preset, present } => {
+                match ws.presets.load(&preset.name)? {
+                    None if *present => Ok(Fate::Ready),
+                    None => Ok(Fate::Done),
+                    Some(current) if current == *preset => {
+                        Ok(if *present { Fate::Done } else { Fate::Ready })
+                    }
+                    Some(_) => Ok(Fate::Blocked(format!(
+                        "preset {} changed since creation",
+                        preset.name
+                    ))),
+                }
+            }
             MetaChange::Preset {
                 name,
                 added,
@@ -475,6 +502,18 @@ impl MetaChange {
                     } else {
                         "cleared"
                     }
+                ))
+            }
+            MetaChange::PresetExistence { preset, present } => {
+                if *present {
+                    ws.presets.save(preset)?;
+                } else {
+                    ws.presets.remove(&preset.name)?;
+                }
+                Ok(format!(
+                    "{} preset {}",
+                    if *present { "created" } else { "removed" },
+                    preset.name
                 ))
             }
             MetaChange::Preset {
@@ -680,6 +719,25 @@ pub fn source_edit(
         }])
     });
     Ok((message, intent))
+}
+
+/// Create a preset and record its initial contents for undo.
+pub fn preset_create(ws: &Workspace, name: &str) -> Result<(String, Option<Intent>)> {
+    if ws.presets.load(name)?.is_some() {
+        anyhow::bail!("preset {name} already exists");
+    }
+    let preset = crate::preset::Preset {
+        name: name.to_string(),
+        ..Default::default()
+    };
+    ws.presets.save(&preset)?;
+    Ok((
+        format!("created {name} — a adds skills, e sets the description"),
+        Some(Intent::Meta(vec![MetaChange::PresetExistence {
+            preset,
+            present: true,
+        }])),
+    ))
 }
 
 /// Change the membership of a preset, recording which skills went in and out.
@@ -1186,6 +1244,33 @@ mod tests {
     }
     fn install(name: &str) -> Intent {
         Intent::Install { skill: name.into() }
+    }
+
+    #[test]
+    fn preset_creation_roundtrips_and_protects_external_edits() {
+        let tmp = crate::ops::DownloadDir::new("preset-create-undo").unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let (_, intent) = preset_create(&ws, "new").unwrap();
+        let intent = intent.unwrap();
+        let Plan::Write { apply, .. } = undo_plan(&ws, &ws.scan().unwrap(), &intent).unwrap()
+        else {
+            panic!("undo creation");
+        };
+        apply.apply(&ws).unwrap();
+        assert!(ws.presets.load("new").unwrap().is_none());
+        let Plan::Write { apply, .. } = redo_plan(&ws, &ws.scan().unwrap(), &intent).unwrap()
+        else {
+            panic!("redo creation");
+        };
+        apply.apply(&ws).unwrap();
+        let mut preset = ws.presets.load("new").unwrap().unwrap();
+        preset.description = Some("external change".into());
+        ws.presets.save(&preset).unwrap();
+        assert!(matches!(
+            undo_plan(&ws, &ws.scan().unwrap(), &intent).unwrap(),
+            Plan::Nothing(_)
+        ));
+        assert!(ws.presets.load("new").unwrap().is_some());
     }
 
     #[test]

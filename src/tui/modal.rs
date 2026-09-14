@@ -53,6 +53,7 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
         scroll: u16,
+        return_to: Option<Box<Modal>>,
     },
     /// Preview of link changes with Apply / Cancel.
     Confirm {
@@ -136,6 +137,7 @@ impl Modal {
             title: title.into(),
             lines,
             scroll: 0,
+            return_to: None,
         }
     }
     pub fn confirm(title: String, actions: Vec<deploy::Action>) -> Self {
@@ -571,7 +573,16 @@ impl Modal {
             Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
             Modal::DeployTargets(p) => p.hints(),
-            Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
+            Modal::Message {
+                return_to: Some(_), ..
+            } => &[
+                ("↑↓", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("Esc", "back to selection"),
+            ],
+            Modal::Help { .. } | Modal::Message { .. } => {
+                &[("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("Esc", "close")]
+            }
             Modal::Confirm { btn: 0, .. } | Modal::ConfirmWrite { btn: 0, .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
@@ -1119,12 +1130,20 @@ impl Modal {
                 title,
                 lines,
                 scroll,
+                return_to,
             } => {
                 let r = centered(area, 84, lines.len() as u16 + 4);
                 f.render_widget(Clear, r);
                 let mut ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
                 ls.push(Line::from(""));
-                ls.push(Line::from(Span::styled("press any key", th.dim())));
+                ls.push(Line::from(Span::styled(
+                    if return_to.is_some() {
+                        "Esc returns to your selection; fix the error and apply again."
+                    } else {
+                        "↑↓ scroll · PgUp/PgDn page · Esc close"
+                    },
+                    th.dim(),
+                )));
                 f.render_widget(
                     Paragraph::new(ls)
                         .wrap(Wrap { trim: false })
@@ -1533,18 +1552,7 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             }
             let land_on = name.clone();
             vec![
-                Action::Write(Box::new(move |ws| {
-                    if ws.presets.load(&name)?.is_some() {
-                        anyhow::bail!("preset {name} already exists");
-                    }
-                    ws.presets.save(&skills::preset::Preset {
-                        name: name.clone(),
-                        ..Default::default()
-                    })?;
-                    Ok(format!(
-                        "created {name} — a adds skills, e sets the description"
-                    ))
-                })),
+                Action::WriteMeta(Box::new(move |ws| history::preset_create(ws, &name))),
                 Action::SelectPreset(land_on),
             ]
         }

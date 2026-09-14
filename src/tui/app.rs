@@ -477,15 +477,27 @@ impl App {
         match out {
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
-                if self.batch_modal_owned && matches!(self.modal, Some(Modal::Batch(_))) {
-                    self.modal = None;
-                }
+                let return_to = if self.batch_modal_owned
+                    && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
+                {
+                    if let Some(Modal::Batch(batch)) = self.modal.as_mut() {
+                        batch.set_busy(false);
+                    }
+                    self.modal.take().map(Box::new)
+                } else {
+                    None
+                };
                 self.batch_modal_owned = false;
                 if let Some(pending) = outcome.conflict {
                     return vec![Action::OpenModal(Box::new(Modal::DeploymentChoices(
                         Box::new(super::name_choices::NameChoices::new(pending)),
                     )))];
                 }
+                let undo_hint = if outcome.intent.is_some() {
+                    " · Ctrl+Z undo"
+                } else {
+                    ""
+                };
                 if let Some(intent) = outcome.intent {
                     self.history.record(intent);
                 }
@@ -494,14 +506,10 @@ impl App {
                 self.presets.batch_finished(&outcome.failed);
                 self.repos.batch_finished(&outcome.failed);
                 if outcome.errors.is_empty() {
-                    self.toast(outcome.message, Level::Ok);
+                    self.toast(format!("{}{undo_hint}", outcome.message), Level::Ok);
                 } else {
                     self.toast(
-                        format!(
-                            "{}; {} skills need attention",
-                            outcome.message,
-                            outcome.failed.len()
-                        ),
+                        format!("{}; errors: {}", outcome.message, outcome.errors.len()),
                         Level::Error,
                     );
                 }
@@ -509,10 +517,12 @@ impl App {
                 if outcome.errors.is_empty() {
                     vec![]
                 } else {
-                    vec![Action::OpenModal(Box::new(Modal::message(
-                        "Operation needs attention",
-                        outcome.errors,
-                    )))]
+                    vec![Action::OpenModal(Box::new(Modal::Message {
+                        title: "Operation needs attention".into(),
+                        lines: outcome.errors,
+                        scroll: 0,
+                        return_to,
+                    }))]
                 }
             }
 
@@ -673,7 +683,8 @@ impl App {
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
         if self.quit_prompt.is_some()
-            || (self.batch_running && matches!(self.modal, Some(Modal::Batch(_))))
+            || (self.batch_running
+                && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_))))
         {
             return vec![];
         }
@@ -713,7 +724,9 @@ impl App {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
         }
-        if self.batch_running && matches!(self.modal, Some(Modal::Batch(_))) {
+        if self.batch_running
+            && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
+        {
             return vec![];
         }
         let ctx = Ctx {
@@ -815,7 +828,9 @@ impl App {
             }
             return vec![];
         }
-        if self.batch_running && matches!(self.modal, Some(Modal::Batch(_))) {
+        if self.batch_running
+            && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
+        {
             return vec![];
         }
         let ctx = Ctx {
@@ -908,7 +923,12 @@ impl App {
             Action::Rescan => self.rescan(),
             Action::Spawn(task) => self.spawn(task),
             Action::OpenModal(m) => self.modal = Some(*m),
-            Action::CloseModal => self.modal = None,
+            Action::CloseModal => {
+                self.modal = match self.modal.take() {
+                    Some(Modal::Message { return_to, .. }) => return_to.map(|modal| *modal),
+                    _ => None,
+                };
+            }
             Action::SubmitInput(actions) => {
                 let prompt = self.modal.take();
                 for action in actions {
@@ -1051,7 +1071,12 @@ impl App {
             Action::WriteMeta(f) => {
                 match f(&self.ws) {
                     Ok((msg, intent)) => {
-                        self.toast(msg, Level::Ok);
+                        let undo_hint = if intent.is_some() {
+                            " · Ctrl+Z undo"
+                        } else {
+                            ""
+                        };
+                        self.toast(format!("{msg}{undo_hint}"), Level::Ok);
                         // A write that left the files as they were is not a step.
                         if let Some(intent) = intent {
                             self.history.record(intent);
@@ -1180,7 +1205,8 @@ impl App {
             return;
         }
         self.batch_running = true;
-        self.batch_modal_owned = matches!(self.modal, Some(Modal::Batch(_)));
+        self.batch_modal_owned =
+            matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)));
         self.next_task_id += 1;
         let id = self.next_task_id;
         self.tasks_running += 1;
@@ -1474,6 +1500,92 @@ pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn member_picker_apply_saves_once_and_returns_to_results() {
+        let tmp = skills::ops::DownloadDir::new("member-picker-finish").unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+        std::fs::write(
+            tmp.path().join("alpha/SKILL.md"),
+            "---\nname: alpha\n---\nBody",
+        )
+        .unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        skills::history::preset_create(&ws, "example").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            theme: &app.theme,
+        };
+        let mut picker = SearchView::preset_members("example", &ctx);
+        picker.focus_list();
+        picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &ctx);
+        app.modal = Some(Modal::PresetSkills(Box::new(picker)));
+        // Force a real filesystem error after the selection has been staged.
+        let path = app.ws.presets.path("example");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        while app.batch_running || app.tasks_running > 0 {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Message {
+                return_to: Some(_),
+                ..
+            })
+        ));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(app.modal, Some(Modal::PresetSkills(_))));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        // Retry without selecting again: the original staged selection survives.
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.batch_running);
+        let task = app.next_task_id;
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.next_task_id, task,
+            "repeated apply must not submit twice"
+        );
+        while app.batch_running || app.tasks_running > 0 {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        assert!(app.modal.is_none(), "successful apply finishes editing");
+        assert_eq!(
+            app.ws.presets.load("example").unwrap().unwrap().skills,
+            ["alpha"]
+        );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Ctrl+Z undo"));
+    }
 
     #[test]
     fn confirmation_ignores_modified_keys_and_help_pages_without_closing() {
