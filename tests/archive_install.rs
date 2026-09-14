@@ -59,6 +59,8 @@ impl HttpArchive {
     }
 
     fn respond(mut stream: TcpStream, content: &RwLock<Vec<u8>>, requests: &Mutex<Vec<String>>) {
+        // macOS inherits the listener's nonblocking mode; request reads need to wait for data.
+        stream.set_nonblocking(false).unwrap();
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
         let mut request = Vec::new();
