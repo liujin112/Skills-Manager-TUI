@@ -626,10 +626,8 @@ impl PresetStatus {
         }
     }
 
-    /// How far along a preset is that is neither on nor off, `5/12`. All the
-    /// way on or all the way off is already told by the colour and the mark, so
-    /// a count there says nothing and only makes the pills harder to read.
-    /// A preset with nothing deployable is worth a word of its own.
+    /// Optional compact status text: a fraction for partial coverage, `empty`
+    /// for no deployable members, and no suffix for active/inactive states.
     pub fn progress(&self) -> Option<String> {
         match self.state() {
             PresetState::Partial => Some(format!("{}/{}", self.installed, self.total)),
@@ -639,8 +637,8 @@ impl PresetStatus {
     }
 }
 
-/// Count how much of `preset` is deployed across `scope`. Only members that
-/// exist in the skills root count; a member whose directory is gone is listed
+/// Count deployed member/agent pairs across the explicit `scope`. Only members
+/// present in the skills root count; a member whose directory is gone is listed
 /// in `absent` and excluded from the total, so a preset referring to a deleted
 /// skill can still read as complete.
 pub fn preset_status(snap: &Snapshot, preset: &Preset, scope: &[String]) -> PresetStatus {

@@ -560,8 +560,8 @@ impl MetaChange {
     }
 }
 
-/// The tags a skill carries now, or `None` if neither its metadata nor its
-/// directory is there any more.
+/// Read current tag membership from configuration. A missing directory still
+/// counts as a target while tags reference it, so those references remain undoable.
 fn current_tags(ws: &Workspace, skill: &str) -> Result<Option<Vec<String>>> {
     let tags = Config::load(&ws.root)?.skill_tags(skill);
     Ok((ws.skill_path(skill).is_dir() || !tags.is_empty()).then_some(tags))

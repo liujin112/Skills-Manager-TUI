@@ -695,7 +695,8 @@ pub fn location_label(agent: &AgentConfig, project: &Path) -> String {
     }
 }
 
-/// Discover products, while keeping upstream per-product physical scope expansion.
+/// Detect installed agent products and add missing defaults to this workspace.
+/// Explicit agent configuration is preserved; scope paths are resolved separately.
 pub fn discover(ws: &mut Workspace, project: &Path) -> Result<()> {
     let dirs = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())

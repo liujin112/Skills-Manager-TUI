@@ -207,14 +207,8 @@ impl Modal {
         }
     }
 
-    /// Edit what a preset is for. A single-line prompt, prefilled, rather
-    /// than `$EDITOR` or editing on the card: a preset description is one
-    /// sentence, like the description in a SKILL.md, and leaving the screen
-    /// for an editor is a heavy round trip for that; editing inside a grid
-    /// cell that is laid out again every frame is fragile; and create, tags
-    /// and install already ask through this same box, so it is the one the
-    /// user knows. Prefilled because a description is usually corrected, not
-    /// replaced, and clearing the field is how it is removed.
+    /// Edit a preset description in a prefilled single-line prompt. Submitting
+    /// an empty value clears the description.
     pub fn preset_description(name: &str, current: Option<&str>) -> Self {
         Modal::Input {
             title: format!(" description of {name} "),
@@ -348,17 +342,10 @@ impl Modal {
         }
     }
 
-    /// Take a directory the agent has of its own into the root. What follows
-    /// is what `install::adopt` does on that branch: the directory moves into
-    /// the root, the agent is left a link to it there, and metadata is created
-    /// with the content as it stands for its baseline.
-    ///
-    /// Not logged. Taking it back would mean moving the directory out of the
-    /// root, deleting the link the agent now reads through and recreating a
-    /// real directory in its place — three writes on a live path with nothing
-    /// on disk to re-derive them from. Nor is it an `Intent::OneWay`: nothing
-    /// consumes those yet, and one on top of the stack would only refuse every
-    /// undo and hide the reversible steps beneath it.
+    /// Adopt an agent-owned directory into the library and leave a link at its
+    /// original location. `install::adopt` creates the library metadata/baseline.
+    /// Session undo does not cover adoption: restoring the original directory
+    /// and metadata requires a reverse plan that this action does not record.
     pub fn adopt(agent: &str, name: &str, path: PathBuf) -> Self {
         let a = agent.to_string();
         Self::confirm_write(
@@ -1545,10 +1532,7 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 Err(e) => vec![Action::Error(format!("{e:#}"))],
             }
         }
-        // Name only. What comes next — members, a description — is done on
-        // the card the new preset lands on, and the notice says which keys;
-        // a second prompt here would be one more thing to dismiss before
-        // seeing the result.
+        // Create the empty definition, then select it for member/description editing.
         InputKind::PresetName => {
             let name = value.trim().to_string();
             if name.is_empty() {

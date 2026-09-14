@@ -13,9 +13,8 @@ pub fn cols_for(width: u16, ctx: &Ctx) -> usize {
 }
 
 /// Draw the frame of one card and hand back the padded area inside it.
-/// `on` is the selection; `focused` says whether that selection is the one the
-/// keyboard is on: cyan marks focus, while a neutral bold frame remembers an
-/// inactive selection.
+/// `on` marks selection; `focused` gives it the theme's accent border.
+/// An inactive selection retains a neutral bold border.
 pub fn frame(f: &mut Frame, cell: Rect, on: bool, focused: bool, th: &Theme) -> Rect {
     draw_frame(f, cell, Borders::ALL, frame_style(on, focused, th))
 }

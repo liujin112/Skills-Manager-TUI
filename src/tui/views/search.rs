@@ -929,9 +929,6 @@ impl SearchView {
         let th = &ctx.settings.theme;
         let searching = !self.input.value().trim().is_empty()
             && !Query::parse(self.input.value()).text.is_empty();
-        // The layout decides the shape too: a grid is made of cards, and the
-        // two splits are lists beside a preview. One column of framed cards
-        // would be a list wearing frames, which is the worst of both.
         let legend = vec![Span::raw(
             match self.panel.as_ref().or(self.scope.as_ref()) {
                 Some((_, title)) => format!(" {title} "),
@@ -1346,8 +1343,8 @@ impl View for SearchView {
                 }
                 KeyCode::Home | KeyCode::Char('g') => self.grid.first(self.hits.len()),
                 KeyCode::End | KeyCode::Char('G') => self.grid.last(self.hits.len()),
-                // Along a row when there is a row to walk; otherwise the old
-                // meaning, which is to step across into the preview.
+                // In multi-column grids, horizontal keys select neighbors;
+                // in a single column, Right opens the selected skill's preview.
                 KeyCode::Right | KeyCode::Char('l') if self.grid.cols() > 1 => self.move_sel(1),
                 KeyCode::Left | KeyCode::Char('h') if self.grid.cols() > 1 => self.move_sel(-1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_preview(ctx),

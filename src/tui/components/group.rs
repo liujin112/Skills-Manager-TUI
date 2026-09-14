@@ -196,9 +196,7 @@ impl<'a> Pill<'a> {
     }
 }
 
-/// Tags as capsules, as many as fit in `max_w`, then a count for the rest. A
-/// filled shape with round ends is told apart from the text around it at a
-/// glance, which a coloured word is not.
+/// Fit whole tag pills in `max_w`, reserving space for a remaining-tag count.
 pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>> {
     if !ctx.settings.tags_enabled {
         return vec![];

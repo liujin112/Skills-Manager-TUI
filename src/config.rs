@@ -30,21 +30,18 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
-/// How the result area is arranged. Both settings can be flipped at runtime for
-/// the session; only `config.toml` decides what the next start looks like.
+/// Skill result density. The file supplies the startup default; page-scoped
+/// session choices override it until the process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UiLayout {
-    /// Results across the full width in as many columns of framed cards as
-    /// fit; the preview opens over them when asked for. The default: cards
-    /// only earn their frames once there are several to a row.
+    /// Framed cards in as many columns as fit; previews open as overlays.
     #[default]
     Grid,
-    /// A list beside an always-open preview, three lines a skill: identity,
-    /// description, tags. The card's content without the frame.
+    /// Four unframed lines per skill: identity, two description lines, and
+    /// source/tags. Search panels show an adjacent preview; Agents uses overlays.
     List,
-    /// The same split with one line a skill (two while searching), for when
-    /// the names are what matters.
+    /// One identity row per skill, with an optional search-excerpt row.
     #[serde(alias = "split")]
     Compact,
 }

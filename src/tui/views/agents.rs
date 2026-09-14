@@ -1,11 +1,8 @@
-//! Agents tab: what a given agent actually has, and the presets that fill it.
+//! Agent inventory and preset deployment for the selected Global/Local scope.
 //!
-//! The page always looks at exactly one agent. Rolling several together needs
-//! a preset to be counted against a set of agents rather than one, which reads
-//! as a fraction of a fraction and answers nothing an agent's own page does not.
-//! Entries are split by who owns them: skills linked from the central root are
-//! ours to add and remove, anything else the agent brought itself is shown but
-//! never written to.
+//! Coverage is calculated from current entries in that scope. Ordinary deployment
+//! changes managed links; agent-owned directories require an explicit adopt,
+//! relink or conflict-resolution action with its own validation.
 
 use super::matrix::Matrix;
 use super::preview::Overlay;
@@ -34,9 +31,8 @@ use skills::preset::Preset;
 
 use skills::reconcile::{AgentDirMode, EntryState};
 
-/// The three bands of the page, top to bottom. Arrows move between them, so
-/// there is never a control the keyboard cannot reach. `[` and `]` still switch
-/// agent from anywhere, since that is the frame everything else sits in.
+/// Keyboard focus follows the four page bands. `[` and `]` switch agents
+/// without requiring focus to return to the agent selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Agents,
@@ -45,19 +41,15 @@ enum Focus {
     Entries,
 }
 
-/// One entry of the agent's directory: a skill name and what shape it is in.
-/// The two groups used to carry captions of their own; each card now says which
-/// group it is in, which is what let the whole list become a grid.
+/// One inventory entry, including its filesystem state and managed-link status.
 struct Row<'a> {
     name: &'a str,
     state: Option<&'a EntryState>,
     linked: bool,
 }
 
-/// Which repairs an entry admits. Kept one per row from the last refresh so
-/// the footer can be filtered without a context in hand, the way the Health
-/// page keeps its own. The two never hold at once: an entry is either a link
-/// or a directory.
+/// Actions available for an entry's observed filesystem state. Cached for the
+/// footer, which has no `Ctx`; each write must still validate its target again.
 #[derive(Debug, Clone, Copy, Default)]
 struct Caps {
     /// A link with nothing behind it; removing it loses nothing.
@@ -674,9 +666,8 @@ impl AgentsView {
             plan_preset_deactivate(ctx.ws, ctx.snap, preset, &scope)
         };
         match plan {
-            // A pill is a switch, and a switch that stops to ask is a bad
-            // switch. What happened is said in the notification, and undo takes
-            // it back; a dialog here would only be in the way of trying things.
+            // Apply the explicit toggle immediately; successful link changes
+            // produce a notification and a session undo entry.
             Ok(actions) => vec![Action::ApplyLinks {
                 title: format!(
                     "{} {} · {}",
@@ -977,8 +968,6 @@ impl AgentsView {
                     self.activate(ctx, on)
                 }
                 KeyCode::Char('x') | KeyCode::Backspace => self.activate(ctx, false),
-                // Focus follows the arrows rather than a separate key, so there
-                // is nothing invisible to remember.
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.set_focus(Focus::Entries);
                     let rows = self.rows(ctx);
@@ -1215,8 +1204,6 @@ impl AgentsView {
         }
         let rows = [interiors[0], interiors[1], preset_rows[2], groups[3]];
 
-        // Agent picker. Big enough to aim at, and it takes the keyboard like
-        // anything else on the page rather than hiding behind a bracket key.
         self.scope_rects.clear();
         let mut x = rows[0].x + 1;
         if ctx.ws.config.agents.is_empty() {
@@ -1613,9 +1600,6 @@ impl AgentsView {
             f.render_widget(Paragraph::new(Line::from(pills)), rows[2]);
         }
 
-        // The whole width goes to the entries. A detail pane here only ever had
-        // the selected preset's members to show, which the pills already count
-        // and the list below already spells out one skill at a time.
         let left = rows[3];
         self.left = left;
         let rows_data = self.rows(ctx);
@@ -1977,8 +1961,6 @@ impl AgentsView {
     }
 }
 
-/// The bright twin of a pill colour, used for the pill holding the keyboard.
-/// Anything outside the basic palette is left alone; the bold text still marks it.
 impl AgentsView {
     fn refresh_scope(&mut self, ctx: &Ctx) {
         if self.destinations.is_empty() {

@@ -155,8 +155,7 @@ impl Prompt {
             ..inner
         };
         p.input.render(f, field, true, placeholder, th);
-        // The swatch shows the pill as it would look, which is the only way
-        // to judge a colour, and says so when the text is not one.
+        // Preview with the shared pill renderer, including its contrast rules.
         let swatch = Rect {
             y: inner.y + 1,
             height: 1,

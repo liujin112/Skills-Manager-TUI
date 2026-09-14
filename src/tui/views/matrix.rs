@@ -1,10 +1,8 @@
 //! The preset × agent table, as a window over a page.
 //!
-//! The Presets page defines what a preset holds and the Agents page switches
-//! presets for one agent at a time; neither shows the whole picture at once.
-//! This table does, in one row per preset, and each cell is the same switch
-//! the pills are. It is a window rather than a tab because it adds nothing to
-//! define or configure — it only lets the switches be seen and thrown together.
+//! Rows are presets and columns are agents. Cell and row actions apply preset
+//! membership to the selected destinations using the same deployment planners
+//! as the Agents page; coverage comes from the supplied inventory.
 
 use crate::tui::app::{Action, Ctx};
 use crate::tui::widgets::OverlayClear as Clear;

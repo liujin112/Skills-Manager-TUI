@@ -140,7 +140,7 @@ pub fn accept(ws: &Workspace, key: &str) -> Result<SkillMeta> {
 }
 
 /// Complete an externally performed move: preserve metadata, repair links that
-/// pointed exactly at the old path, and update preset/installation references.
+/// pointed exactly at the old path, and update tag and preset references.
 /// Content matching is only a suggestion; the caller explicitly chooses the pair.
 pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
     require_key(old)?;

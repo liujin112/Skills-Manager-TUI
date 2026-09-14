@@ -251,8 +251,7 @@ impl TagsView {
                     ))];
                 };
                 self.prompt = None;
-                // Not a history step: the log knows tags on skills, not the
-                // config, and a colour is cheap to set back by hand.
+                // Tag colour changes are not recorded in session undo.
                 vec![Action::Write(Box::new(move |ws| {
                     Config::set_tag_color(&ws.root, &tag, color.as_deref())?;
                     Ok(match color {

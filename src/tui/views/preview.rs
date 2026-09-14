@@ -1,9 +1,7 @@
 //! The skill preview: the full record and the rendered SKILL.md.
 //!
-//! The search page shows it in a pane; every other page shows it in an
-//! overlay on top of what is already there. Opening a skill from a preset or
-//! an agent's list used to jump to the search tab, which lost the place the
-//! user was working in; a window over the page keeps it.
+//! Search panels can embed a preview beside results. Overlays retain the
+//! originating page's query, selection and scroll position when closed.
 
 use crate::tui::app::Ctx;
 use crate::tui::components::skill::{status_glyph, status_text};
