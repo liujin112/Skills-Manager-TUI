@@ -256,7 +256,7 @@ impl Matrix {
                 };
                 let mut cell = Style::default().patch(style);
                 if ri == self.row && ci == self.col {
-                    cell = cell.bg(th.selection_bg).add_modifier(Modifier::BOLD);
+                    cell = cell.patch(th.selected());
                 }
                 let x =
                     inner.x + name_w as u16 + 2 + ((ci - cols.start) as u16) * (col_w as u16 + 2);

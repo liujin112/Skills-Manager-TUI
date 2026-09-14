@@ -12,11 +12,11 @@ use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::modal::Modal;
 use crate::tui::widgets::OverlayClear as Clear;
-use crate::tui::widgets::{CardGrid, Input, ListNav, ScrollTrack, fit, pad, width};
+use crate::tui::widgets::{CardGrid, Input, ListNav, ScrollTrack};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -101,7 +101,7 @@ enum Ask {
 /// `Modal` because the modal's prompts each submit to one fixed action, and
 /// this page needs two of its own. Typing filters the rows; for a colour the
 /// text is also taken as it stands when it names one.
-struct Prompt {
+pub(super) struct Prompt {
     ask: Ask,
     tag: String,
     input: Input,
@@ -113,6 +113,187 @@ struct Prompt {
 }
 
 impl Prompt {
+    pub(super) fn for_color(name: &str, current: Option<&str>) -> Self {
+        let mut choices: Vec<String> = PALETTE.iter().map(|c| c.to_string()).collect();
+        choices.push(NO_COLOR.into());
+        if let Some(c) = current
+            && !choices.iter().any(|s| s == c)
+        {
+            choices.insert(0, c.to_string());
+        }
+        let selected = choices
+            .iter()
+            .position(|s| s == current.unwrap_or(NO_COLOR));
+        let mut prompt = Self::new(Ask::Color, name, choices);
+        prompt.list.state.select(selected);
+        prompt
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.tag
+    }
+
+    pub(super) fn paste(&mut self, text: &str) -> Vec<Action> {
+        match self.input.paste(text) {
+            Ok(true) => {
+                self.refilter();
+                vec![]
+            }
+            Ok(false) => vec![],
+            Err(e) => vec![Action::Error(e.into())],
+        }
+    }
+
+    // Some(true) submits, Some(false) dismisses; None keeps the chooser open.
+    pub(super) fn key(&mut self, k: KeyEvent) -> Option<bool> {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => return Some(false),
+            KeyCode::Enter => return Some(true),
+            KeyCode::Down => self.list.move_by(1, self.shown.len()),
+            KeyCode::Up => self.list.move_by(-1, self.shown.len()),
+            KeyCode::Char('n') if ctrl => self.list.move_by(1, self.shown.len()),
+            KeyCode::Char('p') if ctrl => self.list.move_by(-1, self.shown.len()),
+            KeyCode::PageUp => self.list.first(self.shown.len()),
+            KeyCode::PageDown => self.list.last(self.shown.len()),
+            _ => {
+                if self.input.handle_key(k) {
+                    self.refilter();
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn mouse(&mut self, m: MouseEvent) -> Option<bool> {
+        match m.kind {
+            MouseEventKind::ScrollDown => self.list.move_by(1, self.shown.len()),
+            MouseEventKind::ScrollUp => self.list.move_by(-1, self.shown.len()),
+            MouseEventKind::Down(MouseButton::Left)
+                if !self.rect.contains((m.column, m.row).into()) =>
+            {
+                return Some(false);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, true)) = self.list.click(m.row, self.shown.len()) {
+                    return Some(true);
+                }
+                self.input.click(m.column);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub(super) fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let th = ctx.theme;
+        let p = self;
+        let (title, placeholder) = match p.ask {
+            Ask::Merge => (format!(" merge {} into ", p.tag), "type to filter…"),
+            Ask::Color => (format!(" colour of {} ", p.tag), "a name, or #rrggbb"),
+        };
+        // Room for the field, a swatch line, the rows, and the frame.
+        let want = p.shown.len() as u16 + 6;
+        let w = 56.min(area.width.saturating_sub(2));
+        let h = want.max(8).min(area.height.saturating_sub(2));
+        let rect = Rect::new(
+            area.x + (area.width - w) / 2,
+            area.y + (area.height - h) / 2,
+            w,
+            h,
+        );
+        p.rect = rect;
+        f.render_widget(Clear, rect);
+        let block = th.block(title, true);
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        if inner.height < 4 || inner.width < 4 {
+            p.list.rows = Rect::default();
+            f.render_widget(Paragraph::new("Resize · Esc closes").style(th.dim()), inner);
+            return;
+        }
+        let field = Rect {
+            x: inner.x + 1,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+            ..inner
+        };
+        p.input.render(f, field, true, placeholder, th);
+        // The swatch shows the pill as it would look, which is the only way
+        // to judge a colour, and says so when the text is not one.
+        let swatch = Rect {
+            y: inner.y + 1,
+            height: 1,
+            ..field
+        };
+        let mut preview = vec![Span::raw("  ")];
+        match p.ask {
+            Ask::Merge => {
+                preview.extend(
+                    cards::Pill::new(&p.tag, tag_fill(&p.tag, ctx)).render(ctx, usize::MAX),
+                );
+                preview.push(Span::styled(" → ", th.dim()));
+                match p.chosen() {
+                    Some(into) => preview.extend(
+                        cards::Pill::new(into, tag_fill(into, ctx)).render(ctx, usize::MAX),
+                    ),
+                    None => preview.push(Span::styled("nothing matches", th.dim())),
+                }
+            }
+            Ask::Color => match p.color() {
+                Some(Some(c)) => {
+                    preview.extend(cards::Pill::new(&p.tag, c).render(ctx, usize::MAX))
+                }
+                Some(None) => {
+                    preview.extend(cards::Pill::new(&p.tag, th.tag).render(ctx, usize::MAX))
+                }
+                None => preview.push(Span::styled("not a colour", th.warn())),
+            },
+        }
+        f.render_widget(Paragraph::new(Line::from(preview)), swatch);
+        let list_area = Rect {
+            y: inner.y + 3,
+            height: inner.height.saturating_sub(3),
+            ..inner
+        };
+        p.list.rows = list_area;
+        let rows: Vec<ListItem> = p
+            .shown
+            .iter()
+            .map(|&i| {
+                let name = &p.choices[i];
+                let spans = match p.ask {
+                    Ask::Merge => {
+                        cards::Pill::new(name, tag_fill(name, ctx)).render(ctx, usize::MAX)
+                    }
+                    Ask::Color if name == NO_COLOR => {
+                        vec![Span::styled("none — the default", th.dim())]
+                    }
+                    Ask::Color => {
+                        let fill = name.parse::<Color>().unwrap_or(th.tag);
+                        let mut s = cards::Pill::new(&p.tag, fill).render(ctx, usize::MAX);
+                        s.push(Span::styled(format!("  {name}"), th.dim()));
+                        s
+                    }
+                };
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        f.render_stateful_widget(
+            List::new(rows)
+                .highlight_style(th.selected())
+                .highlight_symbol("▸ "),
+            list_area,
+            &mut p.list.state,
+        );
+        if p.shown.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled("nothing matches", th.dim())),
+                list_area,
+            );
+        }
+    }
+
     fn new(ask: Ask, tag: &str, choices: Vec<String>) -> Self {
         let shown: Vec<usize> = (0..choices.len()).collect();
         let mut list = ListNav::default();
@@ -158,7 +339,7 @@ impl Prompt {
     }
 
     /// The text written to the config for `color()`, as typed or as listed.
-    fn color_text(&self) -> Option<Option<String>> {
+    pub(super) fn color_text(&self) -> Option<Option<String>> {
         let typed = self.input.value().trim();
         if typed.parse::<Color>().is_ok() {
             return Some(Some(typed.to_string()));
@@ -359,13 +540,17 @@ impl TagsView {
         vec![]
     }
 
-    fn ask_color(&mut self) -> Vec<Action> {
+    fn ask_color(&mut self, ctx: &Ctx) -> Vec<Action> {
         let Some(tag) = self.actionable_tag() else {
             return vec![];
         };
-        let mut choices: Vec<String> = PALETTE.iter().map(|c| c.to_string()).collect();
-        choices.push(NO_COLOR.into());
-        self.prompt = Some(Prompt::new(Ask::Color, &tag, choices));
+        let config = &self.fresh.as_ref().unwrap_or(ctx.ws).config;
+        let current = config
+            .tags
+            .iter()
+            .find(|t| t.name == tag)
+            .and_then(|t| t.color.as_deref());
+        self.prompt = Some(Prompt::for_color(&tag, current));
         vec![]
     }
 
@@ -410,53 +595,19 @@ impl TagsView {
     }
 
     fn prompt_key(&mut self, k: KeyEvent) -> Vec<Action> {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let Some(p) = self.prompt.as_mut() else {
-            return vec![];
-        };
-        match k.code {
-            KeyCode::Esc => {
-                self.prompt = None;
-            }
-            KeyCode::Enter => return self.submit_prompt(),
-            KeyCode::Down => p.list.move_by(1, p.shown.len()),
-            KeyCode::Up => p.list.move_by(-1, p.shown.len()),
-            KeyCode::Char('n') if ctrl => p.list.move_by(1, p.shown.len()),
-            KeyCode::Char('p') if ctrl => p.list.move_by(-1, p.shown.len()),
-            KeyCode::PageUp => p.list.first(p.shown.len()),
-            KeyCode::PageDown => p.list.last(p.shown.len()),
-            _ => {
-                if p.input.handle_key(k) {
-                    p.refilter();
-                }
-            }
+        match self.prompt.as_mut().and_then(|p| p.key(k)) {
+            Some(true) => return self.submit_prompt(),
+            Some(false) => self.prompt = None,
+            None => {}
         }
         vec![]
     }
 
-    /// Mouse while the prompt is up: a click outside closes it, a click on a
-    /// row picks it, and anything else stays with the prompt so the page does
-    /// not react to a click it cannot see.
     fn prompt_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
-        let Some(p) = self.prompt.as_mut() else {
-            return vec![];
-        };
-        let at = (m.column, m.row).into();
-        match m.kind {
-            MouseEventKind::ScrollDown => p.list.move_by(1, p.shown.len()),
-            MouseEventKind::ScrollUp => p.list.move_by(-1, p.shown.len()),
-            MouseEventKind::Down(MouseButton::Left) if !p.rect.contains(at) => {
-                self.prompt = None;
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, double)) = p.list.click(m.row, p.shown.len())
-                    && double
-                {
-                    return self.submit_prompt();
-                }
-                p.input.click(m.column);
-            }
-            _ => {}
+        match self.prompt.as_mut().and_then(|p| p.mouse(m)) {
+            Some(true) => return self.submit_prompt(),
+            Some(false) => self.prompt = None,
+            None => {}
         }
         vec![]
     }
@@ -471,61 +622,46 @@ impl TagsView {
             width: inner.width.saturating_sub(1),
             ..inner
         };
-        self.list.layout(content, 1, 1, 0, self.rows.len());
+        let descriptions: Vec<_> = self
+            .rows
+            .iter()
+            .map(|(tag, _)| {
+                ctx.ws
+                    .config
+                    .tags
+                    .iter()
+                    .find(|t| &t.name == tag)
+                    .and_then(|t| t.description.as_deref())
+            })
+            .collect();
+        self.list.layout_heights(
+            content,
+            descriptions
+                .iter()
+                .map(|d| 3 + u16::from(d.is_some_and(|s| !s.trim().is_empty())))
+                .collect(),
+        );
         let selected = self.list.selected();
-        let w = content.width as usize;
         for i in self.list.visible() {
             let Some(cell) = self.list.cell(i) else {
                 continue;
             };
             let (tag, count) = &self.rows[i];
             let on = selected == Some(i);
-            let count = count.to_string();
-            let count_w = width(&count).max(3);
-            // The count sits at the right edge; whatever is left after the
-            // marker and the count goes to the name and the description.
-            let body_w = w.saturating_sub(2 + count_w + 1);
-            let mut spans = vec![Span::styled(if on { "▸ " } else { "  " }, th.accent())];
-            let mut used = 0;
-            if tag == UNTAGGED {
-                let s = fit(UNTAGGED, body_w);
-                used += width(&s);
-                spans.push(Span::raw(s));
+            let inner = if cell.height < 3 {
+                cell
             } else {
-                let marker = fit("● ", body_w);
-                used += width(&marker);
-                spans.push(Span::styled(
-                    marker,
-                    Style::default().fg(tag_fill(tag, ctx)),
-                ));
-                let name = fit(tag, body_w.saturating_sub(used));
-                used += width(&name);
-                spans.push(Span::raw(name));
-                let desc = ctx
-                    .ws
-                    .config
-                    .tags
-                    .iter()
-                    .find(|t| &t.name == tag)
-                    .and_then(|t| t.description.as_deref())
-                    .unwrap_or("");
-                if !desc.is_empty() && used + 3 < body_w {
-                    let d = fit(desc, body_w - used - 2);
-                    used += width(&d) + 2;
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(d, th.dim()));
-                }
-            }
-            spans.push(Span::raw(" ".repeat(body_w.saturating_sub(used) + 1)));
-            spans.push(Span::raw(pad(&count, count_w)));
-            let style = if on && focused {
-                th.selected()
-            } else if on {
-                th.selected_unfocused()
-            } else {
-                Style::default()
+                cards::frame(f, cell, on, focused && !self.filter.editing, th)
             };
-            f.render_widget(Paragraph::new(Line::from(spans)).style(style), cell);
+            let lines = cards::group_card(
+                tag,
+                *count,
+                descriptions[i],
+                tag_fill(tag, ctx),
+                inner.width as usize,
+                th,
+            );
+            f.render_widget(Paragraph::new(lines), inner);
         }
         draw_track(f, inner, &self.list, selected, &mut self.list_track, th);
     }
@@ -539,18 +675,15 @@ impl TagsView {
             self.grid_track.clear();
             return;
         };
-        let count = match self.members.len() {
-            1 => "1 skill".to_string(),
-            n => format!("{n} skills"),
-        };
+        let count = format!("{} skills", self.members.len());
         let mut title = vec![Span::raw(" ")];
         if tag == UNTAGGED {
             title.push(Span::styled("untagged", th.bold()));
         } else {
             title.push(Span::raw("tagged "));
-            title.extend(cards::pill(format!(" {tag} "), tag_fill(&tag, ctx), ctx));
+            title.extend(cards::Pill::new(&tag, tag_fill(&tag, ctx)).render(ctx, usize::MAX));
         }
-        title.push(Span::styled(format!(" · {count} "), th.dim()));
+        title.push(Span::styled(format!(" · {count} "), th.skill_count()));
         let block = th.block(Line::from(title), focused);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -601,104 +734,8 @@ impl TagsView {
     }
 
     fn draw_prompt(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
-        let Some(p) = self.prompt.as_mut() else {
-            return;
-        };
-        let (title, placeholder) = match p.ask {
-            Ask::Merge => (format!(" merge {} into ", p.tag), "type to filter…"),
-            Ask::Color => (format!(" colour of {} ", p.tag), "a name, or #rrggbb"),
-        };
-        // Room for the field, a swatch line, the rows, and the frame.
-        let want = p.shown.len() as u16 + 6;
-        let w = 56.min(area.width.saturating_sub(2)).max(1);
-        let h = want.clamp(8, area.height.saturating_sub(2)).max(1);
-        let rect = Rect::new(
-            area.x + (area.width - w) / 2,
-            area.y + (area.height - h) / 2,
-            w,
-            h,
-        );
-        p.rect = rect;
-        f.render_widget(Clear, rect);
-        let block = th.block(title, true);
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        let field = Rect {
-            x: inner.x + 1,
-            width: inner.width.saturating_sub(2),
-            height: 1,
-            ..inner
-        };
-        p.input.render(f, field, true, placeholder, th);
-        // The swatch shows the pill as it would look, which is the only way
-        // to judge a colour, and says so when the text is not one.
-        let swatch = Rect {
-            y: inner.y + 1,
-            height: 1,
-            ..field
-        };
-        let mut preview = vec![Span::raw("  ")];
-        match p.ask {
-            Ask::Merge => {
-                preview.extend(cards::pill(
-                    format!(" {} ", p.tag),
-                    tag_fill(&p.tag, ctx),
-                    ctx,
-                ));
-                preview.push(Span::styled(" → ", th.dim()));
-                match p.chosen() {
-                    Some(into) => {
-                        preview.extend(cards::pill(format!(" {into} "), tag_fill(into, ctx), ctx))
-                    }
-                    None => preview.push(Span::styled("nothing matches", th.dim())),
-                }
-            }
-            Ask::Color => match p.color() {
-                Some(Some(c)) => preview.extend(cards::pill(format!(" {} ", p.tag), c, ctx)),
-                Some(None) => preview.extend(cards::pill(format!(" {} ", p.tag), th.tag, ctx)),
-                None => preview.push(Span::styled("not a colour", th.warn())),
-            },
-        }
-        f.render_widget(Paragraph::new(Line::from(preview)), swatch);
-        let list_area = Rect {
-            y: inner.y + 3,
-            height: inner.height.saturating_sub(3),
-            ..inner
-        };
-        p.list.rows = list_area;
-        let rows: Vec<ListItem> = p
-            .shown
-            .iter()
-            .map(|&i| {
-                let name = &p.choices[i];
-                let spans = match p.ask {
-                    Ask::Merge => cards::pill(format!(" {name} "), tag_fill(name, ctx), ctx),
-                    Ask::Color if name == NO_COLOR => {
-                        vec![Span::styled("none — the default", th.dim())]
-                    }
-                    Ask::Color => {
-                        let fill = name.parse::<Color>().unwrap_or(th.tag);
-                        let mut s = cards::pill(format!(" {} ", p.tag), fill, ctx);
-                        s.push(Span::styled(format!("  {name}"), th.dim()));
-                        s
-                    }
-                };
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
-        f.render_stateful_widget(
-            List::new(rows)
-                .highlight_style(th.selected())
-                .highlight_symbol("▸ "),
-            list_area,
-            &mut p.list.state,
-        );
-        if p.shown.is_empty() {
-            f.render_widget(
-                Paragraph::new(Span::styled("nothing matches", th.dim())),
-                list_area,
-            );
+        if let Some(p) = self.prompt.as_mut() {
+            p.draw(f, area, ctx);
         }
     }
 }
@@ -739,6 +776,11 @@ fn draw_track(
 }
 
 impl View for TagsView {
+    fn status(&self, ctx: &Ctx) -> String {
+        self.skill_search
+            .as_ref()
+            .map_or_else(String::new, |v| v.status(ctx))
+    }
     fn refresh(&mut self, ctx: &Ctx) {
         let selected = self.selected_tag().map(str::to_owned);
         let panel = self.skill_search.take();
@@ -885,6 +927,10 @@ impl View for TagsView {
                 vec![]
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                if self.list.selected().unwrap_or(0) == 0 {
+                    self.filter.editing = true;
+                    return vec![];
+                }
                 self.list.move_by(-1, n);
                 self.sync_members(ctx.snap);
                 vec![]
@@ -929,7 +975,7 @@ impl View for TagsView {
                 }
                 None => vec![],
             },
-            KeyCode::Char('C') => self.ask_color(),
+            KeyCode::Char('C') => self.ask_color(ctx),
             KeyCode::Char('D' | 'x') | KeyCode::Delete => match self.actionable_tag() {
                 Some(t) => vec![Action::OpenModal(Box::new(Modal::delete_tag(&t)))],
                 None => vec![],
@@ -1055,7 +1101,7 @@ impl View for TagsView {
 
     fn hints(&self) -> Hints {
         if self.filter.editing {
-            return &[("Enter/↓", "tags"), ("Esc", "finish filter")];
+            return &[("Enter/↓", "tags"), ("Esc", "clear filter")];
         }
         if self.focus_grid
             && let Some(view) = self.skill_search.as_ref()
@@ -1093,6 +1139,47 @@ impl View for TagsView {
                 ("Enter/→", "skills"),
                 ("q", "library"),
             ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod prompt_resize_tests {
+    use super::*;
+    #[test]
+    fn colour_picker_starts_at_current_or_default_colour() {
+        let default = Prompt::for_color("test", None);
+        assert_eq!(default.color(), Some(None));
+        assert_eq!(default.color_text(), Some(None));
+        for current in ["blue", "#b87e54"] {
+            let prompt = Prompt::for_color("test", Some(current));
+            assert_eq!(prompt.color_text(), Some(Some(current.into())));
+        }
+    }
+    #[test]
+    fn colour_and_merge_prompts_survive_tiny_terminal_resize() {
+        let tmp = skills::ops::DownloadDir::new("tag-resize").unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        for ask in [Ask::Color, Ask::Merge] {
+            let mut view = TagsView {
+                prompt: Some(Prompt::new(ask, "test", vec!["blue".into()])),
+                ..Default::default()
+            };
+            for (width, height) in [(40, 12), (40, 11), (20, 8), (4, 3), (1, 1), (80, 24)] {
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap();
+                term.draw(|f| view.draw_prompt(f, f.area(), &ctx)).unwrap();
+                let rect = view.prompt.as_ref().unwrap().rect;
+                assert!(rect.right() <= width && rect.bottom() <= height);
+            }
         }
     }
 }

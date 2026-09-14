@@ -272,10 +272,10 @@ fn record_lines<'a>(
             tag_line.push(Span::styled("none", th.dim()));
         } else {
             for t in &r.tags {
-                tag_line.push(Span::styled(
-                    format!(" {t} "),
-                    th.tag().bg(ctx.theme.selection_bg),
-                ));
+                tag_line.extend(
+                    super::cards::Pill::new(t, super::cards::tag_fill(t, ctx))
+                        .render(ctx, usize::MAX),
+                );
                 tag_line.push(Span::raw(" "));
             }
         }

@@ -19,6 +19,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 pub trait View {
+    fn status(&self, _ctx: &Ctx) -> String {
+        String::new()
+    }
     /// Called after every new snapshot.
     fn refresh(&mut self, ctx: &Ctx);
     /// Called when the tab becomes the active one after being away, before

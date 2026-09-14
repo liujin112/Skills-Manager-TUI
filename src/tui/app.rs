@@ -9,11 +9,12 @@ use super::views::{
     View, agents::AgentsView, health::HealthView, presets::PresetsView, repos::ReposView,
     search::SearchView, tags::TagsView,
 };
-use super::widgets::{SPINNER, width};
+use super::widgets::{SPINNER, fit, width};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::Workspace;
@@ -720,8 +721,11 @@ impl App {
             snap: &self.snap,
             theme: &self.theme,
         };
+        if let Some(m) = self.modal.as_mut() {
+            return m.handle_key(k, &ctx);
+        }
         if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
-            if self.modal.is_some() || (self.tab == Tab::Tags && self.tags.dialog_open()) {
+            if self.tab == Tab::Tags && self.tags.dialog_open() {
                 return vec![];
             }
             let tabs = Tab::visible(self.ws.config.tags_enabled);
@@ -732,9 +736,6 @@ impl App {
                 tabs.len() - 1
             };
             return vec![Action::SwitchTab(tabs[(index + delta) % tabs.len()])];
-        }
-        if let Some(m) = self.modal.as_mut() {
-            return m.handle_key(k, &ctx);
         }
         if self.tab == Tab::Agents
             && let Some(actions) = self.agents.handle_matrix_key(k, &ctx)
@@ -1295,7 +1296,7 @@ impl App {
             ));
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(title, th.selected().fg(th.accent)),
+                    Span::styled(title, th.selected()),
                     Span::styled("  Tab → next · Shift+Tab ←", th.dim()),
                 ])),
                 area,
@@ -1316,7 +1317,7 @@ impl App {
                 format!(" {} {} ", i + 1, t.title())
             };
             let style = if *t == self.tab {
-                th.selected().fg(th.accent)
+                th.selected()
             } else {
                 th.dim()
             };
@@ -1326,7 +1327,7 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
-        spans.push(Span::styled(" Tab ↔ ", th.dim()));
+        spans.push(Span::styled(" Tab ↔ ", Style::default().fg(th.placeholder)));
         x += width(" Tab ↔ ") as u16;
         let used = (x - area.x) as usize;
         let right = if self.tasks_running > 0 {
@@ -1355,7 +1356,27 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let th = &self.theme;
-        let hints = if let Some(m) = &self.modal {
+        let ctx = Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            theme: th,
+        };
+        let status = if self.modal.is_some() {
+            String::new()
+        } else {
+            match self.tab {
+                Tab::Search => self.search.status(&ctx),
+                Tab::Tags => self.tags.status(&ctx),
+                Tab::Presets => self.presets.status(&ctx),
+                _ => String::new(),
+            }
+        };
+        let status = fit(&status, area.width as usize / 3);
+        let status_width = width(&status);
+        let budget = area.width as usize - status_width;
+        let hints = if self.batch_running && self.batch_modal_owned {
+            &[("…", "saving changes")][..]
+        } else if let Some(m) = &self.modal {
             m.hints()
         } else {
             match self.tab {
@@ -1370,20 +1391,48 @@ impl App {
         // Results moved out to the notification stack, so the footer is only keys.
         let mut spans: Vec<Span> = Vec::new();
         let mut hint_w = 0usize;
+        let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
+        let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3)
+            + if self.modal.is_none() { 9 } else { 0 };
         for (key, desc) in hints {
-            if !self.ws.config.tags_enabled && *key == "t" {
+            if (!self.ws.config.tags_enabled && *key == "t")
+                || key.contains("Esc")
+                || (*key == "F1" && self.modal.is_none())
+            {
                 continue;
             }
             let piece_w = width(key) + width(desc) + 3;
-            if hint_w + piece_w + 1 > area.width as usize {
+            if hint_w + piece_w + reserve > budget {
                 break;
             }
             spans.push(Span::styled(*key, th.key_hint()));
-            spans.push(Span::styled(format!(" {desc}  "), th.dim()));
+            spans.push(Span::styled(
+                format!(" {desc}  "),
+                Style::default().fg(th.placeholder),
+            ));
             hint_w += piece_w;
         }
-        let pad = (area.width as usize).saturating_sub(hint_w);
-        let mut line = vec![Span::raw(" ".repeat(pad))];
+        if let Some((key, desc)) = escape {
+            let piece_w = width(key) + width(desc) + 3;
+            if hint_w + piece_w <= budget {
+                spans.push(Span::styled(*key, th.key_hint()));
+                spans.push(Span::styled(
+                    format!(" {desc}  "),
+                    Style::default().fg(th.placeholder),
+                ));
+                hint_w += piece_w;
+            }
+        }
+        if self.modal.is_none() && hint_w + 9 <= budget {
+            spans.push(Span::styled("F1", th.key_hint()));
+            spans.push(Span::styled(" help  ", Style::default().fg(th.placeholder)));
+            hint_w += 9;
+        }
+        let pad = budget.saturating_sub(hint_w);
+        let mut line = vec![
+            Span::styled(status, th.skill_count()),
+            Span::raw(" ".repeat(pad)),
+        ];
         line.extend(spans);
         f.render_widget(Paragraph::new(Line::from(line)), area);
     }
@@ -1425,6 +1474,95 @@ pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn confirmation_ignores_modified_keys_and_help_pages_without_closing() {
+        let tmp = skills::ops::DownloadDir::new("modal-key-audit").unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        for mut modal in [
+            Modal::confirm("test".into(), vec![]),
+            Modal::confirm_write("test".into(), vec![], Box::new(|_| Ok("saved".into()))),
+        ] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Enter] {
+                    assert!(
+                        modal
+                            .handle_key(KeyEvent::new(code, modifiers), &ctx)
+                            .is_empty()
+                    );
+                }
+            }
+            if matches!(modal, Modal::ConfirmWrite { .. }) {
+                assert!(
+                    !modal
+                        .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &ctx)
+                        .is_empty()
+                );
+            }
+        }
+        let mut help = Modal::help();
+        assert!(
+            help.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+        assert!(matches!(help, Modal::Help { scroll: 10 }));
+        assert!(
+            help.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+        assert!(matches!(help, Modal::Help { scroll: 0 }));
+    }
+
+    #[test]
+    fn tag_completion_reaches_modal_and_keeps_close_hint_in_small_windows() {
+        let tmp = skills::ops::DownloadDir::new("tag-key-route").unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+        std::fs::write(
+            tmp.path().join("alpha/SKILL.md"),
+            "---\nname: alpha\n---\nBody",
+        )
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        skills::ops::edit::tag_add(&ws, "alpha", &["meta-skill".into()]).unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            theme: &app.theme,
+        };
+        app.modal = Some(Modal::batch_tags(vec!["alpha".into()], &ctx));
+        for c in "met".chars() {
+            assert!(
+                app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                    .is_empty()
+            );
+        }
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .is_empty()
+        );
+        for width in [40, 80] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("› meta-skill"));
+            assert!(text.contains("Tags · alpha"));
+            let footer: String = (0..width).map(|x| buffer[(x, 23)].symbol()).collect();
+            assert!(footer.contains("Enter remove"));
+            assert!(footer.contains("Esc done"));
+            assert!(!footer.contains("add / create"));
+        }
+    }
 
     #[test]
     fn header_paths_keep_the_tail_with_unicode_safe_middle_ellipsis() {

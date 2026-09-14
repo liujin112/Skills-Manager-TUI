@@ -1498,6 +1498,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                 description,
                 skills,
                 agents,
+                color: None,
             };
             store.save(&p)?;
             ctx.out(&p, || println!("created preset {name}"))

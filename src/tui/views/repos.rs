@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ratatui::{
     Frame,
     layout::Rect,
-    text::Line,
+    text::{Line, Span},
     widgets::{List, ListItem, Paragraph, Wrap},
 };
 use skills::repository::{Repository, alias_of};
@@ -325,7 +325,23 @@ impl View for ReposView {
             .theme
             .block(format!("{title}({}) ", labels.len()), !self.reading);
         self.nav.rows = block.inner(left);
-        let items: Vec<_> = labels.into_iter().map(ListItem::new).collect();
+        let items: Vec<_> = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| {
+                if self.project.is_none() {
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!("{} · ", self.projects[i].name)),
+                        Span::styled(
+                            format!("{} skills", self.projects[i].keys.len()),
+                            ctx.theme.skill_count(),
+                        ),
+                    ]))
+                } else {
+                    ListItem::new(label)
+                }
+            })
+            .collect();
         f.render_stateful_widget(
             List::new(items)
                 .block(block)
@@ -376,7 +392,7 @@ impl View for ReposView {
                 );
                 lines.push(Line::styled(
                     format!("{} installed skills", project.keys.len()),
-                    ctx.theme.bold(),
+                    ctx.theme.skill_count(),
                 ));
                 lines.push(Line::raw(""));
                 lines.push(Line::raw(project.source.clone()));
@@ -401,7 +417,7 @@ impl View for ReposView {
 
     fn hints(&self) -> Hints {
         if self.filter.editing {
-            return &[("Enter/↓", "repositories"), ("Esc", "finish filter")];
+            return &[("Enter/↓", "repositories"), ("Esc", "clear filter")];
         }
         if let Some(view) = self.skill_search.as_ref() {
             return view.hints();

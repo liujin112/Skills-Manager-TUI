@@ -155,10 +155,10 @@ impl DeployPicker {
     }
     pub fn hints(&self) -> Hints {
         &[
-            ("p", "project path"),
-            ("Space", "toggle agent"),
-            ("↑↓", "move"),
             ("Ctrl+Enter", "apply"),
+            ("Space", "select"),
+            ("↑↓", "move"),
+            ("p", "project path"),
             ("Esc", "cancel"),
         ]
     }
@@ -320,9 +320,12 @@ impl DeployPicker {
             .and_then(|i| self.rows.get(i))
             .map(|(a, _, _)| {
                 format!(
-                    "Target: {} · {}",
+                    "Target: {}\n{}",
                     targets::product_name(a),
-                    a.skills_path().display()
+                    super::app::middle_ellipsis(
+                        &skills::paths::contract_tilde(&a.skills_path()),
+                        inner.width as usize
+                    )
                 )
             })
             .unwrap_or_default();
@@ -403,7 +406,7 @@ mod tests {
                 .filter(|(a, _, _)| a.skills_path() == ws.root)
                 .all(|(_, _, selected)| *selected == Some(false))
         );
-        for (w, h) in [(100, 30), (80, 24), (40, 12)] {
+        for (w, h) in [(100, 30), (80, 24), (50, 16), (40, 12)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
             let buf = term.backend().buffer();
@@ -411,11 +414,29 @@ mod tests {
                 .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if h >= 24 {
-                assert!(text.contains("Global & Local"));
+            if h >= 16 {
+                if w >= 80 {
+                    assert!(text.contains("Global & Local"));
+                }
                 assert!(!text.contains("{pwd}"));
-                assert!(text.contains("Local"));
+                if h >= 24 {
+                    assert!(text.contains("Local"));
+                }
                 assert!(text.contains("Target:"));
+                let path = picker.rows[codex].0.skills_path();
+                let suffix = path
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+                    + "/"
+                    + &path.file_name().unwrap().to_string_lossy();
+                assert!(
+                    text.contains(&suffix),
+                    "target directory tail must remain visible"
+                );
             } else {
                 assert!(text.contains("Enlarge terminal"));
             }

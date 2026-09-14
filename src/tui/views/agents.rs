@@ -18,7 +18,7 @@ use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use skills::ops::deploy::{
@@ -168,7 +168,7 @@ fn count_scope_skills(path: &std::path::Path) -> ScopeInventory {
         }
     }
     let count = inventory.descriptions.len();
-    inventory.label = format!("{count} {}", if count == 1 { "skill" } else { "skills" });
+    inventory.label = format!("{count} skills");
     inventory
 }
 
@@ -302,10 +302,7 @@ impl AgentsView {
             }
             total += inventory.descriptions.len();
         }
-        Some(format!(
-            "{total} {} total",
-            if total == 1 { "skill" } else { "skills" }
-        ))
+        Some(format!("{total} skills total"))
     }
 
     pub fn discover(&mut self, start: &std::path::Path) -> anyhow::Result<()> {
@@ -1232,11 +1229,14 @@ impl AgentsView {
         self.update_scope_counts();
         let th = ctx.theme;
         let scoped = !self.destinations.is_empty();
+        let compact = area.height < 30;
         let groups = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
-                Constraint::Length(if scoped {
+                Constraint::Length(if compact { 3 } else { 5 }),
+                Constraint::Length(if scoped && compact {
+                    4
+                } else if scoped {
                     6 + self
                         .destinations
                         .get(self.destination)
@@ -1244,7 +1244,7 @@ impl AgentsView {
                 } else {
                     0
                 }),
-                Constraint::Length(5),
+                Constraint::Length(if compact { 4 } else { 5 }),
                 Constraint::Min(5),
             ])
             .split(area);
@@ -1267,7 +1267,7 @@ impl AgentsView {
         }
         let preset_rows = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(u16::from(!compact)),
             Constraint::Min(1),
         ])
         .split(interiors[2]);
@@ -1328,7 +1328,11 @@ impl AgentsView {
                     Some((AgentDirMode::Real, linked, _)) => format!("{linked} linked"),
                 };
                 let sub = self.agent_skill_count(&a.key).unwrap_or(sub);
-                (width(a.display_name()).max(width(&sub)) + 4).max(14) + 1
+                (if compact {
+                    width(a.display_name()) + 4
+                } else {
+                    (width(a.display_name()).max(width(&sub)) + 4).max(14)
+                }) + 1
             })
             .collect();
         let visible = pill_window(
@@ -1369,12 +1373,29 @@ impl AgentsView {
             };
             let sub = self.agent_skill_count(&a.key).unwrap_or(sub);
             let name = a.display_name().to_string();
-            let w = (width(&name).max(width(&sub)) + 4).max(14) as u16;
+            let w = (if compact {
+                width(&name) + 4
+            } else {
+                (width(&name).max(width(&sub)) + 4).max(14)
+            }) as u16;
             if x + w > rows[0].right() {
                 break;
             }
             let rect = Rect::new(x, rows[0].y, w, 3.min(rows[0].height));
             let on = a.key == self.scope;
+            if compact {
+                f.render_widget(
+                    Paragraph::new(format!("{} {name}", if on { "▸" } else { " " })).style(if on {
+                        th.bold()
+                    } else {
+                        th.dim()
+                    }),
+                    rect,
+                );
+                self.scope_rects.push((rect, a.key.clone()));
+                x += w + 1;
+                continue;
+            }
             let border = if on { th.accent() } else { th.dim() };
             let block = ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
@@ -1393,10 +1414,7 @@ impl AgentsView {
                 vertical: 0,
             });
             f.render_widget(block, rect);
-            f.render_widget(
-                Paragraph::new(sub).style(if on { th.bold() } else { th.dim() }),
-                inner,
-            );
+            f.render_widget(Paragraph::new(sub).style(th.skill_count()), inner);
             self.scope_rects.push((rect, a.key.clone()));
             x += w + 1;
         }
@@ -1419,6 +1437,9 @@ impl AgentsView {
                         scope.project.is_none(),
                         false,
                     );
+                    if compact {
+                        return width(&format!("{icon}{tier} · {kind}")) + 5;
+                    }
                     ((width(&path) + 2 + width(self.scope_count(scope)))
                         .max(width(&format!("{icon}{tier} · {kind}")))
                         + 4)
@@ -1452,6 +1473,20 @@ impl AgentsView {
                     scope.project.is_none(),
                     false,
                 );
+                if compact {
+                    f.render_widget(
+                        Paragraph::new(format!(
+                            "{} {icon}{tier} · {kind}",
+                            if on { "▸" } else { " " }
+                        ))
+                        .style(if on { th.bold() } else { th.dim() }),
+                        Rect::new(rect.x, rect.y, rect.width, 1),
+                    );
+                    self.destination_rects
+                        .push((Rect::new(rect.x, rect.y, rect.width, 1), i));
+                    x += w + 1;
+                    continue;
+                }
                 let range_style = if scope.project.is_none() {
                     th.accent()
                 } else {
@@ -1501,8 +1536,8 @@ impl AgentsView {
                 );
                 let count_style = match self.scope_count(scope) {
                     "Unreadable" => th.warn(),
-                    "Not created" | "Counting…" => th.dim(),
-                    _ => th.bold(),
+                    "Counting…" => th.dim(),
+                    _ => th.skill_count(),
                 };
                 f.render_widget(
                     Paragraph::new(count).style(count_style),
@@ -1520,13 +1555,13 @@ impl AgentsView {
                 if visible.start > 0 {
                     f.render_widget(
                         Paragraph::new("‹").style(th.accent()),
-                        Rect::new(band.x, band.y + 1, 1, 1),
+                        Rect::new(band.x, band.y + u16::from(!compact), 1, 1),
                     );
                 }
                 if visible.end < self.destinations.len() {
                     f.render_widget(
                         Paragraph::new("›").style(th.accent()),
-                        Rect::new(band.right() - 1, band.y + 1, 1, 1),
+                        Rect::new(band.right() - 1, band.y + u16::from(!compact), 1, 1),
                     );
                 }
             }
@@ -1536,14 +1571,14 @@ impl AgentsView {
                 .agent(&self.scope)
                 .map(|a| skills::paths::contract_tilde(&a.skills_path()))
                 .unwrap_or_default();
-            if band.height > 3 {
+            if band.height > if compact { 1 } else { 3 } {
                 f.render_widget(
                     Paragraph::new(crate::tui::app::middle_ellipsis(
                         &format!(" Target  {target}"),
                         band.width as usize,
                     ))
                     .style(th.dim()),
-                    Rect::new(band.x, band.y + 3, band.width, 1),
+                    Rect::new(band.x, band.y + if compact { 1 } else { 3 }, band.width, 1),
                 );
             }
             if let Some(scope) = self.destinations.get(self.destination) {
@@ -1572,11 +1607,11 @@ impl AgentsView {
         }
 
         self.preset_filter.rect = preset_filter_area;
-        self.preset_filter.input.render(
+        self.preset_filter.input.render_hint(
             f,
             preset_filter_area,
             self.preset_filter.editing,
-            " / filter presets · Enter results",
+            (" / filter presets", " · Enter results"),
             th,
         );
         {
@@ -1602,36 +1637,40 @@ impl AgentsView {
                     th.dim(),
                 ));
             }
-            let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
-            let caps_w = width(lcap) + width(rcap);
-            // Reserve an indicator on each side; every mouse target is a whole pill.
+            // Reserve an indicator on each side; mouse targets use rendered widths.
             let budget = (rows[2].width as usize).saturating_sub(width(&label) + 4);
-            let bodies: Vec<String> = self
+            let rendered: Vec<_> = self
                 .presets
                 .iter()
-                .map(|(preset, status)| {
-                    let state = if self.destinations.is_empty()
+                .enumerate()
+                .map(|(i, (preset, status))| {
+                    let installed = if self.destinations.is_empty()
                         || self.installed_presets.contains(&preset.name)
                     {
-                        status.state()
+                        status.installed
                     } else {
-                        PresetState::Inactive
+                        0
                     };
-                    let mark = match state {
-                        PresetState::Active => "✓ ",
-                        PresetState::Partial => "◐ ",
-                        PresetState::Inactive => "◌ ",
-                        PresetState::Empty => "◦ ",
-                    };
-                    let suffix = status
-                        .progress()
-                        .map(|p| format!(" {p} "))
-                        .unwrap_or(" ".into());
-                    let name_w = budget.saturating_sub(caps_w + width(mark) + width(&suffix) + 2);
-                    format!(" {mark}{}{suffix}", fit(&preset.name, name_w))
+                    cards::Pill {
+                        coverage: Some((installed, status.total)),
+                        selected: i == self.preset_cursor,
+                        focused: self.focus() == Focus::Presets,
+                        ..cards::Pill::new(
+                            &preset.name,
+                            preset
+                                .color
+                                .as_deref()
+                                .and_then(|c| c.parse().ok())
+                                .unwrap_or(th.tag),
+                        )
+                    }
+                    .render(ctx, budget)
                 })
                 .collect();
-            let widths: Vec<usize> = bodies.iter().map(|b| width(b) + caps_w + 1).collect();
+            let widths: Vec<_> = rendered
+                .iter()
+                .map(|p| p.iter().map(Span::width).sum::<usize>() + 1)
+                .collect();
             let visible = pill_window(&widths, self.preset_cursor, &mut self.preset_offset, budget);
             pills.push(Span::styled(
                 if visible.start > 0 { "‹ " } else { "  " },
@@ -1639,39 +1678,9 @@ impl AgentsView {
             ));
             x += 2;
             for i in visible.clone() {
-                let (preset, status) = &self.presets[i];
-                let body = bodies[i].clone();
                 let w = (widths[i] - 1) as u16;
                 self.preset_rects.push((i, Rect::new(x, rows[2].y, w, 1)));
-                let state = if self.destinations.is_empty()
-                    || self.installed_presets.contains(&preset.name)
-                {
-                    status.state()
-                } else {
-                    PresetState::Inactive
-                };
-                let base = match state {
-                    PresetState::Active => th.ok,
-                    PresetState::Partial => th.warn,
-                    _ => th.dim,
-                };
-                let selected = i == self.preset_cursor;
-                let focused = self.focus() == Focus::Presets;
-                // With the keyboard on this row the pill is lit and underlined, so
-                // the cursor is visible without reading the colours against each
-                // other. Once the focus moves on, the underline goes and bold alone
-                // remembers the place, which marks it without competing with the
-                // list for attention.
-                let fill = if selected && focused { lit(base) } else { base };
-                let mut pill = cards::pill(body, fill, ctx);
-                if selected {
-                    pill[1].style = pill[1].style.add_modifier(if focused {
-                        Modifier::BOLD | Modifier::UNDERLINED
-                    } else {
-                        Modifier::BOLD
-                    });
-                }
-                pills.extend(pill);
+                pills.extend(rendered[i].clone());
                 pills.push(Span::raw(" "));
                 x += w + 1;
             }
@@ -1719,17 +1728,20 @@ impl AgentsView {
             counts.push_str(&format!(" · {invalid} invalid entries"));
         }
         let block = th.block(
-            format!(" skills · {counts} "),
+            Line::from(vec![
+                Span::raw(" skills · "),
+                Span::styled(format!("{counts} "), th.skill_count()),
+            ]),
             self.focus() == Focus::Entries,
         );
         let inner = block.inner(left);
         f.render_widget(block, left);
         self.content_filter_rect = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
-        self.content_filter.render(
+        self.content_filter.render_hint(
             f,
             self.content_filter_rect,
             self.filter_editing,
-            " / filter skills…   tag:x  agent:y  repo:owner/repo",
+            (" / filter skills…", "   tag:x  agent:y  repo:owner/repo"),
             th,
         );
         let separator_height = u16::from(inner.height >= 3);
@@ -1922,7 +1934,7 @@ impl AgentsView {
 
     fn hints_current(&self) -> Hints {
         if self.preset_filter.editing {
-            return &[("Enter/↓", "presets"), ("Esc", "finish filter")];
+            return &[("Enter/↓", "presets"), ("Esc", "clear filter")];
         }
         if let Some(hints) = self.matrix.hints() {
             return hints;
@@ -1962,7 +1974,7 @@ impl AgentsView {
         if !self.destinations.is_empty() && self.focus() == Focus::Presets {
             return &[
                 ("/", "filter presets"),
-                ("Enter / Space", "install / uninstall preset"),
+                ("Enter/Space", "install/uninstall"),
                 ("x", "uninstall preset"),
                 ("←→", "preset"),
                 ("↑", "scopes"),
@@ -2395,19 +2407,6 @@ impl View for AgentsView {
     }
 }
 
-fn lit(c: Color) -> Color {
-    match c {
-        Color::Green => Color::LightGreen,
-        Color::Yellow => Color::LightYellow,
-        Color::Red => Color::LightRed,
-        Color::Cyan => Color::LightCyan,
-        Color::Blue => Color::LightBlue,
-        Color::Magenta => Color::LightMagenta,
-        Color::DarkGray => Color::Gray,
-        other => other,
-    }
-}
-
 /// Marker for one agent's relationship to a skill; `None` means that agent
 /// does not have it at all.
 fn glyph_for(state: Option<&EntryState>, th: &crate::tui::theme::Theme) -> (&'static str, Style) {
@@ -2820,7 +2819,7 @@ mod deployment_scope_tests {
             "Unreadable"
         );
         std::fs::remove_file(directory.join("deployed")).unwrap();
-        assert_eq!(count_scope_skills(&directory).label, "1 skill");
+        assert_eq!(count_scope_skills(&directory).label, "1 skills");
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -2885,13 +2884,13 @@ mod deployment_scope_tests {
             .insert(global.clone(), count_scope_skills(&global));
         assert_eq!(
             view.agent_skill_count(&view.scope).as_deref(),
-            Some("1 skill total")
+            Some("1 skills total")
         );
         view.move_destination(1, &ctx);
         assert_eq!(view.agent_directories[&view.scope], directories);
         assert_eq!(
             view.agent_skill_count(&view.scope).as_deref(),
-            Some("1 skill total")
+            Some("1 skills total")
         );
         view.move_destination(-1, &ctx);
         let first = view.scoped.clone().unwrap();
@@ -3072,6 +3071,10 @@ mod deployment_scope_tests {
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         let search_area = view.content_filter_rect;
         let skills_area = view.left;
+        assert!(
+            skills_area.height >= 10,
+            "compact controls leave room for skills"
+        );
         assert!(skills_area.contains((search_area.x, search_area.y).into()));
         for focus in [Focus::Agents, Focus::Scopes, Focus::Presets, Focus::Entries] {
             view.set_focus(focus);

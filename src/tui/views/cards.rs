@@ -20,6 +20,40 @@ use skills::reconcile::SkillRecord;
 pub const MIN_CARD_W: u16 = 40;
 /// Four content lines: identity, two description lines, and source with tags.
 pub const CARD_H: u16 = 6;
+
+/// Shared identity and optional description for tag and preset cards.
+pub fn group_card(
+    name: &str,
+    count: usize,
+    description: Option<&str>,
+    color: Color,
+    columns: usize,
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let count = fit(&format!("{count} skills"), columns);
+    let room = columns.saturating_sub(width(&count) + usize::from(columns > width(&count)));
+    let marker = fit("● ", room);
+    let name = pad(name, room.saturating_sub(width(&marker)));
+    let mut lines = vec![Line::from(vec![
+        Span::styled(marker, Style::default().fg(color)),
+        Span::styled(name, th.bold()),
+        Span::raw(if columns > width(&count) { " " } else { "" }),
+        Span::styled(count, th.skill_count()),
+    ])];
+    if let Some(desc) = description.filter(|s| !s.trim().is_empty()) {
+        let plain = tui_markdown::from_str(desc)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(Line::from(Span::styled(
+            fit(&plain, columns),
+            Style::default().fg(th.placeholder),
+        )));
+    }
+    lines
+}
 /// Status and selection share a slot, including a separator before the name.
 pub const MARKER_W: usize = 4;
 
@@ -30,7 +64,8 @@ pub fn cols_for(width: u16) -> usize {
 
 /// Draw the frame of one card and hand back the padded area inside it.
 /// `on` is the selection; `focused` says whether that selection is the one the
-/// keyboard is on, which is told by weight rather than by a second colour.
+/// keyboard is on: cyan marks focus, while a neutral bold frame remembers an
+/// inactive selection.
 pub fn frame(f: &mut Frame, cell: Rect, on: bool, focused: bool, th: &Theme) -> Rect {
     frame_styled(
         f,
@@ -38,9 +73,9 @@ pub fn frame(f: &mut Frame, cell: Rect, on: bool, focused: bool, th: &Theme) -> 
         if on && focused {
             th.accent().add_modifier(Modifier::BOLD)
         } else if on {
-            th.accent()
+            th.bold()
         } else {
-            th.dim()
+            th.dim().add_modifier(Modifier::DIM)
         },
     )
 }
@@ -60,14 +95,83 @@ pub fn frame_styled(f: &mut Frame, cell: Rect, border: Style) -> Rect {
     inner
 }
 
-/// Text colour that stays legible on a filled pill.
-pub fn ink(fill: Color) -> Color {
-    match fill {
-        Color::Rgb(r, g, b) if 299 * r as u32 + 587 * g as u32 + 114 * (b as u32) < 128_000 => {
-            Color::Rgb(255, 255, 255)
+/// Filled labels own their palette: ANSI colours can be remapped by the
+/// terminal, making a calculated foreground wrong after a theme switch.
+fn pill_fill(color: Color) -> Color {
+    let palette = [
+        (32, 36, 44),
+        (196, 72, 72),
+        (112, 168, 88),
+        (224, 184, 80),
+        (112, 160, 224),
+        (192, 144, 200),
+        (88, 176, 184),
+        (208, 212, 220),
+        (96, 104, 116),
+        (240, 128, 128),
+        (156, 208, 128),
+        (248, 216, 128),
+        (156, 192, 248),
+        (224, 176, 232),
+        (144, 216, 224),
+        (248, 248, 248),
+    ];
+    let index = match color {
+        Color::Black => 0,
+        Color::Red => 1,
+        Color::Green => 2,
+        Color::Yellow => 3,
+        Color::Blue => 4,
+        Color::Magenta => 5,
+        Color::Cyan => 6,
+        Color::Gray => 7,
+        Color::DarkGray => 8,
+        Color::LightRed => 9,
+        Color::LightGreen => 10,
+        Color::LightYellow => 11,
+        Color::LightBlue => 12,
+        Color::LightMagenta => 13,
+        Color::LightCyan => 14,
+        Color::White => 15,
+        Color::Reset => 7,
+        Color::Rgb(..) => return color,
+        Color::Indexed(i) if i < 16 => i as usize,
+        Color::Indexed(i) if i >= 232 => {
+            let v = 8 + (i - 232) * 10;
+            return Color::Rgb(v, v, v);
         }
-        Color::DarkGray | Color::Black | Color::Blue | Color::Red => Color::Rgb(255, 255, 255),
-        _ => Color::Rgb(20, 20, 20),
+        Color::Indexed(i) => {
+            let levels = [0, 95, 135, 175, 215, 255];
+            let i = (i - 16) as usize;
+            return Color::Rgb(levels[i / 36], levels[i / 6 % 6], levels[i % 6]);
+        }
+    };
+    let (r, g, b) = palette[index];
+    Color::Rgb(r, g, b)
+}
+
+fn luminance(fill: Color) -> f64 {
+    let Color::Rgb(r, g, b) = pill_fill(fill) else {
+        unreachable!()
+    };
+    let linear = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+/// Choose whichever ink has the greater contrast against the rendered RGB.
+pub fn ink(fill: Color) -> Color {
+    let light = luminance(fill);
+    if (light + 0.05) / 0.05 >= 1.05 / (light + 0.05) {
+        Color::Rgb(0, 0, 0)
+    } else {
+        Color::Rgb(255, 255, 255)
     }
 }
 
@@ -84,27 +188,74 @@ pub fn tag_fill(name: &str, ctx: &Ctx) -> Color {
         .unwrap_or(ctx.theme.tag)
 }
 
-/// Shared capsule rendering, including configured end caps and readable text.
-pub fn pill(body: String, fill: Color, ctx: &Ctx) -> Vec<Span<'static>> {
-    let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
-    vec![
-        Span::styled(left, Style::default().fg(fill)),
-        Span::styled(body, Style::default().bg(fill).fg(ink(fill))),
-        Span::styled(right, Style::default().fg(fill)),
-    ]
+/// Every capsule shares spacing, clipping, contrast and selection styling.
+pub struct Pill<'a> {
+    pub name: &'a str,
+    pub fill: Color,
+    pub coverage: Option<(usize, usize)>,
+    pub selected: bool,
+    pub focused: bool,
+}
+
+impl<'a> Pill<'a> {
+    pub fn new(name: &'a str, fill: Color) -> Self {
+        Self {
+            name,
+            fill,
+            coverage: None,
+            selected: false,
+            focused: false,
+        }
+    }
+
+    pub fn render(&self, ctx: &Ctx, max_width: usize) -> Vec<Span<'static>> {
+        let (mark, count) = match self.coverage {
+            Some((installed, total)) => {
+                let mark = if total == 0 {
+                    "◦ "
+                } else if installed == total {
+                    "✓ "
+                } else if installed == 0 {
+                    "◌ "
+                } else {
+                    "◐ "
+                };
+                (mark, format!(" {installed}/{total}"))
+            }
+            None => ("", String::new()),
+        };
+        let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
+        let fixed = width(left) + width(right) + width(mark) + width(&count) + 2;
+        if max_width < fixed {
+            return vec![];
+        }
+        let body = format!(" {mark}{}{count} ", fit(self.name, max_width - fixed));
+        let fill = pill_fill(self.fill);
+        let mut style = Style::default().bg(fill).fg(ink(fill));
+        if self.selected {
+            style = style.add_modifier(if self.focused {
+                Modifier::BOLD | Modifier::UNDERLINED
+            } else {
+                Modifier::BOLD
+            });
+        }
+        vec![
+            Span::styled(left, Style::default().fg(fill)),
+            Span::styled(body, style),
+            Span::styled(right, Style::default().fg(fill)),
+        ]
+    }
 }
 
 /// Tags as capsules, as many as fit in `max_w`, then a count for the rest. A
 /// filled shape with round ends is told apart from the text around it at a
 /// glance, which a coloured word is not.
 pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>> {
-    let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
-    let cap_w = width(lcap) + width(rcap);
     let mut out = Vec::new();
     let mut used = 0;
     for (i, t) in tags.iter().enumerate() {
-        let body = format!(" {t} ");
-        let w = cap_w + width(&body) + usize::from(i > 0);
+        let pill = Pill::new(t, tag_fill(t, ctx)).render(ctx, usize::MAX);
+        let w = pill.iter().map(Span::width).sum::<usize>() + usize::from(i > 0);
         // Keep room for the "+n" so the last thing on the line is never a
         // pill cut in half.
         let rest = tags.len() - i - 1;
@@ -120,11 +271,10 @@ pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>>
             }
             break;
         }
-        let fill = tag_fill(t, ctx);
         if i > 0 {
             out.push(Span::raw(" "));
         }
-        out.extend(pill(body, fill, ctx));
+        out.extend(pill);
         used += w;
     }
     out
@@ -164,8 +314,8 @@ pub fn checkbox_marker(checked: bool, th: &Theme) -> Span<'static> {
 pub fn health_marker(r: &SkillRecord, th: &Theme) -> Span<'static> {
     use skills::reconcile::SkillStatus::*;
     let (glyph, style) = match &r.status {
-        Local | Repository => ("●   ", th.ok()),
-        MissingBaseline => ("●   ", th.warn()),
+        Local | Repository => (" ●  ", th.ok()),
+        MissingBaseline => (" ●  ", th.warn()),
         MissingSource => ("!   ", th.warn()),
         Modified => ("~   ", th.warn()),
         Missing | Invalid { .. } | CorruptMeta { .. } => ("!   ", th.err()),
@@ -271,21 +421,88 @@ pub fn skill_card(
     let pills_w: usize = pills.iter().map(|s| width(&s.content)).sum();
     let source_budget = inner_w.saturating_sub(pills_w + usize::from(pills_w > 0));
     let source = fit(&source, source_budget);
-    let mut foot = vec![Span::styled(source.clone(), th.dim())];
+    let mut foot = vec![Span::styled(source.clone(), Style::default().fg(th.source))];
     foot.push(Span::raw(
         " ".repeat(inner_w.saturating_sub(width(&source) + pills_w)),
     ));
     foot.extend(pills);
     vec![
         Line::from(head),
-        Line::from(highlight_spans(&summary[0], terms, th.dim(), th)),
-        Line::from(highlight_spans(&summary[1], terms, th.dim(), th)),
+        Line::from(highlight_spans(
+            &summary[0],
+            terms,
+            Style::default().add_modifier(Modifier::DIM),
+            th,
+        )),
+        Line::from(highlight_spans(
+            &summary[1],
+            terms,
+            Style::default().add_modifier(Modifier::DIM),
+            th,
+        )),
         Line::from(foot),
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pills_share_coverage_spacing_focus_and_width_for_every_cap_style() {
+        let root = skills::ops::DownloadDir::new("pill-format").unwrap();
+        let mut ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        for caps in [
+            skills::config::PillCaps::Round,
+            skills::config::PillCaps::Block,
+            skills::config::PillCaps::None,
+        ] {
+            ws.config.ui.pill_caps = caps;
+            let ctx = Ctx {
+                ws: &ws,
+                snap: &snap,
+                theme: &theme,
+            };
+            for (coverage, text) in [
+                ((0, 0), " ◦ lark 0/0 "),
+                ((0, 28), " ◌ lark 0/28 "),
+                ((1, 28), " ◐ lark 1/28 "),
+                ((28, 28), " ✓ lark 28/28 "),
+            ] {
+                let pill = Pill {
+                    coverage: Some(coverage),
+                    ..Pill::new("lark", theme.tag)
+                };
+                let spans = pill.render(&ctx, 100);
+                assert_eq!(spans[1].content, text);
+                assert_eq!(spans[0].content, caps.glyphs().0);
+                assert_eq!(spans[2].content, caps.glyphs().1);
+                let selected = Pill {
+                    selected: true,
+                    focused: true,
+                    ..pill
+                };
+                let focused = selected.render(&ctx, 100);
+                assert_eq!(focused[1].style.bg, spans[1].style.bg);
+                assert!(
+                    focused[1]
+                        .style
+                        .add_modifier
+                        .contains(Modifier::BOLD | Modifier::UNDERLINED)
+                );
+                for width in 0..30 {
+                    assert!(
+                        selected
+                            .render(&ctx, width)
+                            .iter()
+                            .map(Span::width)
+                            .sum::<usize>()
+                            <= width
+                    );
+                }
+            }
+        }
+    }
     use super::*;
 
     #[test]
@@ -343,6 +560,37 @@ mod tests {
             snap: &snap,
             theme: &theme,
         };
+        for fill in (0..=255).map(Color::Indexed).chain([
+            Color::Black,
+            Color::Red,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+            Color::Magenta,
+            Color::Cyan,
+            Color::Gray,
+            Color::DarkGray,
+            Color::LightRed,
+            Color::LightGreen,
+            Color::LightYellow,
+            Color::LightBlue,
+            Color::LightMagenta,
+            Color::LightCyan,
+            Color::White,
+            Color::Reset,
+            Color::Rgb(128, 128, 128),
+            Color::Rgb(0, 180, 0),
+            Color::Rgb(255, 0, 128),
+        ]) {
+            let spans = Pill::new("label", fill).render(&ctx, usize::MAX);
+            let bg = spans[1].style.bg.unwrap();
+            let fg = spans[1].style.fg.unwrap();
+            assert!(matches!(bg, Color::Rgb(..)));
+            assert_eq!(spans[0].style.fg, Some(bg));
+            assert_eq!(spans[2].style.fg, Some(bg));
+            let (a, b) = (luminance(fg), luminance(bg));
+            assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5, "{fill:?}");
+        }
         let mut record = snap.get(key).unwrap().clone();
         for status in [
             skills::reconcile::SkillStatus::Repository,

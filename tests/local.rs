@@ -222,6 +222,7 @@ fn shared_readers_sync_union_of_presets_and_undeploy_only_once() {
     skill(&ws.root.join(key));
     ws.presets
         .save(&skills::preset::Preset {
+            color: None,
             name: "only-gemini-cli".into(),
             description: None,
             skills: vec![key.into()],

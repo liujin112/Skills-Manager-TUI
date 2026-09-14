@@ -642,6 +642,12 @@ impl Modal {
 
     pub fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if matches!(self, Modal::Confirm { .. } | Modal::ConfirmWrite { .. })
+            && k.modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return vec![];
+        }
         match self {
             Modal::DeploymentChoices(picker) => picker.key(k),
             Modal::PresetSkills(view) => view.handle_key(k, ctx),
@@ -657,7 +663,20 @@ impl Modal {
                     *scroll = scroll.saturating_sub(1);
                     vec![]
                 }
-                _ => vec![Action::CloseModal],
+                KeyCode::PageDown => {
+                    *scroll = scroll.saturating_add(10);
+                    vec![]
+                }
+                KeyCode::PageUp => {
+                    *scroll = scroll.saturating_sub(10);
+                    vec![]
+                }
+                KeyCode::Home => {
+                    *scroll = 0;
+                    vec![]
+                }
+                KeyCode::Esc | KeyCode::Char('q') => vec![Action::CloseModal],
+                _ => vec![],
             },
             Modal::Confirm {
                 actions,
@@ -1076,12 +1095,23 @@ impl Modal {
                     })
                     .map(|l| help_line(l, th))
                     .collect();
-                let r = centered(area, 78, lines.len() as u16 + 2);
+                let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+                let content_width = 78.min(area.width.saturating_sub(2)).saturating_sub(2);
+                let total = paragraph.line_count(content_width).min(u16::MAX as usize) as u16;
+                let r = centered(area, 78, total.saturating_add(2));
+                let visible = r.height.saturating_sub(2);
+                *scroll = (*scroll).min(total.saturating_sub(visible));
                 f.render_widget(Clear, r);
                 f.render_widget(
-                    Paragraph::new(lines)
-                        .scroll((*scroll, 0))
-                        .block(th.block(" help ", true)),
+                    paragraph.scroll((*scroll, 0)).block(th.block(
+                        format!(
+                            " help · {}–{}/{} ",
+                            (*scroll + 1).min(total),
+                            (*scroll + visible).min(total),
+                            total
+                        ),
+                        true,
+                    )),
                     r,
                 );
             }
@@ -1697,7 +1727,13 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
     }
 }
 
-const HELP: &str = "Library
+const HELP: &str = "Global
+  Ctrl-Z  Ctrl-Y    undo and redo the last change
+  1-6               switch tabs outside text inputs
+  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
+  /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit
+
+Library
   F2                settings
   type              fuzzy search over name, tags, description, note
   tag:x agent:y     filters; also status:modified  source:repository  untagged
@@ -1713,6 +1749,7 @@ const HELP: &str = "Library
   Esc               cancel multi-select; hidden selections never participate
   u  U              check upstream / update from upstream (git sources)
 Tags / Presets
+  C                 choose group colour (name or #rrggbb; none resets)
   c / a             create a group / add skills
   e / r / D         description / rename / delete group
   C / m             Tags: color / merge (left panel)
@@ -1723,19 +1760,24 @@ Tags / Presets
   t / d / p         batch tags / deploy / add to preset
   x                 remove selected skills from the current tag or preset
   Enter / click     toggle or create a tag immediately; Esc closes the picker
+  Tab               complete an existing tag in the picker
+  Backspace         empty tag input: select last token; press again to remove
+  Esc               clear a local name filter; press again to go back
 Agents
   /                 filter preset pills or skills, according to focus
+  arrows            agent → scope → presets → skills; ↑ returns to the group above
+  Enter / Space     install or uninstall the focused preset
+  Enter             preview the focused skill
+  i / x / m         install / uninstall / multi-uninstall skills
+  v                 change skill layout
+  [ / ]             previous / next agent
   a                 adopt an entry the agent has but the root does not
 Mouse
   click             focus panes, select rows, press buttons, switch tabs
   double-click      open preview (or tag / preset / health item)
   right-click       deploy picker for that skill
   wheel             scroll lists and preview
-Global
-  Ctrl-Z  Ctrl-Y    undo and redo the last change
-  1-6               switch tabs outside text inputs
-  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
-  /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit";
+";
 
 fn repository_query(alias: &str, ctx: &Ctx) -> String {
     let name = ctx

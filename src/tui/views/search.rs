@@ -10,10 +10,12 @@ use crate::tui::modal::Modal;
 use crate::tui::widgets::{CardGrid, Input, ScrollTrack, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use skills::config::UiLayout;
 use skills::ops::edit;
 use skills::reconcile::{SkillRecord, SkillStatus};
@@ -748,38 +750,34 @@ impl SearchView {
         let th = ctx.theme;
         let title = Line::from(vec![
             Span::raw(" "),
-            Span::styled(
-                {
-                    let total = ctx
-                        .snap
-                        .skills
-                        .iter()
-                        .filter(|r| self.includes_record(r))
-                        .count();
-                    let local_total = ctx
-                        .snap
-                        .skills
-                        .iter()
-                        .filter(|r| {
-                            self.includes_record(r)
-                                && skills::repository::alias_of(&r.key).is_none()
-                        })
-                        .count();
-                    let local_matches = self
-                        .hits
-                        .iter()
-                        .filter(|h| {
-                            skills::repository::alias_of(&ctx.snap.skills[h.index].key).is_none()
-                        })
-                        .count();
-                    format!(
-                        "{local_matches}/{local_total} local · {}/{} repository installs",
-                        self.hits.len() - local_matches,
-                        total - local_total
-                    )
-                },
-                th.dim(),
-            ),
+            Span::raw({
+                let total = ctx
+                    .snap
+                    .skills
+                    .iter()
+                    .filter(|r| self.includes_record(r))
+                    .count();
+                let local_total = ctx
+                    .snap
+                    .skills
+                    .iter()
+                    .filter(|r| {
+                        self.includes_record(r) && skills::repository::alias_of(&r.key).is_none()
+                    })
+                    .count();
+                let local_matches = self
+                    .hits
+                    .iter()
+                    .filter(|h| {
+                        skills::repository::alias_of(&ctx.snap.skills[h.index].key).is_none()
+                    })
+                    .count();
+                format!(
+                    "{local_matches}/{local_total} local · {}/{} repository installs",
+                    self.hits.len() - local_matches,
+                    total - local_total
+                )
+            }),
             Span::raw(" "),
         ]);
         let block = th.block(title, self.panel_active && self.focus == Focus::Input);
@@ -797,15 +795,16 @@ impl SearchView {
             width: inner.width.saturating_sub(4),
             ..inner
         };
-        self.input.render(
+        let usage = if ctx.ws.config.tags_enabled {
+            "   repo:owner/repo  tag:x  agent:y  source:local  untagged"
+        } else {
+            "   repo:owner/repo  agent:y  source:local"
+        };
+        self.input.render_hint(
             f,
             field,
             self.panel_active && self.focus == Focus::Input,
-            if ctx.ws.config.tags_enabled {
-                "search skills…   repo:owner/repo  tag:x  agent:y  source:local  untagged"
-            } else {
-                "search skills…   repo:owner/repo  agent:y  source:local"
-            },
+            ("search skills…", usage),
             th,
         );
     }
@@ -882,7 +881,13 @@ impl SearchView {
         }
 
         let selected = self.grid.selected();
-        for i in self.grid.visible() {
+        let full = self.grid.visible();
+        let end = if cards && !inner.height.is_multiple_of(CARD_H) {
+            (full.end + cols).min(self.hits.len())
+        } else {
+            full.end
+        };
+        for i in full.start..end {
             let Some(cell) = self.grid.cell(i) else {
                 continue;
             };
@@ -890,7 +895,22 @@ impl SearchView {
             let r = &ctx.snap.skills[h.index];
             let on = selected == Some(i);
             if cards {
-                let ci = frame(f, cell, on, self.focus == Focus::List, th);
+                let ci = if cell.height < CARD_H {
+                    // An open lower edge shows that this card continues below
+                    // the viewport, rather than looking like a shorter card.
+                    let block = Block::default()
+                        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                        .border_type(BorderType::Rounded)
+                        .border_style(th.dim().add_modifier(ratatui::style::Modifier::DIM));
+                    let ci = block.inner(cell).inner(Margin {
+                        horizontal: 1,
+                        vertical: 0,
+                    });
+                    f.render_widget(block, cell);
+                    ci
+                } else {
+                    frame(f, cell, on, self.focus == Focus::List, th)
+                };
                 // While searching the card shows the excerpt around the match
                 // and names the fields it matched in; a hit on the name or a
                 // tag has no excerpt, so the description stays.
@@ -1003,6 +1023,32 @@ impl SearchView {
             }
         }
 
+        if cards && area.width > 4 {
+            let more = if full.end < self.hits.len() {
+                "↓ more · "
+            } else {
+                ""
+            };
+            let hint = format!(
+                " {}{}–{} / {} ",
+                more,
+                full.start + 1,
+                full.end,
+                self.hits.len()
+            );
+            let hint = fit(&hint, area.width.saturating_sub(4) as usize);
+            let hint_width = width(&hint) as u16;
+            f.render_widget(
+                Paragraph::new(Span::styled(hint, th.skill_count())),
+                Rect::new(
+                    area.right() - 2 - hint_width,
+                    area.bottom() - 1,
+                    hint_width,
+                    1,
+                ),
+            );
+        }
+
         // Item space here is grid rows, which is what the thumb is measuring and
         // what a click on the track has to land on.
         let vis = self.grid.visible_rows();
@@ -1071,6 +1117,18 @@ impl SearchView {
 }
 
 impl View for SearchView {
+    fn status(&self, ctx: &Ctx) -> String {
+        if !self.multi {
+            return String::new();
+        }
+        let selected = self.visible_checked(ctx).len();
+        let hidden = self.checked.len().saturating_sub(selected);
+        if hidden > 0 {
+            format!(" {selected} selected · {hidden} hidden ")
+        } else {
+            format!(" {selected} selected ")
+        }
+    }
     fn refresh(&mut self, ctx: &Ctx) {
         self.searcher.configure(
             ctx.ws.config.search.clone(),
@@ -1465,7 +1523,7 @@ impl View for SearchView {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(1),
-                Constraint::Length(1),
+                Constraint::Length(u16::from(self.is_picker())),
             ])
             .split(area);
         self.draw_input(f, rows[0], ctx);
@@ -1489,77 +1547,81 @@ impl View for SearchView {
         }
         self.overlay.draw(f, rows[1], ctx);
         self.batch_buttons.clear();
-        let bar = rows[2];
-        let mut x = bar.x;
-        let selected = self.visible_checked(ctx).len();
-        let status = if self.multi {
-            let hidden = self.checked.len().saturating_sub(selected);
-            format!(
-                " Multi-select · {selected} selected{} ",
-                if hidden > 0 {
-                    format!(" · {hidden} hidden (excluded)")
-                } else {
-                    String::new()
-                }
-            )
-        } else {
-            self.selected(ctx)
-                .map(|r| {
-                    if r.status.is_healthy() {
-                        format!(" {} ", r.source_kind())
+        if self.is_picker() {
+            let bar = rows[2];
+            let mut x = bar.x;
+            let selected = self.visible_checked(ctx).len();
+            let status = if self.multi {
+                let hidden = self.checked.len().saturating_sub(selected);
+                format!(
+                    " Multi-select · {selected} selected{} ",
+                    if hidden > 0 {
+                        format!(" · {hidden} hidden (excluded)")
                     } else {
-                        format!(" {} · {} ", r.source_kind(), r.status.label())
+                        String::new()
                     }
-                })
-                .unwrap_or_default()
-        };
-        let status = fit(&status, bar.width as usize / 2);
-        let w = width(&status) as u16;
-        f.render_widget(
-            Paragraph::new(Span::styled(status, ctx.theme.dim())),
-            Rect::new(x, bar.y, w, 1),
-        );
-        x += w;
-        let buttons: &[(&str, char)] = if self.is_picker() {
-            &[
-                ("[Select all]", 'a'),
-                ("[Apply a]", 'c'),
-                ("[Cancel Esc]", 'e'),
-            ]
-        } else if self.multi {
-            &[
-                ("[Select all]", 'a'),
-                ("[Tags t]", 't'),
-                ("[Deploy d]", 'd'),
-                ("[Preset p]", 'p'),
-                ("[Cancel Esc]", 'e'),
-            ]
-        } else {
-            &[("[Multi-select m]", 'm')]
-        };
-        for (label, command) in buttons {
-            let w = width(label) as u16;
-            if x + w > bar.right() {
-                break;
-            }
-            let rect = Rect::new(x, bar.y, w, 1);
-            let enabled =
-                self.is_picker() || !self.multi || selected > 0 || matches!(*command, 'e' | 'a');
+                )
+            } else {
+                self.selected(ctx)
+                    .map(|r| {
+                        if r.status.is_healthy() {
+                            format!(" {} ", r.source_kind())
+                        } else {
+                            format!(" {} · {} ", r.source_kind(), r.status.label())
+                        }
+                    })
+                    .unwrap_or_default()
+            };
+            let status = fit(&status, bar.width as usize / 2);
+            let w = width(&status) as u16;
             f.render_widget(
-                Paragraph::new(Span::styled(
-                    *label,
-                    if enabled {
-                        ctx.theme.accent()
-                    } else {
-                        ctx.theme.dim()
-                    },
-                )),
-                rect,
+                Paragraph::new(Span::styled(status, ctx.theme.dim())),
+                Rect::new(x, bar.y, w, 1),
             );
-            if enabled {
-                self.batch_buttons.push((rect, *command));
+            x += w;
+            let buttons: &[(&str, char)] = if self.is_picker() {
+                &[
+                    ("[Select all]", 'a'),
+                    ("[Apply a]", 'c'),
+                    ("[Cancel Esc]", 'e'),
+                ]
+            } else if self.multi {
+                &[
+                    ("[Select all]", 'a'),
+                    ("[Tags t]", 't'),
+                    ("[Deploy d]", 'd'),
+                    ("[Preset p]", 'p'),
+                    ("[Cancel Esc]", 'e'),
+                ]
+            } else {
+                &[("[Multi-select m]", 'm')]
+            };
+            for (label, command) in buttons {
+                let w = width(label) as u16;
+                if x + w > bar.right() {
+                    break;
+                }
+                let rect = Rect::new(x, bar.y, w, 1);
+                let enabled = self.is_picker()
+                    || !self.multi
+                    || selected > 0
+                    || matches!(*command, 'e' | 'a');
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        *label,
+                        if enabled {
+                            ctx.theme.accent()
+                        } else {
+                            ctx.theme.dim()
+                        },
+                    )),
+                    rect,
+                );
+                if enabled {
+                    self.batch_buttons.push((rect, *command));
+                }
+                x += w + 1;
             }
-            x += w + 1;
         }
         if self.panel_active && self.focus == Focus::Input && !self.overlay.is_open() {
             self.completion.draw(f, rows[1], ctx);
@@ -1602,12 +1664,13 @@ impl View for SearchView {
         }
         if self.is_picker() {
             return &[
+                ("a", "apply"),
                 ("Space", "select"),
                 ("Ctrl+A", "select all results"),
                 ("/", "search"),
                 ("v/V", "layout"),
                 ("Enter", "preview"),
-                ("a/Ctrl+Enter", "apply"),
+                ("Ctrl+Enter", "apply"),
                 ("Esc", "cancel"),
             ];
         }
@@ -1637,6 +1700,8 @@ impl View for SearchView {
                 ("F1", "help"),
             ],
             Focus::List => &[
+                ("Enter", "preview"),
+                ("Esc", "search"),
                 ("m", "multi-select"),
                 ("t", "tags"),
                 ("n", "note"),
@@ -1646,7 +1711,6 @@ impl View for SearchView {
                 ("a", "accept repo changes"),
                 ("u/U", "check/update"),
                 ("x", "remove"),
-                ("Enter", "preview"),
                 ("i", "install"),
                 ("R", "repos"),
                 ("v/V", "layout"),
@@ -1873,6 +1937,46 @@ mod tests {
         assert_eq!(view.rendered_layout, UiLayout::List);
         assert_eq!(view.grid.cell(3).unwrap().height, 4);
         assert_eq!(view.selected(&ctx).unwrap().key, selected);
+
+        view.layout = Some(UiLayout::Grid);
+        view.set_query("", &ctx);
+        view.grid.first(view.hits.len());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(124, 20)).unwrap();
+        let area = Rect::new(0, 0, 124, 16);
+        terminal.draw(|f| view.draw_results(f, area, &ctx)).unwrap();
+        assert_eq!(view.grid.visible(), 0..6);
+        let peek = view.grid.cell(6).unwrap();
+        assert_eq!(peek.height, 2);
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..124)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(peek.y + 1).contains("printer-06"));
+        assert!(row(area.bottom() - 1).contains("↓ more · 1–6 / 12"));
+        assert_eq!(buffer[(peek.x, peek.y + 1)].symbol(), "│");
+        assert_eq!(buffer[(0, area.bottom() - 1)].symbol(), "╰");
+        assert_eq!(buffer[(2, area.bottom() - 1)].symbol(), "─");
+        assert_eq!(buffer[(123, area.bottom() - 1)].symbol(), "╯");
+        assert!(row(area.bottom()).trim().is_empty());
+
+        // Clicking the peek scrolls it fully into view, including after resize.
+        assert_eq!(view.grid.click(peek.x + 2, peek.y + 1).unwrap().0, 6);
+        for height in 14..20 {
+            terminal
+                .draw(|f| view.draw_results(f, Rect::new(0, 0, 124, height), &ctx))
+                .unwrap();
+            assert_eq!(view.grid.cell(6).unwrap().height, CARD_H);
+        }
+        view.grid.last(view.hits.len());
+        terminal.draw(|f| view.draw_results(f, area, &ctx)).unwrap();
+        let bottom: String = (0..124)
+            .map(|x| terminal.backend().buffer()[(x, area.bottom() - 1)].symbol())
+            .collect();
+        assert!(bottom.contains("7–12 / 12"));
+        assert!(!bottom.contains("more"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

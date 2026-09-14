@@ -968,6 +968,7 @@ fn cli_repairs_and_preset_edits_round_trip_as_json() {
         .save(&Preset {
             name: "daily".into(),
             description: None,
+            color: Some("#b87e54".into()),
             skills: vec!["printer".into()],
             agents: vec![],
         })
@@ -988,6 +989,7 @@ fn cli_repairs_and_preset_edits_round_trip_as_json() {
     assert!(ws.presets.load("daily").unwrap().is_none());
     let v = skills_json(&f.root, &["preset", "show", "weekly"]).unwrap();
     assert_eq!(v["skills"][0], "printer");
+    assert_eq!(v["color"], "#b87e54");
     assert!(skills_json(&f.root, &["preset", "rename", "daily", "weekly"]).is_err());
 }
 

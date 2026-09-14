@@ -14,6 +14,8 @@ pub struct Preset {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     #[serde(default)]
     pub skills: Vec<String>,
     /// Agents this preset targets; empty means every configured agent.

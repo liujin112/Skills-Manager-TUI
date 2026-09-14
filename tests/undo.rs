@@ -708,6 +708,7 @@ fn preset_case_only_rename_preserves_contents_references_and_history() {
     config_by_hand(&fx);
     let ws = fx.ws();
     let original = Preset {
+        color: Some("#b87e54".into()),
         name: "commute".into(),
         description: Some("Daily tools".into()),
         skills: vec!["bicycle".into()],

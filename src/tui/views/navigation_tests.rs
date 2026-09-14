@@ -7,6 +7,30 @@ use skills::{Workspace, config::Config, ops::edit, preset::Preset};
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
+
+#[test]
+fn tag_and_preset_first_item_move_up_to_filter_and_down_to_results() {
+    let ws = fixture("group-filter-navigation");
+    let snap = ws.scan().unwrap();
+    let theme = Theme::default();
+    let ctx = Ctx {
+        ws: &ws,
+        snap: &snap,
+        theme: &theme,
+    };
+    let mut tags = TagsView::default();
+    tags.refresh(&ctx);
+    tags.handle_key(key(KeyCode::Up), &ctx);
+    assert!(tags.input_focused());
+    tags.handle_key(key(KeyCode::Down), &ctx);
+    assert!(!tags.input_focused());
+    let mut presets = PresetsView::default();
+    presets.refresh(&ctx);
+    presets.handle_key(key(KeyCode::Up), &ctx);
+    assert!(presets.input_focused());
+    presets.handle_key(key(KeyCode::Down), &ctx);
+    assert!(!presets.input_focused());
+}
 fn fixture(label: &str) -> Workspace {
     let root = std::env::temp_dir().join(format!("skills-panel-{label}-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();

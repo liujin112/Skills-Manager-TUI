@@ -57,6 +57,7 @@ pub struct Batch {
     buttons: [Rect; 2],
     tag_chips: Vec<(Rect, String)>,
     selected_tags: Vec<String>,
+    remove_armed: bool,
     error: Option<String>,
 }
 impl Batch {
@@ -76,6 +77,7 @@ impl Batch {
             buttons: [Rect::default(); 2],
             tag_chips: vec![],
             selected_tags: vec![],
+            remove_armed: false,
             error: None,
         }
     }
@@ -163,13 +165,29 @@ impl Batch {
             return &[("…", "applying changes")];
         }
         if self.kind == Kind::Tags {
-            return &[
-                ("↑↓", "choose"),
-                ("Enter", "add / create"),
-                ("Backspace", "remove last when empty"),
-                ("Tab", "complete"),
-                ("Esc", "done"),
-            ];
+            return if self
+                .list
+                .selected()
+                .and_then(|i| self.shown.get(i))
+                .and_then(|i| self.rows.get(*i))
+                .is_some_and(|r| r.count == self.keys.len())
+            {
+                &[
+                    ("Enter", "remove"),
+                    ("↑↓", "choose"),
+                    ("Tab", "complete"),
+                    ("Backspace", "select last · again removes"),
+                    ("Esc", "done"),
+                ]
+            } else {
+                &[
+                    ("Enter", "add / create"),
+                    ("↑↓", "choose"),
+                    ("Tab", "complete"),
+                    ("Backspace", "select last · again removes"),
+                    ("Esc", "done"),
+                ]
+            };
         }
         if self.focus == 0 {
             &[
@@ -224,6 +242,7 @@ impl Batch {
         }
     }
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
+        self.remove_armed = false;
         if self.focus != 0 {
             return vec![];
         }
@@ -242,13 +261,20 @@ impl Batch {
             return vec![Action::CloseModal];
         }
         if self.kind == Kind::Tags {
+            if k.code != KeyCode::Backspace {
+                self.remove_armed = false;
+            }
             match k.code {
                 KeyCode::Down => self.list.move_by(1, self.shown.len()),
                 KeyCode::Up => self.list.move_by(-1, self.shown.len()),
                 KeyCode::Enter => return self.edit_selected_tag(),
                 KeyCode::Backspace if self.input.value().is_empty() => {
                     if let Some(name) = self.selected_tags.last() {
-                        return self.edit_tag(name.clone(), false);
+                        if self.remove_armed {
+                            self.remove_armed = false;
+                            return self.edit_tag(name.clone(), false);
+                        }
+                        self.remove_armed = true;
                     }
                 }
                 KeyCode::Tab => {
@@ -467,6 +493,7 @@ impl Batch {
         }
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        self.remove_armed = false;
         let at = ratatui::layout::Position::new(m.column, m.row);
         if self.kind == Kind::Tags {
             match m.kind {
@@ -474,10 +501,17 @@ impl Batch {
                     if !self.rect.contains(at) {
                         return vec![Action::CloseModal];
                     }
-                    if let Some((_, name)) =
+                    if let Some((rect, name)) =
                         self.tag_chips.iter().find(|(rect, _)| rect.contains(at))
                     {
-                        return self.edit_tag(name.clone(), false);
+                        let (_, right) = ctx.ws.config.ui.pill_caps.glyphs();
+                        let close_x = rect
+                            .right()
+                            .saturating_sub(super::widgets::width(right) as u16 + 2);
+                        if m.column == close_x {
+                            return self.edit_tag(name.clone(), false);
+                        }
+                        return vec![];
                     }
                     if self.input_rect.contains(at) {
                         self.input.click(m.column);
@@ -610,7 +644,20 @@ impl Batch {
             );
             f.render_widget(OverlayClear, self.rect);
             let block = ctx.theme.block("", false).title(Line::from(Span::styled(
-                format!(" Tags · {} selected ", self.selected_tags.len()),
+                format!(
+                    " Tags · {} ",
+                    if self.keys.len() == 1 {
+                        fit(
+                            &ctx.snap
+                                .get(&self.keys[0])
+                                .and_then(|s| s.name.clone())
+                                .unwrap_or_else(|| self.keys[0].clone()),
+                            w.saturating_sub(12) as usize,
+                        )
+                    } else {
+                        format!("{} skills · tokens shared by all", self.keys.len())
+                    }
+                ),
                 ctx.theme.accent(),
             )));
             let inner = block.inner(self.rect);
@@ -637,11 +684,20 @@ impl Batch {
                 rect.x += inner.x + 1;
                 rect.y = inner.y + rect.y - first_chip_row + u16::from(overflow);
                 f.render_widget(
-                    Paragraph::new(Line::from(super::views::cards::pill(
-                        body,
-                        super::views::cards::tag_fill(&name, ctx),
-                        ctx,
-                    ))),
+                    Paragraph::new(Line::from(
+                        super::views::cards::Pill::new(
+                            body.trim(),
+                            super::views::cards::tag_fill(&name, ctx),
+                        )
+                        .render(ctx, rect.width as usize),
+                    ))
+                    .style(
+                        if self.remove_armed && self.selected_tags.last() == Some(&name) {
+                            Style::default().add_modifier(ratatui::style::Modifier::UNDERLINED)
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     rect,
                 );
                 self.tag_chips.push((rect, name));
@@ -674,29 +730,34 @@ impl Batch {
                         let fill = super::views::cards::tag_fill(&row.id, ctx);
                         let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
                         let caps_width = super::widgets::width(left) + super::widgets::width(right);
+                        let membership = if row.count == self.keys.len() {
+                            "✓".to_string()
+                        } else if row.count > 0 {
+                            format!("{}/{}", row.count, self.keys.len())
+                        } else {
+                            " ".to_string()
+                        };
                         let label = fit(
                             &row.label,
-                            (self.list.rows.width as usize).saturating_sub(7 + caps_width),
+                            (self.list.rows.width as usize).saturating_sub(
+                                6 + caps_width + super::widgets::width(&membership),
+                            ),
                         );
                         let chip = format!(" {label} ");
-                        let gap =
-                            self.list.rows.width.saturating_sub(
-                                (super::widgets::width(&chip) + caps_width) as u16 + 3,
-                            );
+                        let gap = self.list.rows.width.saturating_sub(
+                            (super::widgets::width(&chip)
+                                + caps_width
+                                + super::widgets::width(&membership))
+                                as u16
+                                + 2,
+                        );
                         let mut spans = vec![Span::raw(" ")];
-                        spans.extend(super::views::cards::pill(chip, fill, ctx));
+                        spans.extend(
+                            super::views::cards::Pill::new(&label, fill).render(ctx, usize::MAX),
+                        );
                         spans.extend([
                             Span::raw(" ".repeat(gap as usize)),
-                            Span::styled(
-                                if row.count == self.keys.len() {
-                                    "✓"
-                                } else if row.count > 0 {
-                                    "−"
-                                } else {
-                                    " "
-                                },
-                                ctx.theme.ok(),
-                            ),
+                            Span::styled(membership, ctx.theme.ok()),
                             Span::raw(" "),
                         ]);
                         Line::from(spans)
@@ -729,19 +790,19 @@ impl Batch {
                 f.render_stateful_widget(List::new(items), self.list.rows, &mut self.list.state);
             }
             f.render_widget(
-                Paragraph::new(
-                    if self
-                        .list
-                        .selected()
-                        .and_then(|i| self.shown.get(i))
-                        .and_then(|i| self.rows.get(*i))
-                        .is_some_and(|r| r.count == self.keys.len())
-                    {
-                        "Enter remove · Esc done"
-                    } else {
-                        "Enter add · × remove · Esc done"
-                    },
-                )
+                Paragraph::new(if self.remove_armed {
+                    "Backspace removes last tag · type to cancel"
+                } else if self
+                    .list
+                    .selected()
+                    .and_then(|i| self.shown.get(i))
+                    .and_then(|i| self.rows.get(*i))
+                    .is_some_and(|r| r.count == self.keys.len())
+                {
+                    "Enter remove · Esc done"
+                } else {
+                    "Enter add · × remove · Esc done"
+                })
                 .style(ctx.theme.dim()),
                 Rect::new(
                     inner.x + 2,
@@ -979,17 +1040,32 @@ mod tests {
             let (left, right) = caps.glyphs();
             assert!(text.contains(&format!("{left} new-tag × {right}")));
         }
-        // Clicking the selected token removes it immediately.
+        // Only the close glyph removes a token.
         let chip = batch
             .tag_chips
             .iter()
             .find(|(_, name)| name == "new-tag")
             .unwrap()
             .0;
+        assert!(
+            batch
+                .mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: chip.x,
+                        row: chip.y,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &ctx
+                )
+                .is_empty()
+        );
         let actions = batch.mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: chip.x,
+                column: chip.right()
+                    - super::super::widgets::width(ws.config.ui.pill_caps.glyphs().1) as u16
+                    - 2,
                 row: chip.y,
                 modifiers: KeyModifiers::NONE,
             },
@@ -1069,6 +1145,8 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         assert!(batch.key(key, &ctx).is_empty());
         assert!(batch.input.value().is_empty());
+        assert!(batch.key(key, &ctx).is_empty());
+        assert!(batch.remove_armed);
         let Action::WriteMeta(write) = batch.key(key, &ctx).remove(0) else {
             panic!("remove last token")
         };

@@ -885,7 +885,7 @@ impl View for HealthView {
     /// or without `U`.
     fn hints(&self) -> Hints {
         if self.filter.editing {
-            return &[("Enter/↓", "issues"), ("Esc", "finish filter")];
+            return &[("Enter/↓", "issues"), ("Esc", "clear filter")];
         }
         if let Some(hints) = self.preview.hints() {
             return hints;
