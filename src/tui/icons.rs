@@ -29,6 +29,17 @@ pub fn git(mode: Icons, url: &str) -> &'static str {
     }
 }
 
+pub fn source_icon(mode: Icons, source: &Source) -> &'static str {
+    match source {
+        Source::Git { url, .. } => git(mode, url),
+        Source::Archive { .. } => match mode {
+            Icons::Nerd => "󰏗",
+            Icons::Text => "archive",
+        },
+        Source::Local { .. } => local(mode),
+    }
+}
+
 pub fn branch(mode: Icons) -> &'static str {
     match mode {
         Icons::Nerd => "󰘬",
@@ -61,21 +72,16 @@ pub fn scope(mode: Icons, global: bool, repository: bool) -> &'static str {
 
 pub fn source(mode: Icons, source: &Source) -> String {
     match source {
-        Source::Git {
-            url,
-            subpath,
-            branch: tracked,
-            revision,
-        } => {
-            let mut text = format!("{} {url}", git(mode, url));
-            if let Some(path) = subpath {
+        Source::Git { url, .. } | Source::Archive { url, .. } => {
+            let mut text = format!("{} {url}", source_icon(mode, source));
+            if let Some(path) = source.subpath() {
                 text.push_str(&format!(" · {path}"));
             }
-            if let Some(name) = tracked {
+            if let Some(name) = source.branch() {
                 text.push_str(&format!(" · {} {name}", branch(mode)));
             }
-            if let Some(rev) = revision {
-                text.push_str(&format!(" ({})", rev.chars().take(7).collect::<String>()));
+            if let Some(rev) = source.revision() {
+                text.push_str(&format!(" ({})", skills::meta::short_rev(rev)));
             }
             text
         }
@@ -110,6 +116,25 @@ mod tests {
             assert_eq!(git(Icons::Nerd, url), "󰊢");
             assert_eq!(git(Icons::Text, url), "git");
         }
+    }
+
+    #[test]
+    fn archive_source_uses_archive_identity_even_when_hosted_on_github() {
+        let archive = Source::Archive {
+            url: "https://github.com/example/tools/releases/download/v1/skills.zip".into(),
+            subpath: Some("bundle/review".into()),
+            revision: Some("sha256:0123456789abcdef".into()),
+        };
+        assert_eq!(source_icon(Icons::Text, &archive), "archive");
+        assert_ne!(
+            source_icon(Icons::Nerd, &archive),
+            git(Icons::Nerd, archive.url().unwrap())
+        );
+        let text = source(Icons::Text, &archive);
+        assert!(text.starts_with("archive https://github.com/"));
+        assert!(text.contains(" · bundle/review"));
+        assert!(text.ends_with("(0123456789ab)"));
+        assert!(!text.contains("branch"));
     }
 
     #[test]

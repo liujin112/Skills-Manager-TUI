@@ -684,7 +684,7 @@ impl App {
                     },
                 ))),
             ],
-            // Legacy git installs with several skills enter the shared repository picker.
+            // Multi-skill sources use the same repository picker as direct discovery.
             TaskOutput::Installed(reference, Err(e)) => {
                 match e.downcast_ref::<skills::ops::install::NotOneSkill>() {
                     Some(_) => vec![Action::Spawn(Task::DiscoverRepository(reference))],
@@ -1249,7 +1249,7 @@ impl App {
         let id = self.next_task_id;
         let label = match &task {
             Task::Scan | Task::PollRoot => None,
-            Task::DiscoverRepository(reference) => Some(format!("Clone {reference}")),
+            Task::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
             Task::InstallRepository(selection) => {
                 Some(format!("Install {}", selection.fetched.repository.alias))
             }
@@ -2133,6 +2133,7 @@ mod matrix_key_tests {
             }
             let fetched = skills::repository::FetchedRepository {
                 repository: skills::repository::Repository {
+                    kind: Default::default(),
                     alias: reference.into(),
                     url: format!("https://example.com/sample/{reference}"),
                     branch: "main".into(),

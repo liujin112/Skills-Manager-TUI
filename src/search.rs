@@ -94,14 +94,14 @@ impl Query {
             }
         }
         if !self.repositories.is_empty()
-            && !self
-                .repositories
-                .iter()
-                .any(|a| {
-                    crate::repository::alias_of(&r.key) == Some(a.as_str())
-                        || matches!(&r.source, Some(crate::meta::Source::Git { url, .. })
-                            if crate::repository::source_name(url).is_some_and(|name| name.eq_ignore_ascii_case(a)))
-                })
+            && !self.repositories.iter().any(|a| {
+                crate::repository::alias_of(&r.key) == Some(a.as_str())
+                    || r.source
+                        .as_ref()
+                        .and_then(crate::meta::Source::url)
+                        .and_then(crate::repository::source_name)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(a))
+            })
         {
             return false;
         }
@@ -1105,6 +1105,15 @@ mod tests {
         }
         r.key = "old-flat-install".into();
         assert!(Query::parse("repo:sampleorg/kit").filter(&r));
+        r.source = Some(crate::meta::Source::Archive {
+            url: "https://example.com/sampleorg/kit".into(),
+            subpath: Some("bundle/review".into()),
+            revision: Some("digest".into()),
+        });
+        assert!(Query::parse("repo:sampleorg/kit").filter(&r));
+        assert!(!Query::parse("repo:other/cli").filter(&r));
+        assert!(Query::parse("source:repository").filter(&r));
+        assert!(!Query::parse("source:local").filter(&r));
     }
 
     #[test]

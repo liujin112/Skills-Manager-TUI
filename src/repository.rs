@@ -1,8 +1,8 @@
-//! Git repository identities and discovery. Aliases are labels, never URL encodings.
+//! Remote source identities and shared skill discovery. Aliases are labels, never URL encodings.
 use crate::{
     Workspace,
-    meta::Source,
-    ops::{DownloadDir, fresh_staging, git},
+    meta::{Source, SourceKind},
+    ops::{DownloadDir, fresh_staging},
     util::{valid_skill_key, write_atomic},
 };
 use anyhow::{Context, Result, bail};
@@ -73,10 +73,33 @@ pub fn resolve_local_names(
 pub struct Repository {
     pub alias: String,
     pub url: String,
+    #[serde(default)]
+    pub kind: SourceKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub branch: String,
 }
 
 impl Repository {
+    pub fn source(&self, path: &str, revision: Option<&str>) -> Source {
+        let subpath = Some(path.to_string());
+        let revision = revision.map(str::to_string);
+        match self.kind {
+            SourceKind::Git => Source::Git {
+                url: self.url.clone(),
+                branch: (!self.branch.is_empty()).then(|| self.branch.clone()),
+                subpath,
+                revision,
+            },
+            SourceKind::Archive => Source::Archive {
+                url: self.url.clone(),
+                subpath,
+                revision,
+            },
+        }
+    }
+    pub fn matches_source(&self, source: &Source, path: &str) -> bool {
+        self.source(path, None).same_location(source)
+    }
     pub fn path(root: &Path, alias: &str) -> PathBuf {
         crate::paths::meta_dir(root)
             .join("repos")
@@ -142,7 +165,12 @@ impl Repository {
         let mut doc = crate::meta::MetaStore::read(&path)?;
         doc["alias"] = toml_edit::value(self.alias.as_str());
         doc["url"] = toml_edit::value(self.url.as_str());
-        doc["branch"] = toml_edit::value(self.branch.as_str());
+        doc["kind"] = toml_edit::value(self.kind.as_str());
+        if self.kind == SourceKind::Git && !self.branch.is_empty() {
+            doc["branch"] = toml_edit::value(self.branch.as_str());
+        } else {
+            doc.remove("branch");
+        }
         write_atomic(&path, doc.to_string().as_bytes())
     }
 }
@@ -152,7 +180,21 @@ pub fn source_name(url: &str) -> Option<String> {
     if url.chars().any(char::is_whitespace) {
         return None;
     }
-    let url = url.trim_end_matches('/').trim_end_matches(".git");
+    let url = url
+        .split(['?', '#'])
+        .next()?
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    if let Some((_, rest)) = url.split_once("://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        let mut parts = path.rsplit('/').filter(|s| !s.is_empty());
+        return match (parts.next(), parts.next()) {
+            (Some(name), Some(parent)) => Some(format!("{parent}/{name}")),
+            (Some(name), None) => Some(format!("{host}/{name}")),
+            _ => (!host.is_empty()).then(|| host.to_string()),
+        };
+    }
     let parts: Vec<_> = url
         .rsplit(['/', ':'])
         .filter(|s| !s.is_empty())
@@ -162,13 +204,23 @@ pub fn source_name(url: &str) -> Option<String> {
 }
 
 pub fn default_alias(url: &str) -> String {
-    let url = url.trim_end_matches('/').trim_end_matches(".git");
-    let pieces: Vec<_> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
-    let n = pieces.len();
-    if n >= 2 {
-        format!("{}--{}", pieces[n - 2], pieces[n - 1])
-    } else {
+    let name = source_name(url).unwrap_or_else(|| "repository".into());
+    let name = name.replace('/', "--");
+    let alias: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let alias = alias.trim_matches(['.', '-']);
+    if alias.is_empty() {
         "repository".into()
+    } else {
+        alias.into()
     }
 }
 
@@ -219,36 +271,16 @@ impl FetchedRepository {
         alias: Option<&str>,
         progress: &mut dyn FnMut(&str),
     ) -> Result<Self> {
-        let crate::ops::install::InstallRef::Git {
-            url,
-            branch,
-            subpath,
-        } = reference
-        else {
-            bail!("expected a Git repository")
-        };
-        if let Some(path) = subpath {
-            validate_subpath(path)?;
-        }
+        anyhow::ensure!(reference.is_remote(), "expected a remote source");
+        let subpath = reference.subpath();
         let download = DownloadDir::new("repository")?;
         let workdir = download.path().to_path_buf();
         let result = (|| {
-            let mut args = vec!["clone", "--progress", "--depth", "1"];
-            if let Some(branch) = branch {
-                args.extend(["--branch", branch]);
-            }
-            args.extend([url, workdir.to_str().context("invalid staging path")?]);
-            progress("Clone: connecting to remote…");
-            crate::ops::git_progress(&args, progress)?;
-            progress("Scan: looking for SKILL.md…");
-            let revision = git(&["rev-parse", "HEAD"], Some(&workdir))?
-                .trim()
-                .to_string();
-            let branch = branch.clone().unwrap_or(
-                git(&["rev-parse", "--abbrev-ref", "HEAD"], Some(&workdir))?
-                    .trim()
-                    .to_string(),
-            );
+            let acquired = crate::ops::source::acquire(reference, &workdir, progress)?;
+            let url = &acquired.url;
+            let revision = acquired.revision;
+            let branch = acquired.branch.unwrap_or_default();
+            progress("Scan: looking for SKILL.md files…");
             let mut choices = Vec::new();
             let mut invalid = std::collections::BTreeMap::new();
             for entry in walkdir::WalkDir::new(&workdir)
@@ -293,14 +325,15 @@ impl FetchedRepository {
                 Some(a) => a.to_string(),
                 None => Repository::list(&ws.root)?
                     .into_iter()
-                    .find(|r| r.url == *url && r.branch == branch)
+                    .find(|r| r.url == *url && r.branch == branch && r.kind == acquired.kind)
                     .map(|r| r.alias)
                     .unwrap_or_else(|| default_alias(url)),
             };
             Ok(Self {
                 repository: Repository {
                     alias,
-                    url: url.clone(),
+                    url: url.to_string(),
+                    kind: acquired.kind,
                     branch,
                 },
                 revision,
@@ -373,16 +406,21 @@ impl FetchedRepository {
             bail!("select at least one skill")
         }
         let existing = ws.scan()?;
-        let paths: Vec<String> = paths.iter().filter(|path| {
-            let installed = existing.skills.iter().any(|r| {
-                matches!(&r.source, Some(Source::Git { url, subpath, .. })
-                    if url == &self.repository.url && subpath.as_deref().unwrap_or("") == path.as_str())
-            });
-            if installed {
-                progress(&format!("Already installed: {path}; skipped"));
-            }
-            !installed
-        }).cloned().collect();
+        let paths: Vec<String> = paths
+            .iter()
+            .filter(|path| {
+                let installed = existing.skills.iter().any(|r| {
+                    r.source
+                        .as_ref()
+                        .is_some_and(|source| self.repository.matches_source(source, path))
+                });
+                if installed {
+                    progress(&format!("Already installed: {path}; skipped"));
+                }
+                !installed
+            })
+            .cloned()
+            .collect();
         if paths.is_empty() {
             return Ok(vec![]);
         }
@@ -459,12 +497,7 @@ impl FetchedRepository {
                 let _ = std::fs::remove_dir_all(staged.join(".git"));
                 metas.push(crate::meta::SkillMeta {
                     installed_name: Some(crate::skill::SkillDoc::load(&staged)?.name),
-                    source: Some(Source::Git {
-                        url: self.repository.url.clone(),
-                        branch: Some(self.repository.branch.clone()),
-                        subpath: Some(path.clone()),
-                        revision: Some(self.revision.clone()),
-                    }),
+                    source: Some(self.repository.source(path, Some(&self.revision))),
                     baseline: Some(crate::meta::Baseline {
                         hash: crate::hash::hash_directory(&staged)?,
                         hash_algo: crate::hash::HASH_ALGO,
@@ -515,4 +548,27 @@ pub fn overlaps(a: &str, b: &str) -> bool {
 }
 pub fn related(a: &str, b: &str) -> bool {
     overlaps(a, b) || overlaps(b, a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_labels_omit_query_credentials_and_keep_host_ports() {
+        let url = "https://user:password@files.example:8443/bundle.zip?token=a@b";
+        assert_eq!(
+            source_name(url).as_deref(),
+            Some("files.example:8443/bundle.zip")
+        );
+        assert_eq!(default_alias(url), "files.example-8443--bundle.zip");
+        assert_eq!(
+            source_name("https://files.example/?token=x").as_deref(),
+            Some("files.example")
+        );
+        assert_eq!(
+            default_alias("https://github.com/owner/repo.git"),
+            "owner--repo"
+        );
+    }
 }

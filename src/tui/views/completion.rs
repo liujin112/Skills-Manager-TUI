@@ -35,11 +35,10 @@ impl Completion {
                 .skills
                 .iter()
                 .filter_map(|r| {
-                    if let Some(skills::meta::Source::Git { url, .. }) = &r.source {
-                        skills::repository::source_name(url)
-                    } else {
-                        None
-                    }
+                    r.source
+                        .as_ref()
+                        .and_then(skills::meta::Source::url)
+                        .and_then(skills::repository::source_name)
                 })
                 .collect(),
             Some(("tag", _)) => ctx

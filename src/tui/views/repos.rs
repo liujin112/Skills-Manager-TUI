@@ -129,12 +129,14 @@ impl View for ReposView {
         match Repository::list(&ctx.ws.root) {
             Ok(repos) => {
                 for repo in repos {
+                    let source =
+                        crate::tui::icons::source(ctx.settings.ui.icons, &repo.source("", None));
                     groups.insert(
                         Some(repo.alias.clone()),
                         Project {
                             name: repo.alias,
                             local: false,
-                            source: format!("{} · {}", repo.url, repo.branch),
+                            source,
                             keys: vec![],
                         },
                     );
@@ -533,6 +535,7 @@ mod tests {
         let ws = skills::Workspace::open(tmp.path()).unwrap();
         for alias in ["demo", "empty"] {
             Repository {
+                kind: Default::default(),
                 alias: alias.into(),
                 url: "https://example.com/demo.git".into(),
                 branch: "main".into(),

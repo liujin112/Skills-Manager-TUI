@@ -29,9 +29,8 @@ pub enum Task {
     PollRoot,
     Check(Vec<String>),
     Prepare(String),
-    /// Fetch a skill from a git repository or a local path into the root.
-    /// Cloning is slow enough that it cannot run on the UI thread. The subpath
-    /// stays separate because appending it to a URL would break the clone.
+    /// Fetch and install off the UI thread. Keep source URLs intact and pass
+    /// the skill's path separately so the source backend can resolve it.
     Install {
         reference: String,
         subpath: Option<String>,

@@ -35,52 +35,121 @@ pub enum Source {
         #[serde(default)]
         revision: Option<String>,
     },
+    Archive {
+        url: String,
+        #[serde(default)]
+        subpath: Option<String>,
+        #[serde(default)]
+        revision: Option<String>,
+    },
     Local {
         #[serde(default)]
         path: Option<String>,
     },
 }
 
-impl Source {
-    pub fn kind(&self) -> &'static str {
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    #[default]
+    Git,
+    Archive,
+}
+
+impl SourceKind {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Source::Git { .. } => "git",
-            Source::Local { .. } => "local",
-        }
-    }
-    pub fn summary(&self) -> String {
-        match self {
-            Source::Git {
-                url,
-                subpath,
-                branch,
-                revision,
-            } => {
-                let mut s = url.clone();
-                if let Some(p) = subpath
-                    && !p.is_empty()
-                {
-                    s.push('/');
-                    s.push_str(p);
-                }
-                if let Some(b) = branch {
-                    s.push('@');
-                    s.push_str(b);
-                }
-                if let Some(r) = revision {
-                    s.push_str(&format!(" ({})", short_rev(r)));
-                }
-                s
-            }
-            Source::Local { path } => match path {
-                Some(p) => format!("local {p}"),
-                None => "local".into(),
-            },
+            Self::Git => "git",
+            Self::Archive => "archive",
         }
     }
 }
 
+impl Source {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Source::Git { .. } => "git",
+            Source::Archive { .. } => "archive",
+            Source::Local { .. } => "local",
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Git { .. } | Self::Archive { .. })
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Self::Git { url, .. } | Self::Archive { url, .. } => Some(url),
+            Self::Local { .. } => None,
+        }
+    }
+
+    pub fn subpath(&self) -> Option<&str> {
+        match self {
+            Self::Git { subpath, .. } | Self::Archive { subpath, .. } => subpath.as_deref(),
+            Self::Local { .. } => None,
+        }
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        match self {
+            Self::Git { branch, .. } => branch.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn revision(&self) -> Option<&str> {
+        match self {
+            Self::Git { revision, .. } | Self::Archive { revision, .. } => revision.as_deref(),
+            Self::Local { .. } => None,
+        }
+    }
+
+    pub fn set_revision(&mut self, value: String) {
+        match self {
+            Self::Git { revision, .. } | Self::Archive { revision, .. } => *revision = Some(value),
+            Self::Local { .. } => {}
+        }
+    }
+
+    pub fn same_location(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local { path }, Self::Local { path: other }) => path == other,
+            _ => {
+                self.kind() == other.kind()
+                    && self.url() == other.url()
+                    && self.branch() == other.branch()
+                    && self.subpath().unwrap_or("") == other.subpath().unwrap_or("")
+            }
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        if let Source::Local { path } = self {
+            return match path {
+                Some(p) => format!("local {p}"),
+                None => "local".into(),
+            };
+        }
+        let mut s = self.url().unwrap().to_owned();
+        if let Some(p) = self.subpath().filter(|p| !p.is_empty()) {
+            s.push('/');
+            s.push_str(p);
+        }
+        if let Some(b) = self.branch() {
+            s.push('@');
+            s.push_str(b);
+        }
+        if let Some(r) = self.revision() {
+            s.push_str(&format!(" ({})", short_rev(r)));
+        }
+        s
+    }
+}
+
 pub fn short_rev(r: &str) -> &str {
+    let r = r.strip_prefix("sha256:").unwrap_or(r);
     if r.len() > 12 { &r[..12] } else { r }
 }
 
@@ -150,9 +219,17 @@ impl MetaStore {
             return Ok(None);
         };
         if let Some(source) = value.get_mut("source").and_then(toml::Value::as_table_mut)
-            && source.get("type").and_then(toml::Value::as_str) == Some("git")
+            && matches!(
+                source.get("type").and_then(toml::Value::as_str),
+                Some("git" | "archive")
+            )
             && crate::repository::alias_of(key).is_some()
         {
+            let kind = doc.get("kind").and_then(Item::as_str).unwrap_or("git");
+            anyhow::ensure!(
+                source.get("type").and_then(toml::Value::as_str) == Some(kind),
+                "repository kind differs from skill source"
+            );
             source.insert(
                 "url".into(),
                 doc.get("url")
@@ -160,16 +237,18 @@ impl MetaStore {
                     .context("repository URL missing")?
                     .into(),
             );
-            if let Some(branch) = doc.get("branch").and_then(Item::as_str) {
+            if kind == "git"
+                && let Some(branch) = doc.get("branch").and_then(Item::as_str)
+            {
                 source.insert("branch".into(), branch.into());
             }
         }
         let mut meta: SkillMeta = value.try_into()?;
-        if !matches!(meta.source, Some(Source::Git { .. })) {
+        if !meta.source.as_ref().is_some_and(Source::is_remote) {
             meta.baseline = None;
         }
         if crate::repository::alias_of(key).is_none()
-            && !matches!(meta.source, Some(Source::Git { .. }))
+            && !meta.source.as_ref().is_some_and(Source::is_remote)
         {
             return Ok(None);
         }
@@ -218,12 +297,18 @@ impl MetaStore {
             .parse::<DocumentMut>()?
             .as_table()
             .clone();
-        if !matches!(meta.source, Some(Source::Git { .. })) {
+        if !meta.source.as_ref().is_some_and(Source::is_remote) {
             item.remove("baseline");
         }
         if let Some(alias) = crate::repository::alias_of(key)
-            && let Some(Source::Git { url, branch, .. }) = &meta.source
+            && let Some(source) = &meta.source
+            && let Some(url) = source.url()
         {
+            anyhow::ensure!(
+                doc.get("url").is_none()
+                    || doc.get("kind").and_then(Item::as_str).unwrap_or("git") == source.kind(),
+                "repository kind differs from skill source"
+            );
             anyhow::ensure!(
                 doc.get("url")
                     .and_then(Item::as_str)
@@ -233,13 +318,16 @@ impl MetaStore {
             anyhow::ensure!(
                 doc.get("branch")
                     .and_then(Item::as_str)
-                    .is_none_or(|b| Some(b) == branch.as_deref()),
+                    .is_none_or(|b| Some(b) == source.branch()),
                 "repository branch differs from skill source"
             );
             doc["alias"] = value(alias);
-            doc["url"] = value(url.as_str());
-            if let Some(branch) = branch {
-                doc["branch"] = value(branch.as_str());
+            doc["kind"] = value(source.kind());
+            doc["url"] = value(url);
+            if let Some(branch) = source.branch() {
+                doc["branch"] = value(branch);
+            } else {
+                doc.remove("branch");
             }
             if let Some(source) = item.get_mut("source").and_then(Item::as_table_mut) {
                 source.remove("url");
@@ -270,7 +358,7 @@ impl MetaStore {
     pub fn save(&self, key: &str, meta: &SkillMeta) -> Result<()> {
         crate::ops::require_key(key)?;
         if crate::repository::alias_of(key).is_none()
-            && !matches!(meta.source, Some(Source::Git { .. }))
+            && !meta.source.as_ref().is_some_and(Source::is_remote)
         {
             return self.remove(key);
         }
@@ -383,6 +471,7 @@ mod tests {
         let ws = crate::Workspace::open(temp.path()).unwrap();
         let repo = crate::repository::Repository {
             alias: "owner--repo".into(),
+            kind: SourceKind::Git,
             url: "https://example.com/owner/repo".into(),
             branch: "main".into(),
         };
@@ -413,6 +502,95 @@ mod tests {
             crate::repository::Repository::list(temp.path()).unwrap(),
             vec![repo]
         );
+    }
+
+    #[test]
+    fn archive_metadata_shares_identity_and_keeps_per_skill_baselines() {
+        let temp = crate::ops::DownloadDir::new("archive-metadata").unwrap();
+        let store = MetaStore::new(temp.path());
+        for key in ["one", "two"] {
+            let meta = SkillMeta {
+                source: Some(Source::Archive {
+                    url: "https://example.com/skills.zip?version=latest".into(),
+                    subpath: Some(format!("skills/{key}")),
+                    revision: Some(format!("sha256:{key}")),
+                }),
+                baseline: Some(Baseline {
+                    hash: format!("baseline-{key}"),
+                    hash_algo: crate::hash::HASH_ALGO,
+                }),
+                ..Default::default()
+            };
+            let id = format!("repos/archive/{key}");
+            store.save(&id, &meta).unwrap();
+            assert_eq!(store.load(&id).unwrap().unwrap(), meta);
+        }
+        let text = std::fs::read_to_string(store.path("repos/archive/one")).unwrap();
+        assert_eq!(text.matches("https://example.com/skills.zip").count(), 1);
+        assert!(text.contains("kind = \"archive\""));
+        assert!(!text.contains("branch"));
+        let incompatible = SkillMeta {
+            source: Some(Source::Git {
+                url: "https://example.com/skills.zip?version=latest".into(),
+                subpath: Some("skills/three".into()),
+                branch: None,
+                revision: None,
+            }),
+            ..Default::default()
+        };
+        assert!(store.save("repos/archive/three", &incompatible).is_err());
+        assert_eq!(store.list_keys().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn repository_without_kind_remains_git() {
+        let temp = crate::ops::DownloadDir::new("git-metadata-default-kind").unwrap();
+        let store = MetaStore::new(temp.path());
+        let file = store.path("repos/demo/one");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "alias = 'demo'\nurl = 'https://example.com/repo'\nbranch = 'main'\n[skills.one.source]\ntype = 'git'\nsubpath = 'one'\nrevision = 'abcdef'\n").unwrap();
+        let source = store
+            .load("repos/demo/one")
+            .unwrap()
+            .unwrap()
+            .source
+            .unwrap();
+        assert_eq!(source.kind(), "git");
+        assert_eq!(source.url(), Some("https://example.com/repo"));
+        assert_eq!(source.branch(), Some("main"));
+        assert_eq!(source.revision(), Some("abcdef"));
+        assert_eq!(
+            crate::repository::Repository::list(temp.path()).unwrap()[0].kind,
+            SourceKind::Git
+        );
+    }
+
+    #[test]
+    fn source_location_excludes_versions_but_includes_transport() {
+        let archive = Source::Archive {
+            url: "https://example.com/source".into(),
+            subpath: None,
+            revision: Some("one".into()),
+        };
+        let another_version = Source::Archive {
+            url: archive.url().unwrap().into(),
+            subpath: Some(String::new()),
+            revision: Some("two".into()),
+        };
+        let git = Source::Git {
+            url: archive.url().unwrap().into(),
+            subpath: None,
+            branch: None,
+            revision: None,
+        };
+        assert!(archive.same_location(&another_version));
+        assert!(!archive.same_location(&git));
+    }
+
+    #[test]
+    fn short_revision_uses_hash_digits_for_git_and_archives() {
+        assert_eq!(short_rev("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short_rev("sha256:0123456789abcdef"), "0123456789ab");
     }
 
     #[test]

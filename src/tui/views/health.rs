@@ -37,7 +37,7 @@ struct Caps {
 
 impl Caps {
     fn of(r: &SkillRecord, check: Option<&Result<CheckResult, String>>) -> Self {
-        let git = matches!(r.source, Some(Source::Git { .. }));
+        let remote = r.source.as_ref().is_some_and(Source::is_remote);
         let update_available = matches!(check, Some(Ok(c)) if c.update_available);
         Caps {
             accept: matches!(
@@ -49,7 +49,7 @@ impl Caps {
             // `update::prepare` requires usable repository content, so
             // offering `U` for a missing or invalid skill would only produce
             // an error toast.
-            update: git
+            update: remote
                 && update_available
                 && matches!(
                     r.status,
@@ -424,10 +424,12 @@ impl HealthView {
                     th,
                 ));
                 source_line(&mut lines);
-                if let Some(Source::Git { revision, .. }) = &r.source {
+                if let Some(source) = &r.source
+                    && source.is_remote()
+                {
                     lines.push(kv(
                         "installed",
-                        revision.as_deref().map(short_rev).unwrap_or("-"),
+                        source.revision().map(short_rev).unwrap_or("-"),
                         th,
                     ));
                 }
@@ -476,10 +478,9 @@ impl HealthView {
                     "forget it: delete the metadata file, tags and note included".into(),
                 ));
                 match &r.source {
-                    Some(Source::Git { .. }) => actions.push(action(
+                    Some(Source::Git { .. } | Source::Archive { .. }) => actions.push(action(
                         "",
-                        "or reinstall it from the Library tab with i, from the git source above"
-                            .into(),
+                        "or reinstall it from the Library tab with i, from the source above".into(),
                     )),
                     Some(Source::Local { path: Some(p) }) => actions.push(action(
                         "",
@@ -565,7 +566,7 @@ impl HealthView {
                 }
                 if caps.update {
                     let what = if r.status == SkillStatus::Modified {
-                        "update from upstream; you choose local or upstream file by file"
+                        "update from upstream; choose local or upstream for the whole skill"
                     } else {
                         "update to the upstream revision"
                     };
@@ -690,11 +691,15 @@ impl View for HealthView {
                     .snap
                     .skills
                     .iter()
-                    .filter(|s| matches!(s.source, Some(Source::Git { .. })))
+                    .filter(|s| {
+                        s.source
+                            .as_ref()
+                            .is_some_and(skills::meta::Source::is_remote)
+                    })
                     .map(|s| s.key.clone())
                     .collect();
                 if keys.is_empty() {
-                    vec![Action::Error("no git-sourced skills to check".into())]
+                    vec![Action::Error("no remote-sourced skills to check".into())]
                 } else {
                     vec![
                         Action::Toast(format!("checking {} skill(s)…", keys.len())),
@@ -799,7 +804,7 @@ impl View for HealthView {
                 format!("No matching issues · {} issues in total", self.total_issues)
             } else {
                 format!(
-                    "everything is healthy\n{} skills · {} agents checked\nPress c to check git sources for updates.",
+                    "everything is healthy\n{} skills · {} agents checked\nPress c to check remote sources for updates.",
                     ctx.snap.skills.len(),
                     ctx.snap.agents.len()
                 )

@@ -58,9 +58,12 @@ pub enum Command {
     Accept { skill: String },
     /// Repair an external move: migrate metadata, deployment links and references
     Migrate { old: String, new: String },
-    /// Install a skill from a git repo, GitHub shorthand, or local path
+    /// Install skills from a Git repository, archive URL, or local path
+    #[command(
+        long_about = "Install skills from a Git repository, archive URL, or local path.\n\nArchive URLs use curl to download and follow HTTP(S) redirects. ZIP, TAR, TAR.GZ, TAR.BZ2, and TAR.XZ are detected from the downloaded content. Paths inside the archive are preserved, including any top-level directory: use --list to discover paths, then --select or --subpath to choose skills. Naming, deployment, and update options are shared with Git sources."
+    )]
     Install(InstallArgs),
-    /// List registered Git repositories and their installed skills
+    /// List registered repositories and their installed skills
     Repos,
     /// Bring an existing skill directory under management
     Adopt {
@@ -88,7 +91,7 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["skill", "all"])]
         repo: Option<String>,
     },
-    /// Update git-sourced skills
+    /// Update skills from their remote sources
     Update(UpdateArgs),
     /// Link skills into agent directories
     Deploy(DeployArgs),
@@ -181,7 +184,7 @@ pub enum NoteCommand {
 
 #[derive(Args, Debug)]
 pub struct InstallArgs {
-    /// Local repository alias; defaults to owner--repository
+    /// Local repository alias; defaults to a name derived from the source URL
     #[arg(long)]
     pub repo_alias: Option<String>,
     /// List discovered skill paths without installing
@@ -196,10 +199,11 @@ pub struct InstallArgs {
     /// Override a local name: upstream/path=local-name
     #[arg(long = "local-name")]
     pub local_names: Vec<String>,
-    /// Path, owner/repo[/subpath], GitHub tree URL, or git URL
+    /// Path, owner/repo[/subpath], GitHub tree URL, Git URL, or archive URL
     pub reference: String,
     #[arg(long)]
     pub name: Option<String>,
+    /// Git branch or tag (not applicable to archive URLs)
     #[arg(long)]
     pub branch: Option<String>,
     #[arg(long)]
@@ -547,7 +551,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let repositories = skills::repository::Repository::list(&ctx.ws.root)?;
             ctx.out(&repositories, || {
                 for repo in &repositories {
-                    println!("{}  {}  {}", repo.alias, repo.url, repo.branch);
+                    println!("{}  {}", repo.alias, repo.source("", None).summary());
                 }
             })
         }
@@ -952,7 +956,7 @@ pub fn edit_in_editor(initial: &str) -> Result<Option<String>> {
 
 fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
     let r = install::parse_ref(&a.reference, a.branch.as_deref(), a.subpath.as_deref())?;
-    if matches!(r, install::InstallRef::Git { .. }) {
+    if r.is_remote() {
         let fetched =
             skills::repository::FetchedRepository::fetch(&ctx.ws, &r, a.repo_alias.as_deref())?;
         let result = (|| {
@@ -974,13 +978,9 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                     .iter()
                     .map(|s| if s == "." { String::new() } else { s.clone() })
                     .collect()
-            } else if let install::InstallRef::Git {
-                subpath: Some(path),
-                ..
-            } = &r
-            {
-                if fetched.choices.contains(path) {
-                    vec![path.clone()]
+            } else if let Some(path) = r.subpath() {
+                if fetched.choices.iter().any(|choice| choice == path) {
+                    vec![path.to_string()]
                 } else {
                     vec![]
                 }
@@ -1072,7 +1072,11 @@ fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
         let snap = ctx.ws.scan()?;
         snap.skills
             .iter()
-            .filter(|s| matches!(s.source, Some(skills::meta::Source::Git { .. })))
+            .filter(|s| {
+                s.source
+                    .as_ref()
+                    .is_some_and(skills::meta::Source::is_remote)
+            })
             .map(|s| s.key.clone())
             .collect()
     } else {
@@ -1127,7 +1131,11 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     } else if a.all {
         snap.skills
             .iter()
-            .filter(|s| matches!(s.source, Some(skills::meta::Source::Git { .. })))
+            .filter(|s| {
+                s.source
+                    .as_ref()
+                    .is_some_and(skills::meta::Source::is_remote)
+            })
             .filter(|s| {
                 matches!(
                     s.status,
@@ -1219,9 +1227,7 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
                     }
                 }
                 if result == "needs-resolution" {
-                    println!(
-                        "    pass --take local|upstream (and --take-file PATH=SIDE for exceptions)"
-                    );
+                    println!("    pass --take local|upstream to choose for the whole skill");
                 }
             }
         }

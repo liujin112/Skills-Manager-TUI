@@ -829,8 +829,12 @@ impl SearchView {
         let Some(r) = self.selected(ctx) else {
             return vec![];
         };
-        if !matches!(r.source, Some(skills::meta::Source::Git { .. })) {
-            return vec![Action::Error(format!("{} has no git source", r.key))];
+        if !r
+            .source
+            .as_ref()
+            .is_some_and(skills::meta::Source::is_remote)
+        {
+            return vec![Action::Error(format!("{} has no remote source", r.key))];
         }
         vec![
             Action::Spawn(Task::Check(vec![r.key.clone()])),
@@ -841,8 +845,12 @@ impl SearchView {
         let Some(r) = self.selected(ctx) else {
             return vec![];
         };
-        if !matches!(r.source, Some(skills::meta::Source::Git { .. })) {
-            return vec![Action::Error(format!("{} has no git source", r.key))];
+        if !r
+            .source
+            .as_ref()
+            .is_some_and(skills::meta::Source::is_remote)
+        {
+            return vec![Action::Error(format!("{} has no remote source", r.key))];
         }
         vec![
             Action::Spawn(Task::Prepare(r.key.clone())),
@@ -1177,9 +1185,13 @@ impl View for SearchView {
         self.searcher.index(&ctx.snap.skills);
         self.run_search(ctx, true);
         self.checked.retain(|key| ctx.snap.get(key).is_some());
-        self.updates.retain(|key, remote| ctx.snap.get(key).is_some_and(|r| {
-            !matches!(&r.source, Some(skills::meta::Source::Git { revision: Some(revision), .. }) if revision == remote)
-        }));
+        self.updates.retain(|key, remote| {
+            ctx.snap.get(key).is_some_and(|r| {
+                r.source.as_ref().is_some_and(|source| {
+                    source.is_remote() && source.revision() != Some(remote.as_str())
+                })
+            })
+        });
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {

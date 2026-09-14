@@ -237,7 +237,8 @@ impl Modal {
             title: " install a skill ".into(),
             input: Input::default(),
             kind: InputKind::Install,
-            hint: "owner/repo[/path] · git URL · local path\nEnter install · Esc cancel".into(),
+            hint: "owner/repo[/path] · Git or archive URL · local path\nEnter install · Esc cancel"
+                .into(),
             rect: Rect::default(),
         }
     }
@@ -337,7 +338,7 @@ impl Modal {
             kind: InputKind::SetSource {
                 skill: skill.into(),
             },
-            hint: format!("now {now} · owner/repo[/path], a git URL or a path replaces it"),
+            hint: format!("now {now} · owner/repo[/path], Git or archive URL"),
             rect: Rect::default(),
         }
     }
@@ -460,19 +461,18 @@ impl Modal {
                                 skills::repository::alias_of(&s.key) == Some(r.alias.as_str())
                             })
                             .count();
+                        let source = r.source("", None);
                         PickItem {
                             id: r.alias.clone(),
                             label: format!(
                                 "{} {}",
-                                crate::tui::icons::git(ctx.settings.ui.icons, &r.url),
+                                crate::tui::icons::source_icon(ctx.settings.ui.icons, &source),
                                 skills::repository::source_name(&r.url).unwrap_or(r.alias)
                             ),
                             sub: format!(
-                                "{} {count} skills · {} {} · {}",
+                                "{} {count} skills · {}",
                                 crate::tui::icons::package(ctx.settings.ui.icons),
-                                crate::tui::icons::branch(ctx.settings.ui.icons),
-                                r.branch,
-                                r.url
+                                crate::tui::icons::source(ctx.settings.ui.icons, &source)
                             ),
                         }
                     })
@@ -1743,7 +1743,7 @@ Library
   Space  Ctrl-A     toggle skill / select current results in multi-select
   t  d  p           selected skills: tags / deploy / add to preset
   Esc               cancel multi-select; hidden selections never participate
-  u  U              check upstream / update from upstream (git sources)
+  u  U              check upstream / update from upstream (Git or archive sources)
 Tags / Presets
   C                 choose group colour (name or #rrggbb; none resets)
   c / a             create a group / add skills
@@ -1781,9 +1781,11 @@ fn repository_query(alias: &str, ctx: &Ctx) -> String {
         .skills
         .iter()
         .filter(|r| skills::repository::alias_of(&r.key) == Some(alias))
-        .find_map(|r| match &r.source {
-            Some(skills::meta::Source::Git { url, .. }) => skills::repository::source_name(url),
-            _ => None,
+        .find_map(|r| {
+            r.source
+                .as_ref()
+                .and_then(skills::meta::Source::url)
+                .and_then(skills::repository::source_name)
         })
         .unwrap_or_else(|| alias.to_string());
     format!("repo:{name}")

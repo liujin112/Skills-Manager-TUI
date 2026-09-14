@@ -111,7 +111,9 @@ pub fn tag_delete(ws: &Workspace, tag: &str) -> Result<usize> {
 pub fn note_set(ws: &Workspace, key: &str, note: Option<&str>) -> Result<SkillMeta> {
     let mut meta = load_or_init(ws, key)?;
     anyhow::ensure!(
-        matches!(meta.source, Some(crate::meta::Source::Git { .. })),
+        meta.source
+            .as_ref()
+            .is_some_and(crate::meta::Source::is_remote),
         "Local skills do not store notes"
     );
     meta.note = note
@@ -124,7 +126,11 @@ pub fn note_set(ws: &Workspace, key: &str, note: Option<&str>) -> Result<SkillMe
 /// Record the current content hash as the new baseline ("accept local changes").
 pub fn accept(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     let mut meta = load_or_init(ws, key)?;
-    if !matches!(meta.source, Some(crate::meta::Source::Git { .. })) {
+    if !meta
+        .source
+        .as_ref()
+        .is_some_and(crate::meta::Source::is_remote)
+    {
         bail!("local skills do not track a baseline");
     }
     let path = ws.skill_path(key);

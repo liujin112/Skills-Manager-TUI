@@ -22,13 +22,16 @@ pub fn display_name(r: &SkillRecord) -> &str {
         .unwrap_or_else(|| r.key.rsplit('/').next().unwrap_or(&r.key))
 }
 
-/// A readable Git source badge, separate from the skill's own name.
+/// A readable source badge, separate from the skill's own name.
 pub fn repository_badge(r: &SkillRecord, icons: skills::config::Icons) -> Option<String> {
     use skills::meta::Source;
     match &r.source {
-        Some(Source::Git { url, .. }) => {
+        Some(source @ (Source::Git { url, .. } | Source::Archive { url, .. })) => {
             let name = skills::repository::source_name(url).unwrap_or_else(|| url.clone());
-            Some(format!("{} {name}", crate::tui::icons::git(icons, url)))
+            Some(format!(
+                "{} {name}",
+                crate::tui::icons::source_icon(icons, source)
+            ))
         }
         Some(Source::Local { .. }) => Some(crate::tui::icons::local(icons).into()),
         None => skills::repository::alias_of(&r.key)
@@ -228,7 +231,7 @@ impl<'a> SkillPresentation<'a> {
     fn source(&self, state: &SkillRenderState) -> String {
         match state
             .context
-            .filter(|tail| !tail.is_empty() && *tail != "local" && *tail != "git")
+            .filter(|tail| !tail.is_empty() && !matches!(*tail, "local" | "git" | "archive"))
         {
             Some(tail) => format!("{} · {tail}", self.source),
             None => self.source.clone(),
