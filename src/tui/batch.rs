@@ -55,6 +55,8 @@ pub struct Batch {
     rect: Rect,
     input_rect: Rect,
     buttons: [Rect; 2],
+    tag_chips: Vec<(Rect, String)>,
+    selected_tags: Vec<String>,
     error: Option<String>,
 }
 impl Batch {
@@ -72,6 +74,8 @@ impl Batch {
             rect: Rect::default(),
             input_rect: Rect::default(),
             buttons: [Rect::default(); 2],
+            tag_chips: vec![],
+            selected_tags: vec![],
             error: None,
         }
     }
@@ -98,7 +102,9 @@ impl Batch {
                 }
             })
             .collect();
-        Self::new(Kind::Tags, keys, rows)
+        let mut picker = Self::new(Kind::Tags, keys, rows);
+        picker.filter();
+        picker
     }
     pub fn deploy(keys: Vec<String>, ctx: &Ctx) -> Self {
         let rows = ctx
@@ -159,7 +165,8 @@ impl Batch {
         if self.kind == Kind::Tags {
             return &[
                 ("↑↓", "choose"),
-                ("Enter", "toggle / create"),
+                ("Enter", "add / create"),
+                ("Backspace", "remove last when empty"),
                 ("Tab", "complete"),
                 ("Esc", "done"),
             ];
@@ -188,7 +195,10 @@ impl Batch {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.label.to_lowercase().contains(&query))
+            .filter(|(_, r)| {
+                r.label.to_lowercase().contains(&query)
+                    && (self.kind != Kind::Tags || r.count != self.keys.len() || !query.is_empty())
+            })
             .map(|(i, _)| i)
             .collect();
         if self.kind == Kind::Tags
@@ -236,6 +246,11 @@ impl Batch {
                 KeyCode::Down => self.list.move_by(1, self.shown.len()),
                 KeyCode::Up => self.list.move_by(-1, self.shown.len()),
                 KeyCode::Enter => return self.edit_selected_tag(),
+                KeyCode::Backspace if self.input.value().is_empty() => {
+                    if let Some(name) = self.selected_tags.last() {
+                        return self.edit_tag(name.clone(), false);
+                    }
+                }
                 KeyCode::Tab => {
                     if let Some(row) = self
                         .list
@@ -334,6 +349,10 @@ impl Batch {
             .get(i)
             .map(|r| r.id.clone())
             .unwrap_or_else(|| self.input.value().trim().to_string());
+        let add = self.rows.get(i).is_none_or(|r| r.count != self.keys.len());
+        self.edit_tag(name, add)
+    }
+    fn edit_tag(&mut self, name: String, add: bool) -> Vec<Action> {
         let keys = self.keys.clone();
         self.input = Input::default();
         self.filter();
@@ -359,9 +378,8 @@ impl Batch {
                         });
                     }
                     let tag = tags.iter_mut().find(|t| t.name == name).unwrap();
-                    let remove = keys.iter().all(|k| tag.skills.contains(k));
                     tag.skills.retain(|k| !keys.contains(k));
-                    if !remove {
+                    if add {
                         tag.skills.extend(keys.clone());
                     }
                 })?;
@@ -456,6 +474,11 @@ impl Batch {
                     if !self.rect.contains(at) {
                         return vec![Action::CloseModal];
                     }
+                    if let Some((_, name)) =
+                        self.tag_chips.iter().find(|(rect, _)| rect.contains(at))
+                    {
+                        return self.edit_tag(name.clone(), false);
+                    }
                     if self.input_rect.contains(at) {
                         self.input.click(m.column);
                     }
@@ -524,8 +547,8 @@ impl Batch {
             if self
                 .rows
                 .iter()
-                .map(|r| &r.id)
-                .ne(fresh.rows.iter().map(|r| &r.id))
+                .map(|r| (&r.id, r.count))
+                .ne(fresh.rows.iter().map(|r| (&r.id, r.count)))
             {
                 self.rows = fresh.rows;
                 self.filter();
@@ -541,11 +564,44 @@ impl Batch {
             } else {
                 self.rows = fresh.rows;
             }
+            self.selected_tags.retain(|name| {
+                self.rows
+                    .iter()
+                    .any(|r| &r.id == name && r.count == self.keys.len())
+            });
+            for row in self.rows.iter().filter(|r| r.count == self.keys.len()) {
+                if !self.selected_tags.contains(&row.id) {
+                    self.selected_tags.push(row.id.clone());
+                }
+            }
             let w = area.width.saturating_sub(2).min(50);
+            // Selected tags form removable tokens before the search field.
+            let mut chips = Vec::new();
+            let mut x = 0u16;
+            let mut y = 0u16;
+            let available = w.saturating_sub(4);
+            for name in &self.selected_tags {
+                let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
+                let caps = super::widgets::width(left) + super::widgets::width(right);
+                let label = fit(name, (available as usize).saturating_sub(caps + 5));
+                let body = format!(" {label} × ");
+                let width = (super::widgets::width(&body) + caps) as u16;
+                if x > 0 && x + width > available {
+                    x = 0;
+                    y += 1;
+                }
+                chips.push((Rect::new(x, y, width, 1), name.clone(), body));
+                x += width + 1;
+            }
+            let total_chip_rows = if chips.is_empty() { 0 } else { y + 1 };
+            let chip_rows = total_chip_rows.min(area.height.saturating_sub(10) / 2);
+            let overflow = total_chip_rows > chip_rows && chip_rows > 0;
+            let first_chip_row =
+                total_chip_rows.saturating_sub(chip_rows.saturating_sub(u16::from(overflow)));
             let h = area
                 .height
                 .saturating_sub(2)
-                .min(self.shown.len().clamp(1, 7) as u16 + 6);
+                .min(self.shown.len().clamp(1, 7) as u16 + 6 + chip_rows);
             self.rect = Rect::new(
                 area.x + (area.width - w) / 2,
                 area.y + (area.height - h) / 2,
@@ -553,31 +609,60 @@ impl Batch {
                 h,
             );
             f.render_widget(OverlayClear, self.rect);
-            let block = ctx
-                .theme
-                .block("", false)
-                .title(Line::from(Span::styled(" Tags ", ctx.theme.accent())));
+            let block = ctx.theme.block("", false).title(Line::from(Span::styled(
+                format!(" Tags · {} selected ", self.selected_tags.len()),
+                ctx.theme.accent(),
+            )));
             let inner = block.inner(self.rect);
             f.render_widget(block, self.rect);
+            self.tag_chips.clear();
             if inner.height < 4 || inner.width < 6 {
                 return;
             }
+            if overflow {
+                let hidden = chips
+                    .iter()
+                    .filter(|(rect, _, _)| rect.y < first_chip_row)
+                    .count();
+                f.render_widget(
+                    Paragraph::new(format!("+{hidden} more · search to remove"))
+                        .style(ctx.theme.dim()),
+                    Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 1),
+                );
+            }
+            for (mut rect, name, body) in chips {
+                if rect.y < first_chip_row {
+                    continue;
+                }
+                rect.x += inner.x + 1;
+                rect.y = inner.y + rect.y - first_chip_row + u16::from(overflow);
+                f.render_widget(
+                    Paragraph::new(Line::from(super::views::cards::pill(
+                        body,
+                        super::views::cards::tag_fill(&name, ctx),
+                        ctx,
+                    ))),
+                    rect,
+                );
+                self.tag_chips.push((rect, name));
+            }
+            let input_y = inner.y + chip_rows;
             f.render_widget(
                 Paragraph::new("›").style(ctx.theme.accent()),
-                Rect::new(inner.x + 1, inner.y, 1, 1),
+                Rect::new(inner.x + 1, input_y, 1, 1),
             );
-            self.input_rect = Rect::new(inner.x + 3, inner.y, inner.width.saturating_sub(4), 1);
+            self.input_rect = Rect::new(inner.x + 3, input_y, inner.width.saturating_sub(4), 1);
             self.input
                 .render(f, self.input_rect, true, "Search or create…", ctx.theme);
             f.render_widget(
                 Paragraph::new("─".repeat(inner.width as usize)).style(ctx.theme.dim()),
-                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+                Rect::new(inner.x, input_y + 1, inner.width, 1),
             );
             self.list.rows = Rect::new(
                 inner.x + 1,
-                inner.y + 2,
+                input_y + 2,
                 inner.width.saturating_sub(2),
-                inner.height.saturating_sub(4),
+                inner.height.saturating_sub(4 + chip_rows),
             );
             self.list.clamp(self.shown.len());
             let items: Vec<ListItem> = self
@@ -637,14 +722,27 @@ impl Batch {
                 .collect();
             if items.is_empty() {
                 f.render_widget(
-                    Paragraph::new("Type to create your first tag").style(ctx.theme.dim()),
+                    Paragraph::new("Type to add or create a tag").style(ctx.theme.dim()),
                     self.list.rows,
                 );
             } else {
                 f.render_stateful_widget(List::new(items), self.list.rows, &mut self.list.state);
             }
             f.render_widget(
-                Paragraph::new("↵ select                 esc close").style(ctx.theme.dim()),
+                Paragraph::new(
+                    if self
+                        .list
+                        .selected()
+                        .and_then(|i| self.shown.get(i))
+                        .and_then(|i| self.rows.get(*i))
+                        .is_some_and(|r| r.count == self.keys.len())
+                    {
+                        "Enter remove · Esc done"
+                    } else {
+                        "Enter add · × remove · Esc done"
+                    },
+                )
+                .style(ctx.theme.dim()),
                 Rect::new(
                     inner.x + 2,
                     inner.bottom() - 1,
@@ -847,8 +945,11 @@ mod tests {
         assert!(!screen.contains("Apply"));
         assert!(!screen.contains("pending"));
         assert!(screen.contains(" new-tag "));
-        assert!(screen.contains('✓'));
+        assert!(screen.contains('×'));
+        assert!(batch.shown.is_empty());
+        assert_eq!(batch.selected_tags, vec!["merlin", "meta", "new-tag"]);
         let mut styled_ws = Workspace::open(&ws.root).unwrap();
+        let styled_snap = styled_ws.scan().unwrap();
         for caps in [
             skills::config::PillCaps::Round,
             skills::config::PillCaps::Block,
@@ -862,6 +963,7 @@ mod tests {
                         f.area(),
                         &Ctx {
                             ws: &styled_ws,
+                            snap: &styled_snap,
                             ..ctx
                         },
                     )
@@ -875,19 +977,20 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect();
             let (left, right) = caps.glyphs();
-            assert!(text.contains(&format!("{left} new-tag {right}")));
+            assert!(text.contains(&format!("{left} new-tag × {right}")));
         }
-        // Clicking the checked tag removes it immediately.
+        // Clicking the selected token removes it immediately.
+        let chip = batch
+            .tag_chips
+            .iter()
+            .find(|(_, name)| name == "new-tag")
+            .unwrap()
+            .0;
         let actions = batch.mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: batch.list.rows.x,
-                row: batch.list.rows.y
-                    + batch
-                        .shown
-                        .iter()
-                        .position(|i| batch.rows[*i].id == "new-tag")
-                        .unwrap() as u16,
+                column: chip.x,
+                row: chip.y,
                 modifiers: KeyModifiers::NONE,
             },
             &ctx,
@@ -911,6 +1014,70 @@ mod tests {
                 .unwrap()
                 .skill_tags("alpha"),
             vec!["merlin", "meta"]
+        );
+    }
+    #[test]
+    fn selected_tokens_wrap_and_backspace_removes_only_when_input_is_empty() {
+        let fixture = Fixture::new();
+        let ws = Workspace::open(&fixture.0).unwrap();
+        edit::tag_add(
+            &ws,
+            "alpha",
+            &[
+                "long-first-tag".into(),
+                "long-second-tag".into(),
+                "third".into(),
+            ],
+        )
+        .unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = super::super::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut batch = Batch::tags(vec!["alpha".into()], &ctx);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 20)).unwrap();
+        terminal.draw(|f| batch.draw(f, f.area(), &ctx)).unwrap();
+        assert_eq!(batch.tag_chips.len(), 3);
+        assert!(batch.tag_chips[1].0.y > batch.tag_chips[0].0.y);
+        assert!(
+            batch
+                .tag_chips
+                .iter()
+                .all(|(rect, _)| rect.bottom() <= batch.input_rect.y)
+        );
+        assert!(batch.shown.is_empty());
+        let mut short = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 14)).unwrap();
+        short.draw(|f| batch.draw(f, f.area(), &ctx)).unwrap();
+        assert_eq!(batch.tag_chips.last().unwrap().1, "third");
+        let text: String = short
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("more"));
+        batch.paste("long-first-tag");
+        assert_eq!(batch.rows[batch.shown[0]].id, "long-first-tag");
+        batch.input = Input::default();
+        batch.filter();
+        batch.paste("x");
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(batch.key(key, &ctx).is_empty());
+        assert!(batch.input.value().is_empty());
+        let Action::WriteMeta(write) = batch.key(key, &ctx).remove(0) else {
+            panic!("remove last token")
+        };
+        write(&ws).unwrap();
+        assert_eq!(
+            skills::config::Config::load(&ws.root)
+                .unwrap()
+                .skill_tags("alpha"),
+            vec!["long-first-tag", "long-second-tag"]
         );
     }
     #[test]

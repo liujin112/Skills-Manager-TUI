@@ -29,7 +29,6 @@ pub struct PickItem {
 }
 
 pub enum InputKind {
-    Tags { skill: String },
     PresetName,
     TagName,
     TagDescription { name: String },
@@ -196,17 +195,6 @@ impl Modal {
         self
     }
 
-    pub fn tags(skill: &str, tags: &[String]) -> Self {
-        Modal::Input {
-            title: format!(" tags for {skill} "),
-            input: Input::with_value(&tags.join(", ")),
-            kind: InputKind::Tags {
-                skill: skill.into(),
-            },
-            hint: "comma separated · Enter save · Esc cancel".into(),
-            rect: Rect::default(),
-        }
-    }
     pub fn new_preset() -> Self {
         Modal::Input {
             title: " new preset ".into(),
@@ -1503,28 +1491,6 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 }))],
                 Err(e) => vec![Action::Error(format!("{e:#}"))],
             }
-        }
-        InputKind::Tags { skill } => {
-            let skill = skill.clone();
-            let tags: Vec<String> = value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            vec![Action::WriteMeta(Box::new(move |ws| {
-                history::tag_edit(ws, |ws| {
-                    edit::tag_set(ws, &skill, &tags).map(|m| {
-                        format!(
-                            "{skill}: {}",
-                            if m.is_empty() {
-                                "no tags".into()
-                            } else {
-                                m.join(", ")
-                            }
-                        )
-                    })
-                })
-            }))]
         }
         // Name only. What comes next — members, a description — is done on
         // the card the new preset lands on, and the notice says which keys;

@@ -643,7 +643,10 @@ impl SearchView {
             return vec![];
         }
         match self.need_present(ctx, "tag") {
-            Ok(r) => vec![Action::OpenModal(Box::new(Modal::tags(&r.key, &r.tags)))],
+            Ok(r) => vec![Action::OpenModal(Box::new(Modal::batch_tags(
+                vec![r.key.clone()],
+                ctx,
+            )))],
             Err(a) => vec![a],
         }
     }

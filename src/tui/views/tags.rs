@@ -865,7 +865,10 @@ impl View for TagsView {
                 // Fixing one skill's tags from here saves a trip to search,
                 // which is where the same key lives.
                 KeyCode::Char('t') => match self.selected_member().and_then(|k| ctx.snap.get(&k)) {
-                    Some(r) => vec![Action::OpenModal(Box::new(Modal::tags(&r.key, &r.tags)))],
+                    Some(r) => vec![Action::OpenModal(Box::new(Modal::batch_tags(
+                        vec![r.key.clone()],
+                        ctx,
+                    )))],
                     None => vec![],
                 },
                 _ => vec![],
