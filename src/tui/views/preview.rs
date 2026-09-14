@@ -5,8 +5,9 @@
 //! an agent's list used to jump to the search tab, which lost the place the
 //! user was working in; a window over the page keeps it.
 
-use super::{status_glyph, status_text};
 use crate::tui::app::Ctx;
+use crate::tui::components::skill::{status_glyph, status_text};
+use crate::tui::text::{highlight_line, highlight_spans};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::OverlayClear as Clear;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -16,7 +17,6 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use skills::reconcile::{DeployState, SkillRecord};
-use skills::search::highlight_ranges;
 
 /// A preview floating over a page. Lives in the view that opened it, so the
 /// page underneath keeps its focus and cursor exactly as they were.
@@ -112,13 +112,13 @@ impl Overlay {
     /// Mouse while the overlay is up: wheel scrolls it, a click outside
     /// closes it, anything else is swallowed so the page does not react to a
     /// click it cannot see.
-    pub fn handle_mouse(&mut self, m: MouseEvent) -> bool {
+    pub fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> bool {
         if !self.is_open() {
             return false;
         }
         match m.kind {
-            MouseEventKind::ScrollDown => self.scroll_by(3),
-            MouseEventKind::ScrollUp => self.scroll_by(-3),
+            MouseEventKind::ScrollDown => self.scroll_by(ctx.settings.interaction.wheel_rows),
+            MouseEventKind::ScrollUp => self.scroll_by(-ctx.settings.interaction.wheel_rows),
             MouseEventKind::Down(MouseButton::Left)
                 if !self.rect.contains((m.column, m.row).into()) =>
             {
@@ -136,7 +136,7 @@ impl Overlay {
             self.rect = Rect::default();
             return;
         };
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let w = area.width.saturating_sub(8).clamp(20, 100);
         let h = area.height.saturating_sub(4).max(6);
         let rect = Rect {
@@ -154,7 +154,11 @@ impl Overlay {
                     .as_ref()
                     .and_then(|p| p.doc.as_ref().ok())
                     .map(|d| d.name.as_str())
-                    .or_else(|| ctx.snap.get(key).map(super::cards::display_name))
+                    .or_else(|| {
+                        ctx.snap
+                            .get(key)
+                            .map(crate::tui::components::skill::display_name)
+                    })
                     .unwrap_or(key)
                     .to_string(),
                 th.bold(),
@@ -258,23 +262,29 @@ fn record_lines<'a>(
     available_width: usize,
     expanded: bool,
 ) -> Vec<Line<'a>> {
-    let th = ctx.theme;
+    let th = &ctx.settings.theme;
     let mut lines = vec![Line::from(vec![
-        Span::styled(super::cards::display_name(r), th.bold().fg(th.accent)),
+        Span::styled(
+            crate::tui::components::skill::display_name(r),
+            th.bold().fg(th.accent),
+        ),
         Span::raw("  "),
         status_glyph(&r.status, th),
         Span::raw(" "),
         Span::styled(status_text(&r.status), th.dim()),
     ])];
-    if ctx.ws.config.tags_enabled {
+    if ctx.settings.tags_enabled {
         let mut tag_line = vec![Span::styled(format!("{:<9}", "tags"), th.dim())];
         if r.tags.is_empty() {
             tag_line.push(Span::styled("none", th.dim()));
         } else {
             for t in &r.tags {
                 tag_line.extend(
-                    super::cards::Pill::new(t, super::cards::tag_fill(t, ctx))
-                        .render(ctx, usize::MAX),
+                    crate::tui::components::group::Pill::new(
+                        t,
+                        crate::tui::components::group::tag_fill(t, ctx),
+                    )
+                    .render(ctx, usize::MAX),
                 );
                 tag_line.push(Span::raw(" "));
             }
@@ -302,7 +312,7 @@ fn record_lines<'a>(
         "source",
         r.source
             .as_ref()
-            .map(|s| crate::tui::icons::source(ctx.ws.config.ui.icons, s))
+            .map(|s| crate::tui::icons::source(ctx.settings.ui.icons, s))
             .unwrap_or_else(|| r.source_kind().into()),
         th,
     ));
@@ -406,45 +416,6 @@ fn markdown_section(
             .map(|line| highlight_line(line, terms, th)),
     );
     lines
-}
-
-/// Split `text` into spans, styling the parts that match `terms`.
-pub fn highlight_spans<'a>(text: &str, terms: &[String], base: Style, th: &Theme) -> Vec<Span<'a>> {
-    let ranges = highlight_ranges(text, terms);
-    if ranges.is_empty() {
-        return vec![Span::styled(text.to_string(), base)];
-    }
-    // The hit keeps none of the surrounding style: a highlighter covers what
-    // is under it, and the dimmed grey of an excerpt would be unreadable on yellow.
-    let hl = th.match_hit();
-    let mut out = Vec::new();
-    let mut pos = 0;
-    for (s, e) in ranges {
-        if s > pos {
-            out.push(Span::styled(text[pos..s].to_string(), base));
-        }
-        out.push(Span::styled(text[s..e].to_string(), hl));
-        pos = e;
-    }
-    if pos < text.len() {
-        out.push(Span::styled(text[pos..].to_string(), base));
-    }
-    out
-}
-
-/// Apply highlighting to every span of an already styled line (markdown output).
-pub fn highlight_line<'a>(line: Line<'a>, terms: &[String], th: &Theme) -> Line<'a> {
-    if terms.is_empty() {
-        return line;
-    }
-    let mut spans = Vec::new();
-    for sp in line.spans {
-        let base = sp.style;
-        spans.extend(highlight_spans(&sp.content, terms, base, th));
-    }
-    Line::from(spans)
-        .style(line.style)
-        .alignment(line.alignment.unwrap_or_default())
 }
 
 #[cfg(test)]

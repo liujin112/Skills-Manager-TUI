@@ -94,7 +94,7 @@ pub enum Command {
     Deploy(DeployArgs),
     /// Remove links from agent directories
     Undeploy(DeployArgs),
-    /// Make agent directories match the desired state from config and presets
+    /// Removed: use deploy/undeploy or apply a preset to an explicit target
     Sync {
         #[arg(long)]
         dry_run: bool,
@@ -366,7 +366,7 @@ pub enum PresetCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Move a preset to a new name, taking its auto-deploy entry with it
+    /// Move a preset file to a new name
     Rename {
         old: String,
         new: String,
@@ -554,11 +554,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Update(a) => cmd_update(&ctx, a),
         Command::Deploy(a) => cmd_deploy(&ctx, a, true),
         Command::Undeploy(a) => cmd_deploy(&ctx, a, false),
-        Command::Sync { dry_run } => {
-            let snap = ctx.ws.scan()?;
-            let actions = deploy::plan_sync(&ctx.ws, &snap)?;
-            run_actions(&ctx, &actions, dry_run)
-        }
+        Command::Sync { .. } => anyhow::bail!(
+            "sync has been removed. Refresh to inspect current state; use deploy/undeploy or apply a preset to an explicit Global/Local target. No links were changed."
+        ),
         Command::Agents(a) => cmd_agents(&ctx, a.command),
         Command::Preset(a) => cmd_preset(&ctx, a.command),
     }

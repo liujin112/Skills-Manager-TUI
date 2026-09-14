@@ -133,12 +133,12 @@ pub fn spawn_input(tx: Sender<Msg>, gate: Arc<InputGate>) {
         .expect("spawn input thread");
 }
 
-pub fn spawn_ticker(tx: Sender<Msg>) {
+pub fn spawn_ticker(tx: Sender<Msg>, tick_interval: Duration) {
     std::thread::Builder::new()
         .name("ticker".into())
         .spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(tick_interval);
                 if tx.send(Msg::Tick).is_err() {
                     return;
                 }

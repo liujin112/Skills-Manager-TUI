@@ -4,6 +4,133 @@ use crate::tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use skills::{Workspace, config::Config, ops::edit, preset::Preset};
 
+#[test]
+fn library_tag_and_preset_pages_share_skill_styles_and_group_colours() {
+    use crate::tui::settings::RuntimeSettings;
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        buffer::Buffer,
+        style::{Color, Modifier},
+    };
+    use skills::config::{Icons, TagConfig, UiLayout};
+
+    // Inspect real page output with distinctive settings, so a page that bypasses
+    // the shared renderer cannot accidentally pass by using today's defaults.
+    let root = skills::ops::DownloadDir::new("cross-page-skill-styles").unwrap();
+    let tint = Color::Rgb(36, 87, 105);
+    let mut config = Config {
+        agents: vec![],
+        tags: vec![TagConfig {
+            name: "team".into(),
+            skills: vec!["sample".into()],
+            color: Some("#245769".into()),
+            description: None,
+        }],
+        ..Default::default()
+    };
+    config.ui.icons = Icons::Text;
+    config.save(root.path()).unwrap();
+    std::fs::create_dir_all(root.path().join("sample")).unwrap();
+    std::fs::write(
+        root.path().join("sample/SKILL.md"),
+        "---\nname: sample\ndescription: Shared skill description\n---\nBody",
+    )
+    .unwrap();
+    let mut ws = Workspace::open(root.path()).unwrap();
+    ws.presets
+        .save(&Preset {
+            name: "bundle".into(),
+            skills: vec!["sample".into()],
+            color: Some("#245769".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let snap = ws.scan().unwrap();
+
+    let render = |view: &mut dyn View, ctx: &Ctx| -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(180, 36)).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, frame.area(), ctx))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let has_styled_text =
+        |buffer: &Buffer, text: &str, fg: Option<Color>, bg: Option<Color>, dim: bool| {
+            assert!(text.is_ascii());
+            buffer
+                .content
+                .chunks(buffer.area.width as usize)
+                .any(|row| {
+                    row.windows(text.len()).any(|cells| {
+                        cells.iter().zip(text.chars()).all(|(cell, symbol)| {
+                            cell.symbol() == symbol.to_string()
+                                && fg.is_none_or(|expected| cell.fg == expected)
+                                && bg.is_none_or(|expected| cell.bg == expected)
+                                && (!dim || cell.modifier.contains(Modifier::DIM))
+                        })
+                    })
+                })
+        };
+
+    for layout in [UiLayout::Grid, UiLayout::List, UiLayout::Compact] {
+        ws.config.ui.layout = layout;
+        let mut settings = RuntimeSettings::new(&ws.config);
+        settings.theme.source = Color::Rgb(17, 29, 43);
+        settings.theme.dim = Color::Rgb(71, 83, 97);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut library = super::search::SearchView::default();
+        library.refresh(&ctx);
+        let mut tags = TagsView::default();
+        tags.refresh(&ctx);
+        tags.select("team", &snap);
+        let mut presets = PresetsView::default();
+        presets.refresh(&ctx);
+        presets.select("bundle");
+
+        for (name, view) in [
+            ("Library", &mut library as &mut dyn View),
+            ("Tags", &mut tags as &mut dyn View),
+            ("Presets", &mut presets as &mut dyn View),
+        ] {
+            let buffer = render(view, &ctx);
+            assert!(
+                has_styled_text(&buffer, "local", Some(settings.theme.source), None, false),
+                "{name} {layout:?} must use the shared source style"
+            );
+            if layout != UiLayout::Compact {
+                assert!(
+                    has_styled_text(
+                        &buffer,
+                        "Shared skill description",
+                        Some(settings.theme.dim),
+                        None,
+                        true
+                    ),
+                    "{name} {layout:?} must use the shared description style"
+                );
+            }
+            if name == "Tags" {
+                assert!(
+                    buffer
+                        .content
+                        .iter()
+                        .any(|cell| cell.symbol() == "●" && cell.fg == tint)
+                );
+            } else {
+                assert!(
+                    has_styled_text(&buffer, "team", None, Some(tint), false),
+                    "{name} {layout:?} must use the configured pill fill"
+                );
+            }
+        }
+    }
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -16,7 +143,11 @@ fn tag_and_preset_first_item_move_up_to_filter_and_down_to_results() {
     let ctx = Ctx {
         ws: &ws,
         snap: &snap,
-        theme: &theme,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
     };
     let mut tags = TagsView::default();
     tags.refresh(&ctx);
@@ -48,7 +179,7 @@ fn fixture(label: &str) -> Workspace {
         )
         .unwrap();
     }
-    let ws = Workspace::open(&root).unwrap();
+    let mut ws = Workspace::open(&root).unwrap();
     for name in ["alpha", "beta"] {
         edit::tag_add(&ws, name, &["team".into()]).unwrap();
     }
@@ -60,6 +191,7 @@ fn fixture(label: &str) -> Workspace {
             ..Default::default()
         })
         .unwrap();
+    ws.config = ws.load_config().unwrap();
     ws
 }
 
@@ -71,7 +203,11 @@ fn create_empty_tag_then_add_members_with_shared_picker() {
     let ctx = Ctx {
         ws: &ws,
         snap: &snap,
-        theme: &theme,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
     };
     let mut view = TagsView::default();
     view.refresh(&ctx);
@@ -89,6 +225,7 @@ fn create_empty_tag_then_add_members_with_shared_picker() {
         }
     }
     ws.config = Config::load(&ws.root).unwrap();
+    let snap = ws.scan().unwrap();
     assert!(
         ws.config
             .tags
@@ -98,7 +235,11 @@ fn create_empty_tag_then_add_members_with_shared_picker() {
     let ctx = Ctx {
         ws: &ws,
         snap: &snap,
-        theme: &theme,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
     };
     view.refresh(&ctx);
     view.select("empty", &snap);
@@ -133,13 +274,17 @@ fn create_empty_tag_then_add_members_with_shared_picker() {
 
 #[test]
 fn tag_panel_filters_locally_and_batch_writes_exclude_hidden_selections() {
-    let ws = fixture("tags");
+    let mut ws = fixture("tags");
     let snap = ws.scan().unwrap();
     let theme = Theme::default();
     let ctx = Ctx {
         ws: &ws,
         snap: &snap,
-        theme: &theme,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
     };
     let mut view = TagsView::default();
     view.refresh(&ctx);
@@ -165,10 +310,20 @@ fn tag_panel_filters_locally_and_batch_writes_exclude_hidden_selections() {
         panic!("batch write")
     };
     write(&ws).unwrap();
+    ws.config = ws.load_config().unwrap();
     let next = ws.scan().unwrap();
     assert!(next.get("alpha").unwrap().tags.contains(&"reviewed".into()));
     assert!(!next.get("beta").unwrap().tags.contains(&"reviewed".into()));
-    view.refresh(&Ctx { snap: &next, ..ctx });
+    let ctx = Ctx {
+        ws: &ws,
+        snap: &next,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
+    };
+    view.refresh(&ctx);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
     terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
     let text: String = terminal
@@ -191,7 +346,11 @@ fn filtered_preset_removal_preserves_other_members_and_central_skills() {
     let ctx = Ctx {
         ws: &ws,
         snap: &snap,
-        theme: &theme,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
     };
     let mut view = PresetsView::default();
     view.refresh(&ctx);
@@ -229,7 +388,11 @@ fn health_filter_with_no_matches_never_claims_the_library_is_healthy() {
     let ctx = Ctx {
         ws: &ws,
         snap: &snap,
-        theme: &theme,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
     };
     let mut view = HealthView::default();
     view.refresh(&ctx);
@@ -264,7 +427,11 @@ fn agent_preset_filter_keeps_its_scope_after_refresh() {
     let ctx = Ctx {
         ws: &ws,
         snap: &snap,
-        theme: &theme,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
     };
     let mut view = super::agents::AgentsView::default();
     view.refresh(&ctx);
@@ -287,5 +454,70 @@ fn agent_preset_filter_keeps_its_scope_after_refresh() {
     assert!(text.contains("bundle"));
     assert!(!text.contains("unrelated"));
     assert_eq!(ws.presets.list().unwrap().len(), 2);
+    std::fs::remove_dir_all(&ws.root).unwrap();
+}
+
+#[test]
+fn member_search_stays_visible_and_presets_place_it_above_tags() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let ws = fixture("persistent-search");
+    let snap = ws.scan().unwrap();
+    let theme = Theme::default();
+    let ctx = Ctx {
+        ws: &ws,
+        snap: &snap,
+        settings: &{
+            let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            settings.theme = theme;
+            settings
+        },
+    };
+    let render = |view: &mut dyn View, height| {
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+    };
+    let mut tags = TagsView::default();
+    tags.refresh(&ctx);
+    assert!(render(&mut tags, 30)[1].contains("search skills…"));
+    tags.handle_key(key(KeyCode::Right), &ctx);
+    tags.handle_key(key(KeyCode::Char('/')), &ctx);
+    tags.paste("beta", &ctx);
+    tags.handle_key(key(KeyCode::Esc), &ctx);
+    tags.handle_key(key(KeyCode::Left), &ctx);
+    assert!(render(&mut tags, 30)[1].contains("beta"));
+    tags.refresh(&ctx);
+    assert!(render(&mut tags, 30)[1].contains("beta"));
+
+    let mut presets = PresetsView::default();
+    presets.refresh(&ctx);
+    let rows = render(&mut presets, 30);
+    assert!(rows[1].contains("search skills…"));
+    assert!(rows[4].contains("team 2/2"));
+    presets.handle_key(key(KeyCode::Right), &ctx); // Tag stripe.
+    presets.handle_key(key(KeyCode::Up), &ctx); // Search above stripe.
+    assert!(presets.input_focused());
+    presets.paste("alpha", &ctx);
+    presets.handle_key(key(KeyCode::Down), &ctx); // Back to stripe.
+    assert!(!presets.input_focused());
+    presets.handle_key(key(KeyCode::Down), &ctx); // Skill list.
+    presets.handle_key(key(KeyCode::Up), &ctx); // Stripe again.
+    presets.handle_key(key(KeyCode::Up), &ctx); // Search again.
+    assert!(presets.input_focused());
+    assert!(render(&mut presets, 30)[1].contains("alpha"));
+    presets.handle_key(key(KeyCode::Esc), &ctx);
+    presets.handle_key(key(KeyCode::Left), &ctx);
+    presets.refresh(&ctx);
+    assert!(render(&mut presets, 30)[1].contains("alpha"));
+    for height in 1..10 {
+        render(&mut tags, height);
+        render(&mut presets, height);
+    }
     std::fs::remove_dir_all(&ws.root).unwrap();
 }

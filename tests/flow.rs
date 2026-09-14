@@ -1,7 +1,7 @@
 //! End-to-end flow over a temporary skills root with fake agent directories.
 
 use skills::Workspace;
-use skills::config::{AgentConfig, Config, DeployConfig};
+use skills::config::{AgentConfig, Config};
 use skills::history::{self, Intent, Plan};
 use skills::ops::deploy::{self, Action};
 use skills::ops::{edit, install};
@@ -40,10 +40,6 @@ impl Fixture {
                     skills_dir: agent_b.display().to_string(),
                 },
             ],
-            deploy: DeployConfig {
-                all_to_all: true,
-                presets: vec![],
-            },
             tags: vec![],
             search: Default::default(),
             ui: Default::default(),
@@ -88,7 +84,7 @@ fn scan_tags_notes_and_baseline() {
     let f = Fixture::new("meta");
     f.add_skill("alpha", "first skill");
     f.add_skill("beta", "second skill");
-    let ws = f.ws();
+    let mut ws = f.ws();
 
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 2);
@@ -97,6 +93,7 @@ fn scan_tags_notes_and_baseline() {
 
     edit::tag_add(&ws, "alpha", &["ops".into(), "ml".into()]).unwrap();
     assert!(edit::note_set(&ws, "alpha", Some("hello\nworld")).is_err());
+    ws.config = ws.load_config().unwrap();
     let snap = ws.scan().unwrap();
     let a = snap.get("alpha").unwrap();
     assert_eq!(a.tags, vec!["ml", "ops"]);
@@ -121,6 +118,7 @@ fn scan_tags_notes_and_baseline() {
     edit::tag_add(&ws, "beta", &["ops".into()]).unwrap();
     assert_eq!(edit::tag_rename(&ws, "ops", "operations").unwrap(), 2);
     assert_eq!(edit::tag_delete(&ws, "ml").unwrap(), 1);
+    ws.config = ws.load_config().unwrap();
     let snap = ws.scan().unwrap();
     assert_eq!(snap.get("alpha").unwrap().tags, vec!["operations"]);
     assert_eq!(snap.get("beta").unwrap().tags, vec!["operations"]);
@@ -133,8 +131,9 @@ fn scan_tags_notes_and_baseline() {
 fn missing_and_rename_detection() {
     let f = Fixture::new("rename");
     f.add_skill("gamma", "g");
-    let ws = f.ws();
+    let mut ws = f.ws();
     edit::tag_add(&ws, "gamma", &["x".into()]).unwrap();
+    ws.config = ws.load_config().unwrap();
     std::os::unix::fs::symlink(&f.root, &f.agent_a).unwrap();
 
     std::fs::rename(f.root.join("gamma"), f.root.join("gamma2")).unwrap();
@@ -147,6 +146,7 @@ fn missing_and_rename_detection() {
     );
 
     edit::migrate_meta(&ws, "gamma", "gamma2").unwrap();
+    ws.config = ws.load_config().unwrap();
     let snap = ws.scan().unwrap();
     assert!(snap.get("gamma").is_none());
     assert_eq!(snap.get("gamma2").unwrap().tags, vec!["x"]);
@@ -164,7 +164,7 @@ fn missing_and_rename_detection() {
 fn external_move_repairs_links_presets_and_preserves_metadata() {
     let f = Fixture::new("external-move");
     f.add_skill("old", "move me");
-    let ws = f.ws();
+    let mut ws = f.ws();
     edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
     ws.presets
         .save(&Preset {
@@ -194,6 +194,7 @@ fn external_move_repairs_links_presets_and_preserves_metadata() {
         ws.presets.load("daily").unwrap().unwrap().skills,
         vec!["local/new"]
     );
+    ws.config = ws.load_config().unwrap();
     let snap = ws.scan().unwrap();
     assert!(snap.get("old").is_none());
     assert_eq!(snap.get("local/new").unwrap().tags, vec!["keep"]);
@@ -269,7 +270,7 @@ fn migration_rejects_existing_source_and_missing_or_external_destination() {
 }
 
 #[test]
-fn deploy_undeploy_sync_and_convert() {
+fn deploy_undeploy_and_convert() {
     let f = Fixture::new("deploy");
     f.add_skill("one", "1");
     f.add_skill("two", "2");
@@ -286,8 +287,14 @@ fn deploy_undeploy_sync_and_convert() {
         DeployState::NoAgentDir
     );
 
-    // Sync creates agent B with both links, skips dir-linked A.
-    let actions = deploy::plan_sync(&ws, &snap).unwrap();
+    // Explicit deployment creates agent B with both links, skips dir-linked A.
+    let actions = deploy::plan_deploy(
+        &ws,
+        &snap,
+        &["one".into(), "two".into()],
+        &["a".into(), "b".into()],
+    )
+    .unwrap();
     assert!(
         actions
             .iter()
@@ -338,7 +345,7 @@ fn deploy_undeploy_sync_and_convert() {
     let actions = deploy::plan_deploy(&ws, &snap, &["two".into()], &["b".into()]).unwrap();
     assert!(deploy::apply(&actions).is_err());
 
-    // Broken link is repaired by sync; sync also re-links `one` to A (all_to_all).
+    // Broken links are reported without retargeting or restoring unrelated links.
     std::fs::remove_dir_all(f.agent_b.join("two")).unwrap();
     std::os::unix::fs::symlink(f.root.join("nonexistent"), f.agent_b.join("two")).unwrap();
     let snap = ws.scan().unwrap();
@@ -346,11 +353,17 @@ fn deploy_undeploy_sync_and_convert() {
         snap.agent("b").unwrap().entries["two"],
         EntryState::Broken { .. }
     ));
-    let actions = deploy::plan_sync(&ws, &snap).unwrap();
+    let actions = deploy::plan_deploy(&ws, &snap, &["two".into()], &["b".into()]).unwrap();
     deploy::apply(&actions).unwrap();
     let snap = ws.scan().unwrap();
-    assert_eq!(snap.get("two").unwrap().deploy["b"], DeployState::Deployed);
-    assert_eq!(snap.get("one").unwrap().deploy["a"], DeployState::Deployed);
+    assert!(matches!(
+        snap.agent("b").unwrap().entries["two"],
+        EntryState::Broken { .. }
+    ));
+    assert_eq!(
+        snap.get("one").unwrap().deploy["a"],
+        DeployState::NotDeployed
+    );
 }
 
 #[test]
@@ -1101,11 +1114,12 @@ fn note_editor_only_saves_successful_content_changes() {
 fn local_tags_do_not_create_metadata_and_notes_are_rejected() {
     let f = Fixture::new("local-metadata");
     f.add_skill("alpha", "first skill");
-    let ws = f.ws();
+    let mut ws = f.ws();
     edit::tag_add(&ws, "alpha", &["keep".into()]).unwrap();
     assert!(edit::note_set(&ws, "alpha", Some("note")).is_err());
     assert!(ws.meta.load("alpha").unwrap().is_none());
     assert!(!f.root.join(".skills-meta/local.toml").exists());
+    ws.config = ws.load_config().unwrap();
     let snap = ws.scan().unwrap();
     let rec = snap.get("alpha").unwrap();
     assert_eq!(rec.status, SkillStatus::Local);

@@ -6,8 +6,10 @@
 //! of `a`, `m`, `x` and `U` fits the row under the cursor.
 
 use super::preview::{Overlay, kv};
-use super::{View, split_panes, status_glyph, status_text, wheel};
+use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::components::layout::split_panes;
+use crate::tui::components::skill::{status_glyph, status_text};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::widgets::{ListNav, fit, pad, width};
@@ -208,8 +210,7 @@ impl HealthView {
                 .collect();
             let mode_issue = match &agent.mode {
                 AgentDirMode::Missing => Some(
-                    "Agent directory does not exist. Deploy or sync from Agents to create it."
-                        .to_string(),
+                    "Agent directory does not exist. Deploy from Agents to create it.".to_string(),
                 ),
                 AgentDirMode::DirForeign { target } => Some(format!(
                     "Agent directory links outside the root → {}. Review this path before changing it.",
@@ -355,7 +356,7 @@ impl HealthView {
     /// which keys act on it. Nothing here is guessed; where the record
     /// cannot answer a question, the text says so.
     fn detail_lines(&self, r: &SkillRecord, caps: Caps, ctx: &Ctx) -> Vec<Line<'static>> {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let key = r.key.clone();
         let heading = |s: &'static str| Line::from(Span::styled(s, th.bold().fg(th.accent)));
         let text = |s: String| Line::from(Span::raw(s));
@@ -607,7 +608,7 @@ impl HealthView {
     }
 
     fn draw_detail(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let block = th.block(" detail ", false);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -753,7 +754,7 @@ impl View for HealthView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.preview.handle_mouse(m) {
+        if self.preview.handle_mouse(m, ctx) {
             return vec![];
         }
         let at = (m.column, m.row).into();
@@ -761,7 +762,7 @@ impl View for HealthView {
             self.filter.editing = true;
             return vec![];
         }
-        if let Some(d) = wheel(&m) {
+        if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
                 self.select_by(d);
             } else if self.right.contains(at) {
@@ -784,7 +785,7 @@ impl View for HealthView {
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let area = self.filter.draw(f, area, "Filter health issues", ctx);
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         // With nothing to show there is nothing to explain either, so the
         // message gets the whole width instead of being squeezed beside an
         // empty pane.
@@ -818,7 +819,7 @@ impl View for HealthView {
         }
         // The list carries the name and the status text side by side, so it
         // needs a little more than the usual share of the width.
-        let (left, right) = split_panes(area, 45);
+        let (left, right) = split_panes(area, 45, ctx);
         self.left = left;
         self.right = right;
         let items: Vec<ListItem> = self
@@ -1089,7 +1090,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = HealthView::default();
         view.refresh(&ctx);
@@ -1187,7 +1192,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = HealthView::default();
         view.refresh(&ctx);

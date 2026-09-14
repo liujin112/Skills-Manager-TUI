@@ -1,6 +1,7 @@
 //! Repository grouping of the existing inventory, including flat local skills.
-use super::{View, split_panes, wheel};
+use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::components::layout::split_panes;
 use crate::tui::widgets::ListNav;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -213,6 +214,7 @@ impl View for ReposView {
             let mut view = super::search::SearchView::panel(
                 self.members.clone(),
                 "Repository skills".into(),
+                crate::tui::settings::LayoutScope::Repositories,
                 ctx,
             );
             if k.code == KeyCode::Char('m') {
@@ -246,7 +248,7 @@ impl View for ReposView {
             self.filter.editing = true;
             return vec![];
         }
-        if let Some(delta) = wheel(&m) {
+        if let Some(delta) = wheel(&m, ctx) {
             if self.nav.rows.contains(point) {
                 self.reading = false;
                 self.move_by(delta);
@@ -280,7 +282,7 @@ impl View for ReposView {
         } else {
             area
         };
-        let (left, right) = split_panes(area, 35);
+        let (left, right) = split_panes(area, 35, ctx);
         self.right = right;
         let path = self
             .project
@@ -302,9 +304,13 @@ impl View for ReposView {
                         .get(key)
                         .map(|r| {
                             if r.status.is_healthy() {
-                                super::cards::display_name(r).to_string()
+                                crate::tui::components::skill::display_name(r).to_string()
                             } else {
-                                format!("{}  [{}]", super::cards::display_name(r), r.status.label())
+                                format!(
+                                    "{}  [{}]",
+                                    crate::tui::components::skill::display_name(r),
+                                    r.status.label()
+                                )
                             }
                         })
                         .unwrap_or_else(|| key.clone())
@@ -322,6 +328,7 @@ impl View for ReposView {
             " repositories "
         };
         let block = ctx
+            .settings
             .theme
             .block(format!("{title}({}) ", labels.len()), !self.reading);
         self.nav.rows = block.inner(left);
@@ -334,7 +341,7 @@ impl View for ReposView {
                         Span::raw(format!("{} · ", self.projects[i].name)),
                         Span::styled(
                             format!("{} skills", self.projects[i].keys.len()),
-                            ctx.theme.skill_count(),
+                            ctx.settings.theme.skill_count(),
                         ),
                     ]))
                 } else {
@@ -345,12 +352,12 @@ impl View for ReposView {
         f.render_stateful_widget(
             List::new(items)
                 .block(block)
-                .highlight_style(ctx.theme.selected())
+                .highlight_style(ctx.settings.theme.selected())
                 .highlight_symbol("▸ "),
             left,
             &mut self.nav.state,
         );
-        let block = ctx.theme.block(
+        let block = ctx.settings.theme.block(
             if self.project.is_some() {
                 " preview · read only "
             } else {
@@ -361,11 +368,14 @@ impl View for ReposView {
         let inner = block.inner(right);
         f.render_widget(block, right);
         let mut lines = vec![
-            Line::styled(skills::paths::contract_tilde(&path), ctx.theme.dim()),
+            Line::styled(
+                skills::paths::contract_tilde(&path),
+                ctx.settings.theme.dim(),
+            ),
             Line::raw(""),
         ];
         if let Some(error) = &self.error {
-            lines.push(Line::styled(error.clone(), ctx.theme.err()));
+            lines.push(Line::styled(error.clone(), ctx.settings.theme.err()));
         }
         if let Some(i) = self.project {
             lines.push(Line::raw(self.projects[i].source.clone()));
@@ -388,16 +398,22 @@ impl View for ReposView {
             if let Some(project) = self.nav.selected().and_then(|i| self.projects.get(i)) {
                 lines.insert(
                     0,
-                    Line::styled(project.name.clone(), ctx.theme.bold().fg(ctx.theme.accent)),
+                    Line::styled(
+                        project.name.clone(),
+                        ctx.settings.theme.bold().fg(ctx.settings.theme.accent),
+                    ),
                 );
                 lines.push(Line::styled(
                     format!("{} installed skills", project.keys.len()),
-                    ctx.theme.skill_count(),
+                    ctx.settings.theme.skill_count(),
                 ));
                 lines.push(Line::raw(""));
                 lines.push(Line::raw(project.source.clone()));
                 lines.push(Line::raw(""));
-                lines.push(Line::styled("Enter → browse skills", ctx.theme.accent()));
+                lines.push(Line::styled(
+                    "Enter → browse skills",
+                    ctx.settings.theme.accent(),
+                ));
             }
             if self.projects.is_empty() {
                 lines.push(Line::raw(
@@ -459,7 +475,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = ReposView::default();
         view.refresh(&ctx);
@@ -493,7 +513,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         view.refresh(&ctx);
         assert!(view.project.is_none());
@@ -537,7 +561,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = ReposView::default();
         view.refresh(&ctx);

@@ -482,8 +482,9 @@ fn scan_inventory(
         }
     }
 
-    let tag_config = Config::load(root)?;
-    let mut references: Vec<String> = tag_config
+    // The caller supplies one validated configuration snapshot, including any
+    // explicit scope overrides. Do not mix its options with a second file read.
+    let mut references: Vec<String> = config
         .tags
         .iter()
         .filter(|_| config.tags_enabled)
@@ -529,7 +530,7 @@ fn scan_inventory(
 
     for rec in records.values_mut() {
         rec.tags = if config.tags_enabled {
-            tag_config.skill_tags(&rec.key)
+            config.skill_tags(&rec.key)
         } else {
             Vec::new()
         };

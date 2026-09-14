@@ -80,18 +80,18 @@ fn representative_tui_latency() {
         };
         let start = Instant::now();
         app.benchmark_apply(Action::WriteMeta(Box::new(move |ws| {
-            targets::set_installed(ws, &agent, None, &selected, preset, on)
+            targets::set_deployed(ws, &agent, None, &selected, on)
         })));
         let dispatch = start.elapsed();
         app.benchmark_drain(&rx);
         terminal.draw(|frame| app.draw(frame)).unwrap();
-        let selection = targets::selection(&app.ws, &target).unwrap();
+        let selection = targets::scan_deployed(&app.ws, &target).unwrap();
         for key in if preset.is_some() {
             keys.clone()
         } else {
             vec![keys[0].clone()]
         } {
-            assert_eq!(selection.skills().contains(&key), on);
+            assert_eq!(selection.contains(&key), on);
             assert_eq!(
                 target
                     .skills_path()

@@ -54,7 +54,7 @@ impl Filter {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, label: &str, ctx: &Ctx) -> Rect {
         let height = area.height.min(3);
         self.rect = Rect::new(area.x, area.y, area.width, height);
-        let block = ctx.theme.block(
+        let block = ctx.settings.theme.block(
             format!(
                 " {label}{} ",
                 if self.input.is_empty() {
@@ -68,7 +68,10 @@ impl Filter {
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
         f.render_widget(
-            ratatui::widgets::Paragraph::new(ratatui::text::Span::styled("› ", ctx.theme.accent())),
+            ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
+                "› ",
+                ctx.settings.theme.accent(),
+            )),
             Rect::new(
                 inner.x + u16::from(inner.width > 0),
                 inner.y,
@@ -86,7 +89,7 @@ impl Filter {
             ),
             self.editing,
             ("filter…", " · Enter results"),
-            ctx.theme,
+            &ctx.settings.theme,
         );
         Rect::new(area.x, area.y + height, area.width, area.height - height)
     }

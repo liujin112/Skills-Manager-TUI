@@ -1,4 +1,4 @@
-//! Symlink deployment: deploy, undeploy, sync to desired state, convert dir-linked agents.
+//! Symlink deployment: deploy, undeploy, convert dir-linked agents.
 
 use crate::Workspace;
 use crate::hash::hash_directory;
@@ -173,19 +173,11 @@ pub fn plan_deploy(
                             reason: "already deployed".into(),
                         })
                     }
-                    Some(EntryState::Broken { .. }) => {
-                        actions.push(Action::Unlink {
-                            agent: agent.clone(),
-                            skill: skill.clone(),
-                            path: dir.join(crate::repository::default_deploy_name(skill)),
-                        });
-                        actions.push(Action::Link {
-                            agent: agent.clone(),
-                            skill: skill.clone(),
-                            path: dir.join(crate::repository::default_deploy_name(skill)),
-                            target: rec.path.clone(),
-                        });
-                    }
+                    Some(EntryState::Broken { .. }) => actions.push(Action::Skip {
+                        agent: agent.clone(),
+                        skill: skill.clone(),
+                        reason: "broken link; explicitly clean it before deploying".into(),
+                    }),
                     Some(EntryState::Deployed) => actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
@@ -428,212 +420,6 @@ pub fn plan_relink(
     Ok(actions)
 }
 
-/// Desired (skill, agent) pairs from config: all-to-all and/or auto-deployed presets.
-pub fn desired_pairs(ws: &Workspace, snap: &Snapshot) -> Result<BTreeSet<(String, String)>> {
-    let mut pairs = BTreeSet::new();
-    let mut explicit = super::targets::registered_keys(&ws.root)?;
-    explicit.extend(ws.discovered_agents.iter().cloned());
-    let desired = super::targets::desired(&ws.root)?;
-    for record in snap.skills.iter().filter(|s| s.status.is_present()) {
-        for agent in snap.agents.iter().filter(|a| explicit.contains(&a.key)) {
-            if desired.get(&agent.key).map_or_else(
-                || {
-                    matches!(
-                        agent.entries.get(&record.deployment_name()),
-                        Some(EntryState::Deployed | EntryState::Broken { .. })
-                    )
-                },
-                |keys| keys.contains(&record.key),
-            ) {
-                pairs.insert((record.key.clone(), agent.key.clone()));
-            }
-        }
-    }
-    let agents = ws.config.agent_keys();
-    let present: Vec<&str> = snap
-        .skills
-        .iter()
-        .filter(|s| s.status.is_present())
-        .map(|s| s.key.as_str())
-        .collect();
-    if ws.config.deploy.all_to_all {
-        for s in &present {
-            for a in &agents {
-                if explicit.contains(a) {
-                    continue;
-                }
-                pairs.insert((s.to_string(), a.clone()));
-            }
-        }
-    }
-    for name in &ws.config.deploy.presets {
-        let preset = ws
-            .presets
-            .load(name)?
-            .with_context(|| format!("deploy.presets names unknown preset {name}"))?;
-        let targets = if preset.agents.is_empty() {
-            agents.clone()
-        } else {
-            preset.agents.clone()
-        };
-        for s in &preset.skills {
-            if present.contains(&s.as_str()) {
-                for a in &targets {
-                    if explicit.contains(a) {
-                        continue;
-                    }
-                    pairs.insert((s.clone(), a.clone()));
-                }
-            }
-        }
-    }
-    Ok(pairs)
-}
-
-/// Plan making reality match the desired state: create missing links, remove
-/// links into the root that are no longer desired, clean broken links.
-pub fn plan_sync(ws: &Workspace, snap: &Snapshot) -> Result<Vec<Action>> {
-    let desired = desired_pairs(ws, snap)?;
-    let mut actions = Vec::new();
-    let mut seen = BTreeSet::new();
-    for a in &ws.config.agents {
-        let report = snap.agent(&a.key).context("agent not scanned")?;
-        let dir = a.skills_path();
-        let identity = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
-        if !seen.insert(identity.clone()) {
-            continue;
-        }
-        let readers: BTreeSet<_> = ws
-            .config
-            .agents
-            .iter()
-            .filter(|other| {
-                let path = other.skills_path();
-                std::fs::canonicalize(&path).unwrap_or(path) == identity
-            })
-            .map(|other| other.key.as_str())
-            .collect();
-        let wanted: BTreeSet<String> = desired
-            .iter()
-            .filter(|(_, ag)| readers.contains(ag.as_str()))
-            .map(|(s, _)| s.clone())
-            .collect();
-        match &report.mode {
-            AgentDirMode::DirLinked => {
-                if !wanted.is_empty() {
-                    actions.push(Action::Skip {
-                        agent: a.key.clone(),
-                        skill: "*".into(),
-                        reason: "whole-directory link; everything is deployed".into(),
-                    });
-                }
-                continue;
-            }
-            AgentDirMode::DirForeign { target } => {
-                actions.push(Action::Skip {
-                    agent: a.key.clone(),
-                    skill: "*".into(),
-                    reason: format!("agent dir is a symlink to {}", target.display()),
-                });
-                continue;
-            }
-            AgentDirMode::Missing => {
-                if wanted.is_empty() {
-                    continue;
-                }
-                actions.push(Action::Mkdir {
-                    agent: a.key.clone(),
-                    path: dir.clone(),
-                });
-                for s in &wanted {
-                    actions.push(Action::Link {
-                        agent: a.key.clone(),
-                        skill: s.clone(),
-                        path: dir.join(crate::repository::default_deploy_name(s)),
-                        target: ws.skill_path(s),
-                    });
-                }
-            }
-            AgentDirMode::Real | AgentDirMode::SharedRoot => {
-                for s in &wanted {
-                    match report
-                        .entries
-                        .get(&crate::repository::default_deploy_name(s))
-                    {
-                        None => actions.push(Action::Link {
-                            agent: a.key.clone(),
-                            skill: s.clone(),
-                            path: dir.join(crate::repository::default_deploy_name(s)),
-                            target: ws.skill_path(s),
-                        }),
-                        Some(EntryState::Deployed)
-                            if snap.get(s).is_some_and(|r| {
-                                r.deploy.get(&a.key) == Some(&DeployState::Deployed)
-                            }) => {}
-                        Some(EntryState::Deployed) => actions.push(Action::Link {
-                            agent: a.key.clone(),
-                            skill: s.clone(),
-                            path: dir.join(crate::repository::default_deploy_name(s)),
-                            target: ws.skill_path(s),
-                        }),
-
-                        Some(EntryState::Broken { .. }) => {
-                            actions.push(Action::Unlink {
-                                agent: a.key.clone(),
-                                skill: s.clone(),
-                                path: dir.join(crate::repository::default_deploy_name(s)),
-                            });
-                            actions.push(Action::Link {
-                                agent: a.key.clone(),
-                                skill: s.clone(),
-                                path: dir.join(crate::repository::default_deploy_name(s)),
-                                target: ws.skill_path(s),
-                            });
-                        }
-                        Some(other) => actions.push(Action::Skip {
-                            agent: a.key.clone(),
-                            skill: s.clone(),
-                            reason: format!("entry is {}", other.label()),
-                        }),
-                    }
-                }
-                for (name, state) in &report.entries {
-                    if report.mode == AgentDirMode::SharedRoot && snap.get(name).is_some() {
-                        continue; // Source entries cannot be disabled for only one reader.
-                    }
-                    let is_wanted = wanted
-                        .iter()
-                        .any(|w| crate::repository::default_deploy_name(w) == *name);
-                    match state {
-                        EntryState::Deployed if !is_wanted => actions.push(Action::Unlink {
-                            agent: a.key.clone(),
-                            skill: snap
-                                .skills
-                                .iter()
-                                .find(|s| s.deployment_name() == *name)
-                                .map(|s| s.key.clone())
-                                .unwrap_or_else(|| name.clone()),
-                            path: dir.join(name),
-                        }),
-                        EntryState::Broken { .. } if !is_wanted => actions.push(Action::Unlink {
-                            agent: a.key.clone(),
-                            skill: snap
-                                .skills
-                                .iter()
-                                .find(|s| s.deployment_name() == *name)
-                                .map(|s| s.key.clone())
-                                .unwrap_or_else(|| name.clone()),
-                            path: dir.join(name),
-                        }),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    Ok(actions)
-}
-
 /// Plan turning a whole-directory link into a real directory with per-skill links.
 pub fn plan_convert(ws: &Workspace, snap: &Snapshot, agent: &str) -> Result<Vec<Action>> {
     let cfg = ws
@@ -853,26 +639,12 @@ impl PresetStatus {
     }
 }
 
-/// Agents a preset applies to inside `scope`: its own list narrowed to the
-/// scope, or the whole scope when the preset targets everything.
-pub fn preset_agents(preset: &Preset, scope: &[String]) -> Vec<String> {
-    if preset.agents.is_empty() {
-        scope.to_vec()
-    } else {
-        scope
-            .iter()
-            .filter(|a| preset.agents.contains(a))
-            .cloned()
-            .collect()
-    }
-}
-
 /// Count how much of `preset` is deployed across `scope`. Only members that
 /// exist in the skills root count; a member whose directory is gone is listed
 /// in `absent` and excluded from the total, so a preset referring to a deleted
 /// skill can still read as complete.
 pub fn preset_status(snap: &Snapshot, preset: &Preset, scope: &[String]) -> PresetStatus {
-    let agents = preset_agents(preset, scope);
+    let agents = scope.to_vec();
     let mut installed = 0;
     let mut total = 0;
     let mut absent = Vec::new();
@@ -904,7 +676,7 @@ pub fn plan_preset_activate(
     preset: &Preset,
     scope: &[String],
 ) -> Result<Vec<Action>> {
-    let agents = preset_agents(preset, scope);
+    let agents = scope.to_vec();
     let present: Vec<String> = preset
         .skills
         .iter()
@@ -923,7 +695,7 @@ pub fn plan_preset_activate(
 }
 
 /// Undeploy every member of `preset` from `scope`. Overlap with other presets
-/// is deliberately ignored: a preset is applied as a one-time copy, not a live
+/// is deliberately ignored: a preset is applied as a one-time selection, not a live
 /// membership, so deactivating removes all of its skills.
 pub fn plan_preset_deactivate(
     ws: &Workspace,
@@ -931,7 +703,7 @@ pub fn plan_preset_deactivate(
     preset: &Preset,
     scope: &[String],
 ) -> Result<Vec<Action>> {
-    let agents = preset_agents(preset, scope);
+    let agents = scope.to_vec();
     let present: Vec<String> = preset
         .skills
         .iter()

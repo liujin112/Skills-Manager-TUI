@@ -89,7 +89,6 @@ fn shared_root_is_deployed_and_cannot_be_converted_relinked_or_pruned() {
     skill(&f.0.join(".agents/skills/sample"));
     let mut ws = Workspace::open_local(&f.0, false).unwrap();
     ws.config.agents.retain(|a| a.key == "codex");
-    ws.config.deploy.all_to_all = false;
     let snap = ws.scan().unwrap();
     assert_eq!(snap.agent("codex").unwrap().mode, AgentDirMode::SharedRoot);
     assert_eq!(snap.get("sample").unwrap().deployed_to(), vec!["codex"]);
@@ -101,7 +100,7 @@ fn shared_root_is_deployed_and_cannot_be_converted_relinked_or_pruned() {
             .all(|a| !a.is_change())
     );
     assert!(
-        deploy::plan_sync(&ws, &snap)
+        deploy::plan_undeploy(&ws, &snap, &["sample".into()], &["codex".into()])
             .unwrap()
             .iter()
             .all(|a| !a.is_change())
@@ -202,7 +201,7 @@ fn shared_source_rename_preserves_directory_and_shared_alias_removal_cleans_link
 }
 
 #[test]
-fn shared_readers_sync_union_of_presets_and_undeploy_only_once() {
+fn shared_readers_observe_deployment_and_undeploy_only_once() {
     let f = Fixture::new("shared-readers");
     let mut ws = Workspace::open_local(&f.0, true).unwrap();
     Config::add_agent(
@@ -216,8 +215,6 @@ fn shared_readers_sync_union_of_presets_and_undeploy_only_once() {
     )
     .unwrap();
     ws.config = ws.load_config().unwrap();
-    ws.config.deploy.all_to_all = false;
-    ws.config.deploy.presets = vec!["only-gemini-cli".into()];
     let key = "repos/example/sample";
     skill(&ws.root.join(key));
     ws.presets
@@ -229,7 +226,13 @@ fn shared_readers_sync_union_of_presets_and_undeploy_only_once() {
             agents: vec!["gemini-cli".into()],
         })
         .unwrap();
-    let plan = deploy::plan_sync(&ws, &ws.scan().unwrap()).unwrap();
+    let plan = deploy::plan_deploy(
+        &ws,
+        &ws.scan().unwrap(),
+        &[key.into()],
+        &["gemini-cli".into()],
+    )
+    .unwrap();
     assert_eq!(
         plan.iter()
             .filter(|a| matches!(a, deploy::Action::Link { .. }))
@@ -272,7 +275,7 @@ fn catalog_needs_no_root_and_agent_registration_preserves_global_config() {
     let text = std::fs::read_to_string(Config::path(&root)).unwrap();
     assert!(text.starts_with("# keep my comment\n"));
     let cfg = Config::load(&root).unwrap();
-    assert!(!cfg.deploy.all_to_all);
+    assert!(!toml::to_string(&cfg).unwrap().contains("all_to_all"));
     assert_eq!(cfg.agent("claude").unwrap().skills_dir, "~/.claude/skills");
     assert_eq!(cfg.agent("cursor").unwrap().skills_dir, "~/.cursor/skills");
 }

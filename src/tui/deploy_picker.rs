@@ -234,7 +234,7 @@ impl DeployPicker {
         self.list.rows = Rect::default();
         self.project_rect = Rect::default();
         f.render_widget(OverlayClear, self.rect);
-        let block = ctx.theme.block(
+        let block = ctx.settings.theme.block(
             format!(" Install to agents · {} skills ", self.keys.len()),
             true,
         );
@@ -246,7 +246,7 @@ impl DeployPicker {
         }
         f.render_widget(
             Paragraph::new("Select directories under each product · Global & Local")
-                .style(ctx.theme.bold()),
+                .style(ctx.settings.theme.bold()),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
         self.project_rect = Rect::new(inner.x, inner.y + 2, inner.width, 1);
@@ -262,7 +262,7 @@ impl DeployPicker {
                 self.project_rect,
                 self.editing,
                 "Project directory",
-                ctx.theme,
+                &ctx.settings.theme,
             );
         }
         f.render_widget(
@@ -270,7 +270,7 @@ impl DeployPicker {
                 &format!("Source: {} (symlink deployment)", ctx.ws.root.display()),
                 inner.width as usize,
             ))
-            .style(ctx.theme.dim()),
+            .style(ctx.settings.theme.dim()),
             Rect::new(inner.x, inner.y + 3, inner.width, 1),
         );
         self.list.rows = Rect::new(inner.x, inner.y + 5, inner.width, inner.height - 11);
@@ -310,7 +310,7 @@ impl DeployPicker {
             })
             .collect();
         f.render_stateful_widget(
-            List::new(rows).highlight_style(ctx.theme.selected()),
+            List::new(rows).highlight_style(ctx.settings.theme.selected()),
             self.list.rows,
             &mut self.list.state,
         );
@@ -341,9 +341,9 @@ impl DeployPicker {
             Paragraph::new(info)
                 .wrap(Wrap { trim: false })
                 .style(if self.error.is_some() {
-                    ctx.theme.err()
+                    ctx.settings.theme.err()
                 } else {
-                    ctx.theme.dim()
+                    ctx.settings.theme.dim()
                 }),
             Rect::new(inner.x, inner.bottom() - 4, inner.width, 2),
         );
@@ -353,7 +353,7 @@ impl DeployPicker {
         ];
         for (i, label) in ["[ Apply ]", "[ Cancel ]"].iter().enumerate() {
             f.render_widget(
-                Paragraph::new(*label).style(ctx.theme.bold()),
+                Paragraph::new(*label).style(ctx.settings.theme.bold()),
                 self.buttons[i],
             );
         }
@@ -379,7 +379,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut picker =
             DeployPicker::with_home(vec!["sample".into()], &ctx, project.with_extension("home"));

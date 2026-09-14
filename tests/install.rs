@@ -2,7 +2,7 @@
 //! question, name clashes, and the clean update path.
 
 use skills::Workspace;
-use skills::config::{Config, DeployConfig};
+use skills::config::Config;
 use skills::hash::hash_directory;
 use skills::meta::Source;
 use skills::ops::install::{self, NotOneSkill};
@@ -28,10 +28,6 @@ impl Fixture {
             tags_enabled: true,
             schema: 1,
             agents: vec![],
-            deploy: DeployConfig {
-                all_to_all: true,
-                presets: vec![],
-            },
             tags: vec![],
             search: Default::default(),
             ui: Default::default(),

@@ -236,7 +236,6 @@ pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
             ws.presets.save(&p)?;
         }
     }
-    super::targets::rename_skill_reference(ws, old, Some(new))?;
     Config::rename_tag_skill(&ws.root, old, Some(new))?;
     ws.meta.rename(old, new)
 }
@@ -299,7 +298,6 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
             log.push(format!("updated preset {}", p.name));
         }
     }
-    super::targets::rename_skill_reference(ws, old, Some(new))?;
     Ok(log)
 }
 
@@ -342,6 +340,5 @@ pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Re
         log.push("removed metadata".into());
     }
     Config::rename_tag_skill(&ws.root, key, None)?;
-    super::targets::rename_skill_reference(ws, key, None)?;
     Ok(log)
 }

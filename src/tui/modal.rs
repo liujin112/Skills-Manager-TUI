@@ -477,13 +477,13 @@ impl Modal {
                             id: r.alias.clone(),
                             label: format!(
                                 "{} {}",
-                                crate::tui::icons::git(ctx.ws.config.ui.icons, &r.url),
+                                crate::tui::icons::git(ctx.settings.ui.icons, &r.url),
                                 skills::repository::source_name(&r.url).unwrap_or(r.alias)
                             ),
                             sub: format!(
                                 "{} {count} skills · {} {} · {}",
-                                crate::tui::icons::package(ctx.ws.config.ui.icons),
-                                crate::tui::icons::branch(ctx.ws.config.ui.icons),
+                                crate::tui::icons::package(ctx.settings.ui.icons),
+                                crate::tui::icons::branch(ctx.settings.ui.icons),
                                 r.branch,
                                 r.url
                             ),
@@ -564,7 +564,11 @@ impl Modal {
         }
     }
 
-    pub fn refresh(&mut self, _ctx: &Ctx) {}
+    pub fn refresh(&mut self, ctx: &Ctx) {
+        if let Self::Repository(picker) = self {
+            picker.refresh(ctx);
+        }
+    }
 
     pub fn hints(&self) -> Hints {
         match self {
@@ -1079,7 +1083,7 @@ impl Modal {
     // ---- drawing ----------------------------------------------------------
 
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         match self {
             Modal::DeploymentChoices(picker) => picker.draw(f, area, ctx),
             Modal::PresetSkills(view) => {
@@ -1101,7 +1105,7 @@ impl Modal {
                 let lines: Vec<Line> = HELP
                     .lines()
                     .filter(|l| {
-                        ctx.ws.config.tags_enabled
+                        ctx.settings.tags_enabled
                             || (!l.to_lowercase().contains("tag") && !l.starts_with("  t "))
                     })
                     .map(|l| help_line(l, th))
@@ -1824,7 +1828,11 @@ mod picker_tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         for width in [40, 60, 80] {
             let mut modal = Modal::install();
@@ -1865,7 +1873,11 @@ mod picker_tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut modal = Modal::picker(
             "repositories".into(),
@@ -1989,7 +2001,11 @@ mod picker_tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut modal = Modal::preset_members("reading", &ctx);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);

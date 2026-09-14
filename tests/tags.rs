@@ -3,7 +3,7 @@
 //! the file.
 
 use skills::Workspace;
-use skills::config::{AgentConfig, Config, DeployConfig, TagConfig};
+use skills::config::{AgentConfig, Config, TagConfig};
 use skills::history::{self, History};
 use skills::ops::edit;
 use std::path::PathBuf;
@@ -27,10 +27,6 @@ impl Fixture {
                 name: "Agent A".into(),
                 skills_dir: base.join("agent-a").display().to_string(),
             }],
-            deploy: DeployConfig {
-                all_to_all: false,
-                presets: vec![],
-            },
             tags: vec![TagConfig {
                 skills: vec![],
                 name: "storage".into(),
@@ -91,7 +87,7 @@ fn set_tags(ws: &Workspace, key: &str, tags: &[&str]) {
 #[test]
 fn merging_onto_an_existing_tag_leaves_one_copy_and_comes_back_as_one_step() {
     let fx = Fixture::new("merge");
-    let ws = fx.ws();
+    let mut ws = fx.ws();
     set_tags(&ws, "printer", &["paper", "office"]);
     set_tags(&ws, "bicycle", &["paper"]);
     set_tags(&ws, "etcd", &["office"]);
@@ -108,6 +104,7 @@ fn merging_onto_an_existing_tag_leaves_one_copy_and_comes_back_as_one_step() {
     assert_eq!(fx.tags("bicycle"), vec!["office"]);
     assert_eq!(fx.tags("etcd"), vec!["office"]);
 
+    ws.config = ws.load_config().unwrap();
     let snap = ws.scan().unwrap();
     match history::undo_plan(&ws, &snap, &log.last().unwrap().intent).unwrap() {
         history::Plan::Write { apply, .. } => {
@@ -220,4 +217,55 @@ fn a_colour_can_be_set_before_there_is_a_config_file() {
     assert_eq!(cfg.tags[0].color.as_deref(), Some("cyan"));
     // The rest of the config is still the default, not an empty one.
     assert_eq!(cfg.agents.len(), 2);
+}
+
+#[test]
+fn scans_use_the_explicit_config_until_the_caller_reloads_it() {
+    let fx = Fixture::new("config-snapshot");
+    let mut ws = fx.ws();
+    ws.config.tags = vec![TagConfig {
+        name: "snapshot".into(),
+        color: Some("blue".into()),
+        description: None,
+        skills: vec!["printer".into(), "missing-snapshot".into()],
+    }];
+    // Scope overrides must survive a scan even though they are not on disk.
+    ws.config.agents[0].key = "selected-scope".into();
+    let mut newer = Config::load(&fx.root).unwrap();
+    newer.tags = vec![TagConfig {
+        name: "newer".into(),
+        color: Some("red".into()),
+        description: None,
+        skills: vec!["bicycle".into(), "missing-newer".into()],
+    }];
+    newer.save(&fx.root).unwrap();
+
+    let assert_snapshot = |ws: &Workspace| {
+        for scan in [Workspace::scan, Workspace::scan_for_links] {
+            let snap = scan(ws).unwrap();
+            assert_eq!(snap.get("printer").unwrap().tags, vec!["snapshot"]);
+            assert!(snap.get("bicycle").unwrap().tags.is_empty());
+            assert_eq!(snap.get("missing-snapshot").unwrap().tags, vec!["snapshot"]);
+            assert!(snap.get("missing-newer").is_none());
+            assert!(snap.agent("selected-scope").is_some());
+            assert!(snap.agent("a").is_none());
+        }
+    };
+    assert_snapshot(&ws);
+
+    // An incomplete external edit cannot invalidate the already-loaded config.
+    std::fs::write(Config::path(&fx.root), "[unfinished").unwrap();
+    assert!(ws.load_config().is_err());
+    assert_snapshot(&ws);
+
+    newer.save(&fx.root).unwrap();
+    ws.config = ws.load_config().unwrap();
+    for scan in [Workspace::scan, Workspace::scan_for_links] {
+        let snap = scan(&ws).unwrap();
+        assert!(snap.get("printer").unwrap().tags.is_empty());
+        assert_eq!(snap.get("bicycle").unwrap().tags, vec!["newer"]);
+        assert!(snap.get("missing-newer").is_some());
+        assert!(snap.get("missing-snapshot").is_none());
+        assert!(snap.agent("a").is_some());
+    }
 }

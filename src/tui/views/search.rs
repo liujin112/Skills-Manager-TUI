@@ -1,21 +1,22 @@
 //! Library tab: input, result list, preview.
 
-use super::cards::{self, CARD_H, cols_for, frame, skill_card};
 use super::completion::Completion;
-use super::preview::{Overlay, highlight_spans, preview_lines};
-use super::{View, split_panes, wheel};
+use super::preview::{Overlay, preview_lines};
+use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::layout::split_panes;
+use crate::tui::components::layout::{cols_for, skill_frame};
+use crate::tui::components::skill::{SkillPresentation, SkillRenderState};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
-use crate::tui::widgets::{CardGrid, Input, ScrollTrack, fit, pad, width};
+use crate::tui::settings::LayoutScope;
+use crate::tui::widgets::{CardGrid, Input, ScrollTrack, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use skills::config::UiLayout;
 use skills::ops::edit;
 use skills::reconcile::{SkillRecord, SkillStatus};
@@ -45,10 +46,8 @@ pub struct SearchView {
     track_drag: bool,
     preview_rect: Rect,
     esc_armed: bool,
-    /// Session overrides for what `config.toml` set. Flipping these is a way to
-    /// try a layout on for size; what the next start looks like stays the file's
-    /// business, so neither is written back.
-    layout: Option<UiLayout>,
+    /// The owner of the layout preference; selection dialogs constrain their own layout.
+    layout_scope: LayoutScope,
     rendered_layout: UiLayout,
     /// Grid layout has no standing preview pane, so it opens over the results.
     overlay: Overlay,
@@ -89,7 +88,7 @@ impl Default for SearchView {
             track_drag: false,
             preview_rect: Rect::default(),
             esc_armed: false,
-            layout: None,
+            layout_scope: LayoutScope::Library,
             rendered_layout: UiLayout::Grid,
             overlay: Overlay::default(),
             searcher: Searcher::new(),
@@ -111,6 +110,134 @@ impl Default for SearchView {
 }
 
 impl SearchView {
+    pub fn draw_with_content_header(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        ctx: &Ctx,
+        header: impl FnOnce(&mut Frame, Rect) -> Rect,
+    ) {
+        self.area = area;
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(u16::from(self.is_picker())),
+            ])
+            .split(area);
+        self.draw_input(f, rows[0], ctx);
+
+        let content = header(f, rows[1]);
+
+        // Split keeps a preview open beside the results and so gets one column
+        // of cards; grid spends the whole width on cards and puts the preview
+        // over them when it is wanted.
+        let grid = self.layout(ctx) == UiLayout::Grid;
+        let (left, right) = if grid {
+            (content, Rect::default())
+        } else {
+            split_panes(content, 38, ctx)
+        };
+        self.list_rect = left;
+        self.draw_results(f, left, ctx);
+        if grid {
+            self.preview_rect = Rect::default();
+        } else {
+            self.preview_rect = right;
+            self.draw_preview(f, right, ctx);
+        }
+        self.overlay.draw(f, content, ctx);
+        self.batch_buttons.clear();
+        if self.is_picker() {
+            let bar = rows[2];
+            let mut x = bar.x;
+            let selected = self.visible_checked(ctx).len();
+            let status = if self.multi {
+                let hidden = self.checked.len().saturating_sub(selected);
+                format!(
+                    " Multi-select · {selected} selected{} ",
+                    if hidden > 0 {
+                        format!(" · {hidden} hidden (excluded)")
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                self.selected(ctx)
+                    .map(|r| {
+                        if r.status.is_healthy() {
+                            format!(" {} ", r.source_kind())
+                        } else {
+                            format!(" {} · {} ", r.source_kind(), r.status.label())
+                        }
+                    })
+                    .unwrap_or_default()
+            };
+            let status = fit(&status, bar.width as usize / 2);
+            let w = width(&status) as u16;
+            f.render_widget(
+                Paragraph::new(Span::styled(status, ctx.settings.theme.dim())),
+                Rect::new(x, bar.y, w, 1),
+            );
+            x += w;
+            let buttons: &[(&str, char)] = if self.is_picker() {
+                &[
+                    ("[Select all]", 'a'),
+                    ("[Apply a]", 'c'),
+                    ("[Cancel Esc]", 'e'),
+                ]
+            } else if self.multi {
+                &[
+                    ("[Select all]", 'a'),
+                    ("[Tags t]", 't'),
+                    ("[Deploy d]", 'd'),
+                    ("[Preset p]", 'p'),
+                    ("[Cancel Esc]", 'e'),
+                ]
+            } else {
+                &[("[Multi-select m]", 'm')]
+            };
+            for (label, command) in buttons {
+                let w = width(label) as u16;
+                if x + w > bar.right() {
+                    break;
+                }
+                let rect = Rect::new(x, bar.y, w, 1);
+                let enabled = self.is_picker()
+                    || !self.multi
+                    || selected > 0
+                    || matches!(*command, 'e' | 'a');
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        *label,
+                        if enabled {
+                            ctx.settings.theme.accent()
+                        } else {
+                            ctx.settings.theme.dim()
+                        },
+                    )),
+                    rect,
+                );
+                if enabled {
+                    self.batch_buttons.push((rect, *command));
+                }
+                x += w + 1;
+            }
+        }
+        if self.panel_active && self.focus == Focus::Input && !self.overlay.is_open() {
+            self.completion.draw(f, rows[1], ctx);
+        }
+    }
+
+    pub fn panel_at_top(&self) -> bool {
+        self.panel_actions_ready()
+            && self
+                .grid
+                .selected()
+                .is_none_or(|index| index < self.grid.cols())
+    }
+
     fn is_picker(&self) -> bool {
         self.preset.is_some() || self.tag.is_some() || self.target.is_some()
     }
@@ -127,22 +254,14 @@ impl SearchView {
                 || record.status.is_healthy())
     }
 
-    pub fn panel(keys: Vec<String>, title: String, ctx: &Ctx) -> Self {
+    pub fn panel(keys: Vec<String>, title: String, layout_scope: LayoutScope, ctx: &Ctx) -> Self {
         let mut view = Self {
             panel: Some((keys.into_iter().collect(), title)),
-            layout: Some(UiLayout::Grid),
+            layout_scope,
             ..Self::default()
         };
         view.refresh(ctx);
         view
-    }
-
-    pub fn start_multi(&mut self, checked: Option<String>) {
-        self.focus_list();
-        self.multi = true;
-        if let Some(key) = checked {
-            self.checked.insert(key);
-        }
     }
 
     pub fn panel_keys(&self, ctx: &Ctx) -> Vec<String> {
@@ -245,7 +364,6 @@ impl SearchView {
         view.target = Some((agent, project, on));
         view.run_search(ctx, false);
         view.multi = true;
-        view.layout = Some(UiLayout::Grid);
         view
     }
 
@@ -255,7 +373,6 @@ impl SearchView {
         view.preset = Some(preset.into());
         view.run_search(ctx, false);
         view.multi = true;
-        view.layout = Some(UiLayout::Grid);
         if let Ok(Some(p)) = ctx.ws.presets.load(preset) {
             view.checked = p.skills.iter().cloned().collect();
         }
@@ -267,7 +384,6 @@ impl SearchView {
             tag: Some(tag.into()),
             multi: true,
             hide_tags: true,
-            layout: Some(UiLayout::Grid),
             ..Self::default()
         };
         view.refresh(ctx);
@@ -295,12 +411,11 @@ impl SearchView {
                     Box::new({
                         let keys = keys.clone();
                         move |ws| {
-                            skills::ops::targets::set_installed(
+                            skills::ops::targets::set_deployed(
                                 ws,
                                 &agent,
                                 project.as_deref(),
                                 &keys,
-                                None,
                                 on,
                             )
                         }
@@ -433,31 +548,25 @@ impl SearchView {
         vec![Action::OpenModal(Box::new(modal))]
     }
 
-    fn decorate(&self, lines: &mut [Line<'static>], r: &SkillRecord, ctx: &Ctx) {
-        if let Some(line) = lines.first_mut()
-            && let Some(marker) = line.spans.first_mut()
-        {
-            if self.multi {
-                *marker = cards::checkbox_marker(self.checked.contains(&r.key), ctx.theme);
-                if !r.status.is_healthy() {
-                    marker.style = ctx.theme.warn();
-                }
-            } else if r.status.is_healthy() && self.updates.contains_key(&r.key) {
-                *marker = Span::styled("↑   ", ctx.theme.accent());
-            }
-        }
-        if self.multi
-            && !r.status.is_healthy()
-            && let Some(line) = lines.first_mut()
-        {
-            let warning = format!(" ! {}", r.status.label());
-            let available = line.width().saturating_sub(cards::MARKER_W);
-            if available > width(&warning) + 8 {
-                let name = pad(cards::display_name(r), available - width(&warning));
-                line.spans.truncate(1);
-                line.spans.push(Span::styled(name, ctx.theme.bold()));
-                line.spans.push(Span::styled(warning, ctx.theme.warn()));
-            }
+    fn render_state<'a>(
+        &self,
+        r: &SkillRecord,
+        hit: &'a Hit,
+        context: &'a str,
+        searching: bool,
+    ) -> SkillRenderState<'a> {
+        SkillRenderState {
+            checked: self.multi.then(|| self.checked.contains(&r.key)),
+            update_available: self.updates.contains_key(&r.key),
+            excerpt: hit
+                .excerpt
+                .as_ref()
+                .filter(|_| searching)
+                .map(|e| e.text.as_str()),
+            terms: &hit.terms,
+            context: searching.then_some(context),
+            show_tags: !self.hide_tags,
+            show_match_details: searching,
         }
     }
 
@@ -512,7 +621,11 @@ impl SearchView {
     }
 
     fn layout(&self, ctx: &Ctx) -> UiLayout {
-        self.layout.unwrap_or(ctx.ws.config.ui.layout)
+        if self.is_picker() {
+            UiLayout::Grid
+        } else {
+            ctx.settings.layout_for(self.layout_scope)
+        }
     }
 
     fn selected<'a>(&self, ctx: &'a Ctx) -> Option<&'a SkillRecord> {
@@ -641,7 +754,7 @@ impl SearchView {
     }
 
     fn act_tags(&self, ctx: &Ctx) -> Vec<Action> {
-        if !ctx.ws.config.tags_enabled {
+        if !ctx.settings.tags_enabled {
             return vec![];
         }
         match self.need_present(ctx, "tag") {
@@ -747,7 +860,7 @@ impl SearchView {
 /// Drawing, split by band. `draw` itself only decides which of these run.
 impl SearchView {
     fn draw_input(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let title = Line::from(vec![
             Span::raw(" "),
             Span::raw({
@@ -795,7 +908,7 @@ impl SearchView {
             width: inner.width.saturating_sub(4),
             ..inner
         };
-        let usage = if ctx.ws.config.tags_enabled {
+        let usage = if ctx.settings.tags_enabled {
             "   repo:owner/repo  tag:x  agent:y  source:local  untagged"
         } else {
             "   repo:owner/repo  agent:y  source:local"
@@ -813,7 +926,7 @@ impl SearchView {
     /// the split layout. Drawing cell by cell rather than through `List` is what
     /// lets a card carry its own frame and lets several sit on a row.
     fn draw_results(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let searching = !self.input.value().trim().is_empty()
             && !Query::parse(self.input.value()).text.is_empty();
         // The layout decides the shape too: a grid is made of cards, and the
@@ -846,7 +959,7 @@ impl SearchView {
         // content bare; a compact row is one line, two while an excerpt has
         // something to say.
         let cell_h = match layout {
-            UiLayout::Grid => CARD_H,
+            UiLayout::Grid => ctx.settings.layout.card_height,
             UiLayout::List => 4,
             UiLayout::Compact if searching && !short => 2,
             UiLayout::Compact => 1,
@@ -854,7 +967,7 @@ impl SearchView {
         // One column is always kept back for the scrollbar so the column count
         // does not change under the user the moment the list grows past a screen.
         let usable = inner.width.saturating_sub(1);
-        let cols = if cards { cols_for(usable) } else { 1 };
+        let cols = if cards { cols_for(usable, ctx) } else { 1 };
         let gap = if cols > 1 { 1 } else { 0 };
         let content = Rect {
             width: usable,
@@ -882,7 +995,7 @@ impl SearchView {
 
         let selected = self.grid.selected();
         let full = self.grid.visible();
-        let end = if cards && !inner.height.is_multiple_of(CARD_H) {
+        let end = if cards && !inner.height.is_multiple_of(ctx.settings.layout.card_height) {
             (full.end + cols).min(self.hits.len())
         } else {
             full.end
@@ -894,53 +1007,17 @@ impl SearchView {
             let h = &self.hits[i];
             let r = &ctx.snap.skills[h.index];
             let on = selected == Some(i);
+            let presentation = SkillPresentation::managed(r, ctx);
+            let context = h
+                .fields
+                .iter()
+                .map(|field| field.label())
+                .collect::<Vec<_>>()
+                .join("·");
+            let render_state = self.render_state(r, h, &context, searching);
             if cards {
-                let ci = if cell.height < CARD_H {
-                    // An open lower edge shows that this card continues below
-                    // the viewport, rather than looking like a shorter card.
-                    let block = Block::default()
-                        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                        .border_type(BorderType::Rounded)
-                        .border_style(th.dim().add_modifier(ratatui::style::Modifier::DIM));
-                    let ci = block.inner(cell).inner(Margin {
-                        horizontal: 1,
-                        vertical: 0,
-                    });
-                    f.render_widget(block, cell);
-                    ci
-                } else {
-                    frame(f, cell, on, self.focus == Focus::List, th)
-                };
-                // While searching the card shows the excerpt around the match
-                // and names the fields it matched in; a hit on the name or a
-                // tag has no excerpt, so the description stays.
-                let body = h
-                    .excerpt
-                    .as_ref()
-                    .filter(|_| searching)
-                    .map(|e| e.text.as_str());
-                let tail = if searching {
-                    h.fields
-                        .iter()
-                        .map(|f| f.label())
-                        .collect::<Vec<_>>()
-                        .join("·")
-                } else {
-                    r.source
-                        .as_ref()
-                        .map(|s| s.kind().to_string())
-                        .unwrap_or_default()
-                };
-                let mut lines = skill_card(
-                    r,
-                    ctx,
-                    ci.width as usize,
-                    body,
-                    &tail,
-                    &h.terms,
-                    !self.hide_tags,
-                );
-                self.decorate(&mut lines, r, ctx);
+                let ci = skill_frame(f, cell, on, self.focus == Focus::List, ctx);
+                let lines = presentation.card(ctx, ci.width as usize, &render_state);
                 let style = if self.multi && self.checked.contains(&r.key) {
                     th.selected_unfocused()
                 } else {
@@ -959,38 +1036,12 @@ impl SearchView {
                 } else {
                     Style::default()
                 };
-                let tail = r
-                    .source
-                    .as_ref()
-                    .map(|s| s.kind().to_string())
-                    .unwrap_or_default();
-                let body = h
-                    .excerpt
-                    .as_ref()
-                    .filter(|_| searching)
-                    .map(|e| e.text.as_str());
-                let mut lines = skill_card(
-                    r,
+                let lines = presentation.list(
                     ctx,
-                    cell.width.saturating_sub(3) as usize,
-                    body,
-                    &tail,
-                    &h.terms,
-                    !self.hide_tags,
+                    cell.width.saturating_sub(1) as usize,
+                    on,
+                    &render_state,
                 );
-                self.decorate(&mut lines, r, ctx);
-                let lines: Vec<Line> = lines
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        // The marker sits on the first line only; the rest of
-                        // the entry is told by the background.
-                        let mark = if on && i == 0 { "▸ " } else { "  " };
-                        let mut spans = vec![Span::styled(mark, th.accent())];
-                        spans.extend(l.spans);
-                        Line::from(spans)
-                    })
-                    .collect();
                 f.render_widget(Paragraph::new(lines).style(style), cell);
             } else {
                 let style = if on {
@@ -1002,23 +1053,15 @@ impl SearchView {
                 } else {
                     Style::default()
                 };
-                let mut lines = row_lines(
-                    r,
-                    h,
+                let lines = presentation.compact(
                     ctx,
                     cell.width.saturating_sub(2) as usize,
-                    searching && !short,
                     on,
+                    &SkillRenderState {
+                        show_match_details: searching && !short,
+                        ..render_state
+                    },
                 );
-                if self.multi
-                    && let Some(line) = lines.first_mut()
-                {
-                    // Compact rows reserve two columns for focus, then the marker.
-                    line.spans.splice(
-                        1..2,
-                        [cards::checkbox_marker(self.checked.contains(&r.key), th)],
-                    );
-                }
                 f.render_widget(Paragraph::new(lines).style(style), cell);
             }
         }
@@ -1076,7 +1119,7 @@ impl SearchView {
     }
 
     fn draw_preview(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let block = th.block(" preview ", self.focus == Focus::Preview);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -1131,8 +1174,8 @@ impl View for SearchView {
     }
     fn refresh(&mut self, ctx: &Ctx) {
         self.searcher.configure(
-            ctx.ws.config.search.clone(),
-            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.ws.config.search.dictionaries),
+            ctx.settings.search.clone(),
+            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
         );
         self.searcher.index(&ctx.snap.skills);
         self.run_search(ctx, true);
@@ -1225,7 +1268,7 @@ impl View for SearchView {
                     return vec![];
                 }
                 KeyCode::Char(op @ ('t' | 'd' | 'p')) if k.modifiers.is_empty() => {
-                    if op == 't' && !ctx.ws.config.tags_enabled {
+                    if op == 't' && !ctx.settings.tags_enabled {
                         return vec![];
                     }
                     return self.batch_action(op, ctx);
@@ -1308,7 +1351,7 @@ impl View for SearchView {
                 KeyCode::Right | KeyCode::Char('l') if self.grid.cols() > 1 => self.move_sel(1),
                 KeyCode::Left | KeyCode::Char('h') if self.grid.cols() > 1 => self.move_sel(-1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_preview(ctx),
-                KeyCode::Char('t') if ctx.ws.config.tags_enabled => {
+                KeyCode::Char('t') if ctx.settings.tags_enabled => {
                     acts = if self.multi {
                         self.batch_action('t', ctx)
                     } else {
@@ -1333,10 +1376,13 @@ impl View for SearchView {
                 KeyCode::Char('x') => acts = self.act_remove(ctx),
                 KeyCode::Char('v') | KeyCode::Char('V') => {
                     // Cycle from most to least room per skill.
-                    self.layout = Some(match self.layout(ctx) {
-                        UiLayout::Grid => UiLayout::List,
-                        UiLayout::List => UiLayout::Compact,
-                        UiLayout::Compact => UiLayout::Grid,
+                    if self.is_picker() {
+                        return vec![];
+                    }
+                    let layout = self.layout(ctx).next();
+                    acts.push(Action::SetLayout {
+                        scope: self.layout_scope,
+                        layout,
                     });
                     self.overlay.close();
                 }
@@ -1366,7 +1412,7 @@ impl View for SearchView {
                 }
                 KeyCode::Home | KeyCode::Char('g') => self.preview_scroll = 0,
                 KeyCode::End | KeyCode::Char('G') => self.scroll_preview(i32::MAX / 2),
-                KeyCode::Char('t') if ctx.ws.config.tags_enabled => {
+                KeyCode::Char('t') if ctx.settings.tags_enabled => {
                     acts = if self.multi {
                         self.batch_action('t', ctx)
                     } else {
@@ -1391,7 +1437,7 @@ impl View for SearchView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.overlay.handle_mouse(m) {
+        if self.overlay.handle_mouse(m, ctx) {
             return vec![];
         }
         if self.is_picker()
@@ -1445,7 +1491,7 @@ impl View for SearchView {
             }
         }
         let at = (m.column, m.row).into();
-        if let Some(d) = wheel(&m) {
+        if let Some(d) = wheel(&m, ctx) {
             if self.preview_rect.contains(at) {
                 self.scroll_preview(d);
             } else if self.list_rect.contains(at) {
@@ -1487,7 +1533,9 @@ impl View for SearchView {
                         } else {
                             (cell.x + 2, cell.y)
                         };
-                        m.row == y && m.column >= x && m.column < x + cards::MARKER_W as u16
+                        m.row == y
+                            && m.column >= x
+                            && m.column < x + ctx.settings.layout.marker_width as u16
                     });
                     if self.multi || marker {
                         if !double {
@@ -1517,115 +1565,7 @@ impl View for SearchView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        self.area = area;
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(u16::from(self.is_picker())),
-            ])
-            .split(area);
-        self.draw_input(f, rows[0], ctx);
-
-        // Split keeps a preview open beside the results and so gets one column
-        // of cards; grid spends the whole width on cards and puts the preview
-        // over them when it is wanted.
-        let grid = self.layout(ctx) == UiLayout::Grid;
-        let (left, right) = if grid {
-            (rows[1], Rect::default())
-        } else {
-            split_panes(rows[1], 38)
-        };
-        self.list_rect = left;
-        self.draw_results(f, left, ctx);
-        if grid {
-            self.preview_rect = Rect::default();
-        } else {
-            self.preview_rect = right;
-            self.draw_preview(f, right, ctx);
-        }
-        self.overlay.draw(f, rows[1], ctx);
-        self.batch_buttons.clear();
-        if self.is_picker() {
-            let bar = rows[2];
-            let mut x = bar.x;
-            let selected = self.visible_checked(ctx).len();
-            let status = if self.multi {
-                let hidden = self.checked.len().saturating_sub(selected);
-                format!(
-                    " Multi-select · {selected} selected{} ",
-                    if hidden > 0 {
-                        format!(" · {hidden} hidden (excluded)")
-                    } else {
-                        String::new()
-                    }
-                )
-            } else {
-                self.selected(ctx)
-                    .map(|r| {
-                        if r.status.is_healthy() {
-                            format!(" {} ", r.source_kind())
-                        } else {
-                            format!(" {} · {} ", r.source_kind(), r.status.label())
-                        }
-                    })
-                    .unwrap_or_default()
-            };
-            let status = fit(&status, bar.width as usize / 2);
-            let w = width(&status) as u16;
-            f.render_widget(
-                Paragraph::new(Span::styled(status, ctx.theme.dim())),
-                Rect::new(x, bar.y, w, 1),
-            );
-            x += w;
-            let buttons: &[(&str, char)] = if self.is_picker() {
-                &[
-                    ("[Select all]", 'a'),
-                    ("[Apply a]", 'c'),
-                    ("[Cancel Esc]", 'e'),
-                ]
-            } else if self.multi {
-                &[
-                    ("[Select all]", 'a'),
-                    ("[Tags t]", 't'),
-                    ("[Deploy d]", 'd'),
-                    ("[Preset p]", 'p'),
-                    ("[Cancel Esc]", 'e'),
-                ]
-            } else {
-                &[("[Multi-select m]", 'm')]
-            };
-            for (label, command) in buttons {
-                let w = width(label) as u16;
-                if x + w > bar.right() {
-                    break;
-                }
-                let rect = Rect::new(x, bar.y, w, 1);
-                let enabled = self.is_picker()
-                    || !self.multi
-                    || selected > 0
-                    || matches!(*command, 'e' | 'a');
-                f.render_widget(
-                    Paragraph::new(Span::styled(
-                        *label,
-                        if enabled {
-                            ctx.theme.accent()
-                        } else {
-                            ctx.theme.dim()
-                        },
-                    )),
-                    rect,
-                );
-                if enabled {
-                    self.batch_buttons.push((rect, *command));
-                }
-                x += w + 1;
-            }
-        }
-        if self.panel_active && self.focus == Focus::Input && !self.overlay.is_open() {
-            self.completion.draw(f, rows[1], ctx);
-        }
+        self.draw_with_content_header(f, area, ctx, |_, content| content);
     }
 
     fn hints(&self) -> Hints {
@@ -1668,7 +1608,6 @@ impl View for SearchView {
                 ("Space", "select"),
                 ("Ctrl+A", "select all results"),
                 ("/", "search"),
-                ("v/V", "layout"),
                 ("Enter", "preview"),
                 ("Ctrl+Enter", "apply"),
                 ("Esc", "cancel"),
@@ -1728,77 +1667,55 @@ impl View for SearchView {
     }
 }
 
-/// The compact density: one line, and a second carrying the excerpt while a
-/// query is running. `on` draws the selection marker the list widget used to.
-#[allow(clippy::too_many_arguments)]
-fn row_lines<'a>(
-    r: &'a SkillRecord,
-    h: &'a Hit,
-    ctx: &'a Ctx,
-    inner_w: usize,
-    searching: bool,
-    on: bool,
-) -> Vec<Line<'a>> {
-    let th = ctx.theme;
-    let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
-    let content_w = inner_w.saturating_sub(2 + cards::MARKER_W);
-    let badge_w = badge
-        .as_deref()
-        .map(|text| width(text).min(content_w / 2))
-        .unwrap_or(0);
-    let badge_space = badge_w + usize::from(badge_w > 0);
-    let key_w = 26.min(content_w.saturating_sub(badge_space));
-    let mut spans = vec![
-        Span::styled(if on { "▸ " } else { "  " }, th.accent()),
-        cards::health_marker(r, th),
-    ];
-    spans.extend(highlight_spans(
-        &pad(cards::display_name(r), key_w),
-        &h.terms,
-        Style::default(),
-        th,
-    ));
-    if let Some(badge) = badge.filter(|_| badge_w > 0) {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(pad(&badge, badge_w), th.dim()));
-    }
-    let tags_w = content_w.saturating_sub(key_w + badge_space);
-    if !r.tags.is_empty() && tags_w > 3 {
-        spans.push(Span::raw(" "));
-        spans.extend(highlight_spans(
-            &pad(&r.tags.join(","), tags_w - 1),
-            &h.terms,
-            th.tag(),
-            th,
-        ));
-    } else {
-        spans.push(Span::raw(" ".repeat(tags_w)));
-    }
-    spans.push(Span::raw(" "));
-    if !searching {
-        return vec![Line::from(spans)];
-    }
-    let mut sub = vec![Span::raw("    ")];
-    let fields: Vec<&str> = h.fields.iter().map(|f| f.label()).collect();
-    sub.push(Span::styled(
-        format!("{} ", fields.join("·")),
-        th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
-    ));
-    let avail = inner_w.saturating_sub(6 + width(&fields.join("·")));
-    if let Some(e) = &h.excerpt {
-        sub.extend(highlight_spans(
-            &fit(&e.text, avail),
-            &h.terms,
-            th.dim(),
-            th,
-        ))
-    }
-    vec![Line::from(spans), Line::from(sub)]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_panels_read_scoped_layouts_and_emit_session_updates() {
+        use crate::tui::settings::{RuntimeSettings, SessionSettings};
+        let root = skills::ops::DownloadDir::new("scoped-panel-layout").unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut session = SessionSettings::default();
+        session.set_layout(LayoutScope::Library, UiLayout::Compact);
+        session.set_layout(LayoutScope::Tags, UiLayout::List);
+        let settings = RuntimeSettings::resolve(&ws.config, &session);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut panel = SearchView::panel(vec![], "Tag skills".into(), LayoutScope::Tags, &ctx);
+        assert_eq!(panel.layout(&ctx), UiLayout::List);
+        assert_eq!(SearchView::default().layout(&ctx), UiLayout::Compact);
+        panel.focus_list();
+        let actions = panel.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), &ctx);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::SetLayout {
+                scope: LayoutScope::Tags,
+                layout: UiLayout::Compact
+            }]
+        ));
+        // The supplied snapshot is authoritative until App resolves the action.
+        assert_eq!(panel.layout(&ctx), UiLayout::List);
+        session.set_layout(LayoutScope::Tags, UiLayout::Compact);
+        let settings = RuntimeSettings::resolve(&ws.config, &session);
+        let ctx = Ctx {
+            settings: &settings,
+            ..ctx
+        };
+        assert_eq!(panel.layout(&ctx), UiLayout::Compact);
+        let mut picker = SearchView::tag_members("events", &ctx);
+        picker.focus_list();
+        assert_eq!(picker.layout(&ctx), UiLayout::Grid);
+        assert!(
+            picker
+                .handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn library_hides_problem_records_without_removing_them_from_repair_views() {
@@ -1843,7 +1760,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
@@ -1902,11 +1823,21 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
-        view.layout = Some(UiLayout::List);
+        let mut session = crate::tui::settings::SessionSettings::default();
+        session.set_layout(LayoutScope::Library, UiLayout::List);
+        let settings = crate::tui::settings::RuntimeSettings::resolve(&ws.config, &session);
+        let ctx = Ctx {
+            settings: &settings,
+            ..ctx
+        };
         view.set_query("shared", &ctx);
         view.grid.select(Some(3));
         let selected = view.selected(&ctx).unwrap().key.clone();
@@ -1916,7 +1847,7 @@ mod tests {
             .draw(|f| view.draw(f, Rect::new(0, 1, 80, 22), &ctx))
             .unwrap();
         assert_eq!(view.rendered_layout, UiLayout::Compact);
-        assert_eq!(view.layout, Some(UiLayout::List));
+        assert_eq!(view.layout(&ctx), UiLayout::List);
         assert!(view.grid.visible().len() >= 4);
         assert_eq!(view.grid.cell(3).unwrap().height, 1);
         assert_eq!(view.selected(&ctx).unwrap().key, selected);
@@ -1938,7 +1869,13 @@ mod tests {
         assert_eq!(view.grid.cell(3).unwrap().height, 4);
         assert_eq!(view.selected(&ctx).unwrap().key, selected);
 
-        view.layout = Some(UiLayout::Grid);
+        session.set_layout(LayoutScope::Library, UiLayout::Grid);
+        let settings = crate::tui::settings::RuntimeSettings::resolve(&ws.config, &session);
+        let ctx = Ctx {
+            settings: &settings,
+            ..ctx
+        };
+
         view.set_query("", &ctx);
         view.grid.first(view.hits.len());
         let mut terminal =
@@ -1968,7 +1905,10 @@ mod tests {
             terminal
                 .draw(|f| view.draw_results(f, Rect::new(0, 0, 124, height), &ctx))
                 .unwrap();
-            assert_eq!(view.grid.cell(6).unwrap().height, CARD_H);
+            assert_eq!(
+                view.grid.cell(6).unwrap().height,
+                ctx.settings.layout.card_height
+            );
         }
         view.grid.last(view.hits.len());
         terminal.draw(|f| view.draw_results(f, area, &ctx)).unwrap();
@@ -2028,7 +1968,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
@@ -2053,7 +1997,13 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(view.focus, Focus::Input);
-        view.layout = Some(UiLayout::List);
+        let mut session = crate::tui::settings::SessionSettings::default();
+        session.set_layout(LayoutScope::Library, UiLayout::List);
+        let settings = crate::tui::settings::RuntimeSettings::resolve(&ws.config, &session);
+        let ctx = Ctx {
+            settings: &settings,
+            ..ctx
+        };
         view.focus = Focus::Preview;
         view.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &ctx);
         let mut terminal =
@@ -2098,7 +2048,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
@@ -2130,30 +2084,28 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &ctx);
         assert_eq!(view.visible_checked(&ctx), vec!["printer"]);
         let record = ctx.snap.get("printer").unwrap();
-        let mut lines = skill_card(record, &ctx, 40, None, "", &[], true);
-        let before = lines[0].to_string();
-        view.decorate(&mut lines, record, &ctx);
-        assert!(lines[0].to_string().starts_with("[✓] printer"));
-        assert_eq!(lines[0].width(), width(&before));
-        assert_eq!(
-            width(&before[..before.find("printer").unwrap()]),
-            cards::MARKER_W
-        );
+        let presentation = SkillPresentation::managed(record, &ctx);
+        let normal = presentation.card(&ctx, 40, &SkillRenderState::default());
         let hit = view.hits.first().unwrap();
-        let compact = row_lines(record, hit, &ctx, 60, false, true);
-        let mut checked_compact = compact[0].clone();
-        checked_compact.spans[1] = cards::checkbox_marker(true, ctx.theme);
-        let normal = compact[0].to_string();
-        let selected = checked_compact.to_string();
-        assert!(selected.starts_with("▸ [✓] printer"));
+        let state = view.render_state(record, hit, "", false);
+        let checked = presentation.card(&ctx, 40, &state);
+        assert!(checked[0].to_string().starts_with("[✓] printer"));
+        assert_eq!(checked[0].width(), normal[0].width());
         assert_eq!(
-            width(&normal[..normal.find("printer").unwrap()]),
-            2 + cards::MARKER_W
+            width(&normal[0].to_string()[..normal[0].to_string().find("printer").unwrap()]),
+            ctx.settings.layout.marker_width
         );
-        assert_eq!(
-            width(&selected[..selected.find("printer").unwrap()]),
-            2 + cards::MARKER_W
-        );
+        for state in [SkillRenderState::default(), state] {
+            let compact = presentation.compact(&ctx, 60, true, &state);
+            let text = compact[0].to_string();
+            assert_eq!(
+                width(&text[..text.find("printer").unwrap()]),
+                2 + ctx.settings.layout.marker_width
+            );
+            if state.checked == Some(true) {
+                assert!(text.starts_with("▸ [✓] printer"));
+            }
+        }
         view.handle_key(key(KeyCode::Esc), &ctx);
         assert_eq!(view.hits.len(), 3);
         view.batch_finished(&["printer".into()]);
@@ -2211,7 +2163,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = SearchView::default();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);

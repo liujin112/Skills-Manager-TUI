@@ -37,7 +37,7 @@ pub struct RepositoryPicker {
     candidates: Snapshot,
     searcher: Searcher,
     matching: BTreeSet<String>,
-    configured: bool,
+    configured_search: Option<skills::config::SearchConfig>,
     completion: Completion,
     preview: Overlay,
 }
@@ -84,7 +84,7 @@ impl RepositoryPicker {
             candidates,
             searcher: Searcher::new(),
             matching: BTreeSet::new(),
-            configured: false,
+            configured_search: None,
             completion: Completion::default(),
             preview: Overlay::default(),
             selection,
@@ -118,17 +118,27 @@ impl RepositoryPicker {
         nodes.into_iter().collect()
     }
     fn configure(&mut self, ctx: &Ctx) {
-        if !self.configured {
-            self.searcher = Searcher::for_workspace(ctx.ws);
-            self.configured = true;
-            self.refilter();
+        if self.configured_search.as_ref() != Some(&ctx.settings.search) {
+            self.refresh(ctx);
         }
+    }
+
+    /// Re-read dictionaries and the resolved settings when the app refreshes.
+    /// Preserve staged choices and input while re-evaluating the current query.
+    pub fn refresh(&mut self, ctx: &Ctx) {
+        self.searcher.configure(
+            ctx.settings.search.clone(),
+            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
+        );
+        self.configured_search = Some(ctx.settings.search.clone());
+        self.refilter();
+        self.update_completion(ctx);
     }
     fn update_completion(&mut self, ctx: &Ctx) {
         let candidate_ctx = Ctx {
             ws: ctx.ws,
             snap: &self.candidates,
-            theme: ctx.theme,
+            settings: ctx.settings,
         };
         self.completion.update_install(&self.search, &candidate_ctx);
     }
@@ -293,6 +303,7 @@ impl RepositoryPicker {
         }
     }
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        self.configure(ctx);
         if self.preview.is_open() {
             return vec![];
         }
@@ -445,7 +456,8 @@ impl RepositoryPicker {
         vec![]
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.preview.handle_mouse(m) {
+        self.configure(ctx);
+        if self.preview.handle_mouse(m, ctx) {
             return vec![];
         }
         if self.focus == 1 {
@@ -460,12 +472,12 @@ impl RepositoryPicker {
         }
         let at = (m.column, m.row).into();
         match m.kind {
-            MouseEventKind::ScrollDown if self.list.rows.contains(at) => {
-                self.list.move_by(3, self.shown.len())
-            }
-            MouseEventKind::ScrollUp if self.list.rows.contains(at) => {
-                self.list.move_by(-3, self.shown.len())
-            }
+            MouseEventKind::ScrollDown if self.list.rows.contains(at) => self
+                .list
+                .move_by(ctx.settings.interaction.wheel_rows, self.shown.len()),
+            MouseEventKind::ScrollUp if self.list.rows.contains(at) => self
+                .list
+                .move_by(-ctx.settings.interaction.wheel_rows, self.shown.len()),
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.rect.contains(at) {
                     return self.key(KeyEvent::new(KeyCode::Esc, m.modifiers), ctx);
@@ -499,7 +511,7 @@ impl RepositoryPicker {
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         self.configure(ctx);
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let w = area.width.saturating_sub(4).min(110);
         let h = area.height.saturating_sub(4).min(32);
         let r = Rect::new(
@@ -639,7 +651,7 @@ impl RepositoryPicker {
         let candidate_ctx = Ctx {
             ws: ctx.ws,
             snap: &self.candidates,
-            theme: ctx.theme,
+            settings: ctx.settings,
         };
         self.preview.draw(f, area, &candidate_ctx);
     }
@@ -725,7 +737,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut picker = RepositoryPicker::new(
             FetchedRepository {
@@ -766,6 +782,27 @@ mod tests {
             assert!(picker.matches_filter("skills/print"), "{query}");
             assert!(!picker.matches_filter("internal/print"), "{query}");
         }
+
+        // A still-open picker follows the resolved configuration without
+        // clearing its query or the installation choices already staged.
+        picker.search = Input::with_value("skills/ prnter");
+        picker.refilter();
+        let staged = picker.selection.paths.clone();
+        assert!(picker.matches_filter("skills/print"));
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        settings.search.fuzzy = false;
+        let changed_ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        picker.configure(&changed_ctx);
+        assert!(picker.shown.is_empty());
+        assert_eq!(picker.search.value(), "skills/ prnter");
+        assert_eq!(picker.selection.paths, staged);
+        picker.refresh(&ctx);
+        assert!(picker.matches_filter("skills/print"));
+
         picker.search = Input::with_value("repo:other/tools");
         picker.refilter();
         assert!(picker.shown.is_empty());
@@ -864,7 +901,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let fetched = FetchedRepository {
             repository: Repository {

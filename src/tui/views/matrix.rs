@@ -175,7 +175,7 @@ impl Matrix {
             self.rect = Rect::default();
             return;
         }
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let agents = &ctx.ws.config.agents;
         let name_w = self
             .presets
@@ -328,7 +328,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut matrix = Matrix {
             open: true,

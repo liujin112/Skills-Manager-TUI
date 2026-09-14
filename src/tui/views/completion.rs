@@ -71,7 +71,7 @@ impl Completion {
             _ => BTreeSet::new(),
         };
         self.choices = candidates(token, values);
-        if !ctx.ws.config.tags_enabled {
+        if !ctx.settings.tags_enabled {
             self.choices
                 .retain(|s| !s.starts_with("tag:") && s != "untagged");
         }
@@ -174,7 +174,7 @@ impl Completion {
             ..area
         };
         f.render_widget(OverlayClear, self.rect);
-        let block = ctx.theme.block(" filters · Enter accepts ", true);
+        let block = ctx.settings.theme.block(" filters · Enter accepts ", true);
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
         let lines: Vec<Line> = self
@@ -189,9 +189,9 @@ impl Completion {
                     inner.width as usize,
                 ))
                 .style(if i == self.selected {
-                    ctx.theme.selected()
+                    ctx.settings.theme.selected()
                 } else {
-                    ctx.theme.dim()
+                    ctx.settings.theme.dim()
                 })
             })
             .collect();

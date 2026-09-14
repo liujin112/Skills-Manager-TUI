@@ -1,15 +1,19 @@
 //! What the session has done, and how to take it back.
 //!
-//! An entry records the *intent* of an operation, never the changes it made.
-//! Undo re-derives the opposite intent against the filesystem as it stands now,
+//! An entry records an operation for this session.
+//! Undo re-derives the opposite operation against the filesystem as it stands now,
 //! so anything altered in the meantime is handled by the same rules that guard
 //! ordinary operations: a link the user already removed is simply not there to
 //! remove again, and a directory the agent replaced by hand is left alone.
 //!
 //! Link operations are recorded as the exact skill-and-agent pairs they
-//! touched rather than as the preset or sync that produced them. Undoing then
+//! touched rather than as the preset operation that produced them. Undoing then
 //! reverses precisely what happened, and does not change meaning if the preset
 //! behind it is edited or deleted afterwards.
+//!
+//! Explicit scoped deployments carry the target directory and before/after sets
+//! of deployed keys. These sets validate session undo only; ordinary deployment
+//! decisions always come from a fresh directory scan.
 //!
 //! Metadata writes cannot be re-derived that way. A link that was removed can
 //! be put back because the skill and the agent directory between them still say
@@ -35,7 +39,6 @@ use crate::meta;
 use crate::ops::deploy::{self, Action};
 use crate::ops::edit;
 use crate::ops::install::{self, InstallRef};
-use crate::preset;
 use crate::reconcile::Snapshot;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,14 +50,14 @@ pub type Pair = (String, String);
 #[derive(Debug, Clone)]
 pub enum Intent {
     Group(Vec<Intent>),
-    TargetSelection {
+    TargetDeployment {
         agent: crate::config::AgentConfig,
         project: Option<std::path::PathBuf>,
-        before: crate::ops::targets::Selection,
-        after: crate::ops::targets::Selection,
+        before: crate::ops::targets::DeploymentState,
+        after: crate::ops::targets::DeploymentState,
     },
     /// Links created and removed together, as one batch: deploy, undeploy,
-    /// sync, a preset switched either way, or a whole-directory conversion.
+    /// a preset switched either way, or a whole-directory conversion.
     Links {
         added: Vec<Pair>,
         removed: Vec<Pair>,
@@ -75,8 +78,7 @@ pub enum Intent {
         from: String,
         to: String,
     },
-    /// A preset moved to a new name: its file, and its entry in the
-    /// auto-deploy list if it had one. Undone the way a skill rename is, by
+    /// A preset file moved to a new name. Undone the way a skill rename is, by
     /// planning the move back when it is asked for, so the old name being
     /// taken since stops it.
     PresetRename {
@@ -128,7 +130,7 @@ impl Intent {
                 }
                 parts.join("; ")
             }
-            Intent::TargetSelection { agent, .. } => {
+            Intent::TargetDeployment { agent, .. } => {
                 format!("changed installations in {}", agent.skills_dir)
             }
             Intent::Meta(changes) => describe_changes(changes),
@@ -816,21 +818,10 @@ pub fn preset_description_edit(
     ))
 }
 
-/// Move a preset to a new name, taking its auto-deploy entry with it, and
-/// record the move. The two writes are not one transaction; the file is
-/// moved first because a rename that fails there has changed nothing, and a
-/// config that then cannot be rewritten is reported with the preset already
-/// under its new name, which the message says.
+/// Rename only the preset definition, with session undo.
 pub fn preset_rename(ws: &Workspace, from: &str, to: &str) -> Result<(String, Option<Intent>)> {
     ws.presets.rename(from, to)?;
-    crate::ops::targets::rename_preset_reference(ws, from, to)?;
-    let listed = preset::rename_deploy_reference(&ws.root, from, to)
-        .with_context(|| format!("preset renamed to {to}, but its auto-deploy entry was not"))?;
-    let message = if listed {
-        format!("renamed preset {from} to {to}, config.toml too")
-    } else {
-        format!("renamed preset {from} to {to}")
-    };
+    let message = format!("renamed preset {from} to {to}");
     Ok((
         message,
         Some(Intent::PresetRename {
@@ -862,11 +853,11 @@ pub enum Plan {
 #[derive(Debug, Clone)]
 pub enum WriteBack {
     Group(Vec<WriteBack>),
-    TargetSelection {
+    TargetDeployment {
         agent: crate::config::AgentConfig,
         project: Option<std::path::PathBuf>,
-        expected: crate::ops::targets::Selection,
-        desired: crate::ops::targets::Selection,
+        expected: crate::ops::targets::DeploymentState,
+        desired: crate::ops::targets::DeploymentState,
     },
     RemoveInstalled {
         skill: String,
@@ -893,12 +884,12 @@ impl WriteBack {
                 .map(|write| write.apply(ws))
                 .collect::<Result<Vec<_>>>()
                 .map(|messages| messages.join("; ")),
-            WriteBack::TargetSelection {
+            WriteBack::TargetDeployment {
                 agent,
                 project,
                 expected,
                 desired,
-            } => crate::ops::targets::restore_selection(
+            } => crate::ops::targets::restore_deployed(
                 ws,
                 agent,
                 project.as_deref(),
@@ -1052,7 +1043,7 @@ fn group_plan(ws: &Workspace, snap: &Snapshot, intents: &[Intent], undo: bool) -
         }
     }
     Ok(Plan::Write {
-        describe: "restore deployment selections".into(),
+        describe: "restore deployment state".into(),
         apply: WriteBack::Group(writes),
     })
 }
@@ -1062,14 +1053,14 @@ pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
     match intent {
         Intent::Group(intents) => group_plan(ws, snap, intents, true),
         // Reversed: what was added comes out, what was removed goes back.
-        Intent::TargetSelection {
+        Intent::TargetDeployment {
             agent,
             project,
             before,
             after,
         } => Ok(Plan::Write {
             describe: intent.describe(),
-            apply: WriteBack::TargetSelection {
+            apply: WriteBack::TargetDeployment {
                 agent: agent.clone(),
                 project: project.clone(),
                 expected: after.clone(),
@@ -1105,14 +1096,14 @@ pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
 pub fn redo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Plan> {
     match intent {
         Intent::Group(intents) => group_plan(ws, snap, intents, false),
-        Intent::TargetSelection {
+        Intent::TargetDeployment {
             agent,
             project,
             before,
             after,
         } => Ok(Plan::Write {
             describe: intent.describe(),
-            apply: WriteBack::TargetSelection {
+            apply: WriteBack::TargetDeployment {
                 agent: agent.clone(),
                 project: project.clone(),
                 expected: before.clone(),

@@ -149,7 +149,7 @@ impl NameChoices {
         );
         f.render_widget(OverlayClear, rect);
         let group = &self.pending.groups[self.group];
-        let block = ctx.theme.block(
+        let block = ctx.settings.theme.block(
             format!(
                 " Name conflict · {}/{} ",
                 self.group + 1,
@@ -211,13 +211,13 @@ impl NameChoices {
             ))))
             .collect::<Vec<_>>();
         f.render_stateful_widget(
-            List::new(rows).highlight_style(ctx.theme.selected()),
+            List::new(rows).highlight_style(ctx.settings.theme.selected()),
             self.list.rows,
             &mut self.list.state,
         );
         f.render_widget(
             Paragraph::new("Choose one or none for each name. Nothing changes until confirmed.")
-                .style(ctx.theme.dim()),
+                .style(ctx.settings.theme.dim()),
             Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
         );
         self.apply_rect = Rect::new(inner.x, inner.bottom() - 1, 18.min(inner.width), 1);
@@ -225,16 +225,16 @@ impl NameChoices {
             self.previous_rect = Rect::new(inner.x + 20, inner.bottom() - 1, 12, 1);
             self.next_rect = Rect::new(inner.x + 34, inner.bottom() - 1, 10, 1);
             f.render_widget(
-                Paragraph::new("[ Previous ]").style(ctx.theme.accent()),
+                Paragraph::new("[ Previous ]").style(ctx.settings.theme.accent()),
                 self.previous_rect,
             );
             f.render_widget(
-                Paragraph::new("[ Next ]").style(ctx.theme.accent()),
+                Paragraph::new("[ Next ]").style(ctx.settings.theme.accent()),
                 self.next_rect,
             );
         }
         f.render_widget(
-            Paragraph::new("[ Review / Apply ]").style(ctx.theme.accent()),
+            Paragraph::new("[ Review / Apply ]").style(ctx.settings.theme.accent()),
             self.apply_rect,
         );
     }
