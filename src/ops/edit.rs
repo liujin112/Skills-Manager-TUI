@@ -111,7 +111,9 @@ pub fn tag_delete(ws: &Workspace, tag: &str) -> Result<usize> {
 pub fn note_set(ws: &Workspace, key: &str, note: Option<&str>) -> Result<SkillMeta> {
     let mut meta = load_or_init(ws, key)?;
     anyhow::ensure!(
-        matches!(meta.source, Some(crate::meta::Source::Git { .. })),
+        meta.source
+            .as_ref()
+            .is_some_and(crate::meta::Source::is_remote),
         "Local skills do not store notes"
     );
     meta.note = note
@@ -124,7 +126,11 @@ pub fn note_set(ws: &Workspace, key: &str, note: Option<&str>) -> Result<SkillMe
 /// Record the current content hash as the new baseline ("accept local changes").
 pub fn accept(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     let mut meta = load_or_init(ws, key)?;
-    if !matches!(meta.source, Some(crate::meta::Source::Git { .. })) {
+    if !meta
+        .source
+        .as_ref()
+        .is_some_and(crate::meta::Source::is_remote)
+    {
         bail!("local skills do not track a baseline");
     }
     let path = ws.skill_path(key);
@@ -140,7 +146,7 @@ pub fn accept(ws: &Workspace, key: &str) -> Result<SkillMeta> {
 }
 
 /// Complete an externally performed move: preserve metadata, repair links that
-/// pointed exactly at the old path, and update preset/installation references.
+/// pointed exactly at the old path, and update tag and preset references.
 /// Content matching is only a suggestion; the caller explicitly chooses the pair.
 pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
     require_key(old)?;
@@ -236,7 +242,6 @@ pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
             ws.presets.save(&p)?;
         }
     }
-    super::targets::rename_skill_reference(ws, old, Some(new))?;
     Config::rename_tag_skill(&ws.root, old, Some(new))?;
     ws.meta.rename(old, new)
 }
@@ -299,7 +304,6 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
             log.push(format!("updated preset {}", p.name));
         }
     }
-    super::targets::rename_skill_reference(ws, old, Some(new))?;
     Ok(log)
 }
 
@@ -342,6 +346,5 @@ pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Re
         log.push("removed metadata".into());
     }
     Config::rename_tag_skill(&ws.root, key, None)?;
-    super::targets::rename_skill_reference(ws, key, None)?;
     Ok(log)
 }

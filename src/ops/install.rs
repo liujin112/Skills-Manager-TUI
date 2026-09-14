@@ -1,96 +1,15 @@
-//! Installing skills from git or local paths, and adopting existing directories.
+//! Installing skills from remote sources or local paths, and adopting existing directories.
 
 use crate::Workspace;
 use crate::hash::{HASH_ALGO, hash_directory};
 use crate::meta::{Baseline, SkillMeta, Source};
-use crate::ops::{DownloadDir, fresh_staging, git, require_key, swap_dir};
+use crate::ops::{DownloadDir, fresh_staging, require_key, swap_dir};
 use crate::skill::{SKILL_FILE, SkillDoc};
 use crate::util::copy_dir;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
-/// A parsed install reference.
-#[derive(Debug, Clone, PartialEq)]
-pub enum InstallRef {
-    Local(PathBuf),
-    Git {
-        url: String,
-        branch: Option<String>,
-        subpath: Option<String>,
-    },
-}
-
-/// Parse user input: an existing path, a GitHub `owner/repo[/sub/path]`
-/// shorthand, a GitHub tree URL (branch and subpath encoded), or any git URL.
-pub fn parse_ref(input: &str, branch: Option<&str>, subpath: Option<&str>) -> Result<InstallRef> {
-    let p = crate::paths::expand_tilde(input);
-    if p.exists() {
-        return Ok(InstallRef::Local(std::fs::canonicalize(p)?));
-    }
-    let mut url;
-    let mut br = branch.map(|s| s.to_string());
-    let mut sub = subpath
-        .map(|s| s.trim_matches('/').to_string())
-        .filter(|s| !s.is_empty());
-
-    if let Some(rest) = input
-        .strip_prefix("https://github.com/")
-        .or_else(|| input.strip_prefix("http://github.com/"))
-    {
-        let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
-        if parts.len() < 2 {
-            bail!("cannot parse GitHub URL: {input}");
-        }
-        url = format!(
-            "https://github.com/{}/{}",
-            parts[0],
-            parts[1].trim_end_matches(".git")
-        );
-        if parts.len() >= 4 && parts[2] == "tree" {
-            if br.is_none() {
-                br = Some(parts[3].to_string());
-            }
-            if sub.is_none() && parts.len() > 4 {
-                sub = Some(parts[4..].join("/"));
-            }
-        }
-    } else if input.starts_with("http://")
-        || input.starts_with("https://")
-        || input.starts_with("git@")
-        || input.starts_with("ssh://")
-        || input.starts_with("file://")
-        || input.ends_with(".git")
-    {
-        url = input.to_string();
-    } else {
-        let parts: Vec<&str> = input.trim_matches('/').split('/').collect();
-        if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
-            bail!("cannot parse reference: {input} (not a path, URL, or owner/repo)");
-        }
-        url = format!("https://github.com/{}/{}", parts[0], parts[1]);
-        if sub.is_none() && parts.len() > 2 {
-            sub = Some(parts[2..].join("/"));
-        }
-    }
-    // `url@branch` form, but not `git@host:` prefixes.
-    let split = url
-        .rsplit_once('@')
-        .filter(|(base, b)| {
-            !base.is_empty() && !url.starts_with("git@") && !b.contains('/') && !b.contains(':')
-        })
-        .map(|(base, b)| (base.to_string(), b.to_string()));
-    if let Some((base, b)) = split {
-        url = base;
-        if br.is_none() {
-            br = Some(b);
-        }
-    }
-    Ok(InstallRef::Git {
-        url,
-        branch: br,
-        subpath: sub,
-    })
-}
+pub use crate::ops::source::{InstallRef, parse_ref};
 
 pub struct Fetched {
     /// Directory holding the skill content (inside `workdir`).
@@ -117,66 +36,37 @@ pub fn fetch(ws: &Workspace, r: &InstallRef) -> Result<Fetched> {
                 },
             })
         }
-        InstallRef::Git {
-            url,
-            branch,
-            subpath,
-        } => {
-            let download = DownloadDir::new("git")?;
-            let work = download.path().to_path_buf();
-            let mut args = vec!["clone", "--quiet", "--depth", "1"];
-            if let Some(b) = branch {
-                args.push("--branch");
-                args.push(b);
-            }
-            args.push(url);
-            let work_s = work.to_string_lossy().into_owned();
-            args.push(&work_s);
-            git(&args, None)?;
-            let rev = git(&["rev-parse", "HEAD"], Some(&work))?.trim().to_string();
-            let resolved_branch = match branch {
-                Some(b) => Some(b.clone()),
-                None => git(&["rev-parse", "--abbrev-ref", "HEAD"], Some(&work))
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| s != "HEAD"),
-            };
-            let skill_dir = match subpath {
-                Some(s) if !s.is_empty() => work.join(s),
-                _ => work.clone(),
-            };
-            // A repository of many skills is normal; the caller decides which.
+        _ => {
+            let download = DownloadDir::new("source")?;
+            let work = download.path();
+            let acquired = crate::ops::source::acquire(r, work, &mut |_| {})?;
+            let subpath = r.subpath();
+            let url = r.url().context("missing source URL")?;
+            let skill_dir = work.join(subpath.unwrap_or(""));
             if !skill_dir.join(SKILL_FILE).is_file() {
-                // Reported relative to the repository root, because that is
-                // what a caller passes back as `subpath` on the second attempt.
-                let base = subpath.as_deref().unwrap_or("");
+                let base = subpath.unwrap_or("");
                 let choices: Vec<String> = discover(&skill_dir)
                     .into_iter()
                     .map(|c| {
                         if base.is_empty() {
                             c
                         } else {
-                            format!("{}/{c}", base.trim_end_matches('/'))
+                            format!("{base}/{c}")
                         }
                     })
                     .collect();
                 if choices.is_empty() {
                     bail!(
                         "no {SKILL_FILE} at {} in {url}",
-                        subpath.as_deref().unwrap_or("the repository root")
+                        subpath.unwrap_or("the source root")
                     );
                 }
                 return Err(NotOneSkill { choices }.into());
             }
             Ok(Fetched {
                 skill_dir,
+                source: acquired.source(subpath),
                 workdir: download.keep(),
-                source: Source::Git {
-                    url: url.clone(),
-                    subpath: subpath.clone().filter(|s| !s.is_empty()),
-                    branch: resolved_branch,
-                    revision: Some(rev),
-                },
             })
         }
     }
@@ -189,7 +79,7 @@ pub fn default_name(r: &InstallRef, fetched: &Fetched) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        InstallRef::Git { .. } => SkillDoc::load(&fetched.skill_dir)
+        _ => SkillDoc::load(&fetched.skill_dir)
             .map(|doc| doc.name)
             .unwrap_or_default(),
     }
@@ -245,7 +135,7 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
         // Downloads may be on another filesystem. Publish only a complete
         // skill copied into the central root's staging area, never a partial
         // cross-filesystem copy directly into its final destination.
-        if matches!(r, InstallRef::Git { .. }) {
+        if r.is_remote() {
             let staged = fresh_staging(&ws.root, "install")?;
             let placed = (|| -> Result<()> {
                 copy_dir(&fetched.skill_dir, &staged)?;
@@ -262,7 +152,7 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
             note: None,
             installed_name: Some(SkillDoc::load(&dest)?.name),
             source: Some(fetched.source.clone()),
-            baseline: if matches!(fetched.source, Source::Git { .. }) {
+            baseline: if fetched.source.is_remote() {
                 Some(Baseline {
                     hash: hash_directory(&dest)?,
                     hash_algo: HASH_ALGO,
@@ -334,24 +224,39 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
 /// Change the recorded source of a skill without touching its content.
 pub fn set_source(ws: &Workspace, key: &str, r: &InstallRef) -> Result<SkillMeta> {
     anyhow::ensure!(
-        matches!(r, InstallRef::Git { .. }),
+        r.is_remote(),
         "Only repository upstream sources are recorded"
     );
     let mut meta = crate::ops::edit::load_or_init(ws, key)?;
+    // Resolve ambiguous URLs before recording them so future checks always use
+    // the same provider. This operation records no installed baseline.
     meta.source = Some(match r {
-        InstallRef::Local(p) => Source::Local {
-            path: Some(crate::paths::contract_tilde(p)),
-        },
         InstallRef::Git {
             url,
             branch,
             subpath,
         } => Source::Git {
             url: url.clone(),
-            subpath: subpath.clone(),
             branch: branch.clone(),
+            subpath: subpath.clone(),
             revision: None,
         },
+        InstallRef::Archive { url, subpath } => Source::Archive {
+            url: url.clone(),
+            subpath: subpath.clone(),
+            revision: None,
+        },
+        InstallRef::Url { .. } => {
+            let download = DownloadDir::new("source-reference")?;
+            let acquired = crate::ops::source::acquire(r, download.path(), &mut |_| {})?;
+            let mut source = acquired.source(r.subpath());
+            match &mut source {
+                Source::Git { revision, .. } | Source::Archive { revision, .. } => *revision = None,
+                Source::Local { .. } => unreachable!(),
+            }
+            source
+        }
+        InstallRef::Local { .. } => unreachable!(),
     });
     ws.meta.save(key, &meta)?;
     Ok(meta)

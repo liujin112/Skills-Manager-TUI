@@ -1,8 +1,9 @@
 //! Repository-level configuration: `<root>/.skills-meta/config.toml`.
 //!
-//! Everything that shapes the user experience lives here so that cloning the
-//! skills repository reproduces the same setup on another machine. Paths use
-//! `~` and are expanded at load time.
+//! This module owns the persisted schema and defaults. The TUI resolves these
+//! values with its application defaults and session preferences in
+//! `tui::settings`; views consume that snapshot. Paths use `~` and are expanded
+//! at load time.
 
 use crate::paths::{expand_tilde, meta_dir};
 use anyhow::{Context, Result};
@@ -20,8 +21,6 @@ pub struct Config {
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
-    pub deploy: DeployConfig,
-    #[serde(default)]
     pub tags: Vec<TagConfig>,
     #[serde(default = "default_true")]
     pub tags_enabled: bool,
@@ -31,23 +30,31 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
-/// How the result area is arranged. Both settings can be flipped at runtime for
-/// the session; only `config.toml` decides what the next start looks like.
+/// Skill result density. The file supplies the startup default; page-scoped
+/// session choices override it until the process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UiLayout {
-    /// Results across the full width in as many columns of framed cards as
-    /// fit; the preview opens over them when asked for. The default: cards
-    /// only earn their frames once there are several to a row.
+    /// Framed cards in as many columns as fit; previews open as overlays.
     #[default]
     Grid,
-    /// A list beside an always-open preview, three lines a skill: identity,
-    /// description, tags. The card's content without the frame.
+    /// Four unframed lines per skill: identity, two description lines, and
+    /// source/tags. Search panels show an adjacent preview; Agents uses overlays.
     List,
-    /// The same split with one line a skill (two while searching), for when
-    /// the names are what matters.
+    /// One identity row per skill, with an optional search-excerpt row.
     #[serde(alias = "split")]
     Compact,
+}
+
+impl UiLayout {
+    /// Shared order for the session layout shortcut on every skills page.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Grid => Self::List,
+            Self::List => Self::Compact,
+            Self::Compact => Self::Grid,
+        }
+    }
 }
 
 /// What caps the ends of a preset pill. A terminal cell is taller than it is
@@ -244,26 +251,6 @@ impl AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeployConfig {
-    /// Deploy every skill to every agent. Matches the "one shared directory" setup.
-    #[serde(default = "default_true")]
-    pub all_to_all: bool,
-    /// Presets whose members are part of the desired deployment state.
-    #[serde(default)]
-    pub presets: Vec<String>,
-}
-
-impl Default for DeployConfig {
-    fn default() -> Self {
-        Self {
-            all_to_all: true,
-            presets: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TagConfig {
     #[serde(default)]
     pub skills: Vec<String>,
@@ -290,7 +277,6 @@ impl Default for Config {
         Self {
             schema: 1,
             agents: default_agents(),
-            deploy: DeployConfig::default(),
             tags: Vec::new(),
             tags_enabled: true,
             search: SearchConfig::default(),
@@ -300,6 +286,13 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Ignore the retired sync section only at the file boundary. It is not
+    /// represented in runtime configuration, and all other fields stay strict.
+    fn parse(text: &str) -> Result<Self> {
+        let mut doc: DocumentMut = text.parse()?;
+        doc.remove("deploy");
+        Ok(toml::from_str(&doc.to_string())?)
+    }
     pub fn local_default() -> Self {
         Self {
             agents: crate::agents::defaults(true),
@@ -318,7 +311,7 @@ impl Config {
             Self::default()
         };
         Self::edit_document(root, |doc| {
-            let parsed: Self = toml::from_str(&doc.to_string())?;
+            let parsed = Self::parse(&doc.to_string())?;
             let existing = if doc.get("agents").is_some() {
                 &parsed.agents
             } else {
@@ -359,7 +352,7 @@ impl Config {
         let path = Self::path(root);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("invalid config: {}", path.display()))
+                Self::parse(&text).with_context(|| format!("invalid config: {}", path.display()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -489,7 +482,7 @@ impl Config {
     pub fn edit_tags(root: &Path, edit: impl FnOnce(&mut Vec<TagConfig>)) -> Result<()> {
         let _lock = crate::meta::MetaStore::new(root).lock()?;
         Self::edit_document(root, |doc| {
-            let mut config: Self = toml::from_str(&doc.to_string())?;
+            let mut config = Self::parse(&doc.to_string())?;
             edit(&mut config.tags);
             for tag in &mut config.tags {
                 tag.skills.sort();

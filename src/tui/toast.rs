@@ -5,6 +5,7 @@
 //! Active tasks instead show live details and remain until explicitly finished.
 
 use super::app::Level;
+use super::settings::InteractionSettings;
 use super::theme::Theme;
 use super::widgets::{SPINNER, fit, width};
 use crate::tui::widgets::OverlayClear as Clear;
@@ -13,13 +14,6 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use std::time::{Duration, Instant};
-
-/// How long a notification stays before it goes. An error gets longer: it has
-/// to be read, but it should not sit in the corner forever either.
-const LIFETIME: Duration = Duration::from_secs(5);
-const ERROR_LIFETIME: Duration = Duration::from_secs(20);
-/// Most shown at once; older ones are dropped rather than pushed off screen.
-const MAX_VISIBLE: usize = 3;
 
 pub struct Toast {
     pub text: String,
@@ -38,21 +32,22 @@ impl Toast {
         }
     }
 
-    fn lifetime(&self) -> Duration {
+    fn lifetime(&self, policy: &InteractionSettings) -> Duration {
         if self.level == Level::Error {
-            ERROR_LIFETIME
+            policy.error_toast_lifetime
         } else {
-            LIFETIME
+            policy.toast_lifetime
         }
     }
 
-    fn done(&self) -> bool {
-        self.detail.is_none() && self.at.elapsed() >= self.lifetime()
+    fn done(&self, policy: &InteractionSettings) -> bool {
+        self.detail.is_none() && self.at.elapsed() >= self.lifetime(policy)
     }
 
-    fn marker(&self) -> &'static str {
+    fn marker(&self, policy: &InteractionSettings) -> &'static str {
         if self.detail.is_some() {
-            let frame = (self.at.elapsed().as_millis() / 100) % SPINNER.len() as u128;
+            let frame = (self.at.elapsed().as_nanos() / policy.tick_interval.as_nanos().max(1))
+                % SPINNER.len() as u128;
             return SPINNER[frame as usize];
         }
         match self.level {
@@ -63,8 +58,12 @@ impl Toast {
     }
 
     /// Keep a sliver visible until expiry, with the full line at creation.
-    fn bar_width(&self, width: usize) -> usize {
-        let remaining = 1.0 - self.at.elapsed().as_secs_f64() / self.lifetime().as_secs_f64();
+    fn bar_width(&self, width: usize, policy: &InteractionSettings) -> usize {
+        let lifetime = self.lifetime(policy);
+        if lifetime.is_zero() {
+            return 0;
+        }
+        let remaining = 1.0 - self.at.elapsed().as_secs_f64() / lifetime.as_secs_f64();
         (remaining.clamp(0.0, 1.0) * width as f64).ceil() as usize
     }
 }
@@ -74,9 +73,18 @@ impl Toast {
 pub struct Toasts {
     items: Vec<Toast>,
     running: std::collections::BTreeMap<u64, Toast>,
+    policy: InteractionSettings,
 }
 
 impl Toasts {
+    pub fn new(policy: InteractionSettings) -> Self {
+        Self {
+            items: Vec::new(),
+            running: std::collections::BTreeMap::new(),
+            policy,
+        }
+    }
+
     pub fn start(&mut self, id: u64, text: String) {
         let mut toast = Toast::new(text, Level::Info);
         toast.detail = Some("Starting…".into());
@@ -109,19 +117,23 @@ impl Toasts {
     pub fn push(&mut self, text: impl Into<String>, level: Level) {
         self.items.push(Toast::new(text, level));
         // Keep the newest; a burst of writes should not bury the last result.
-        let excess = self.items.len().saturating_sub(MAX_VISIBLE);
+        let excess = self
+            .items
+            .len()
+            .saturating_sub(self.policy.max_visible_toasts);
         self.items.drain(..excess);
     }
 
     /// Drop whatever has run out. Called on every tick.
     pub fn expire(&mut self) {
-        self.items.retain(|t| !t.done());
+        self.items.retain(|t| !t.done(&self.policy));
     }
 
     /// Draw the stack above the footer, hugging the right edge. Returns the
     /// area covered so callers can avoid drawing under it.
     pub fn draw(&self, f: &mut Frame, area: Rect, th: &Theme) -> Option<Rect> {
-        if self.items.is_empty() && self.running.is_empty() {
+        if self.policy.max_visible_toasts == 0 || (self.items.is_empty() && self.running.is_empty())
+        {
             return None;
         }
         let max_text = (area.width as usize).saturating_sub(12).min(
@@ -148,12 +160,11 @@ impl Toasts {
         // Reserve space for persistent work, then fit newest results from below.
         let mut remaining = budget.saturating_sub(usize::from(active.is_some()) * 2);
         let mut lines: Vec<(Vec<String>, &Toast)> = Vec::new();
-        for toast in self
-            .items
-            .iter()
-            .rev()
-            .take(MAX_VISIBLE - usize::from(active.is_some()))
-        {
+        for toast in self.items.iter().rev().take(
+            self.policy
+                .max_visible_toasts
+                .saturating_sub(usize::from(active.is_some())),
+        ) {
             if remaining < 2 {
                 break;
             }
@@ -221,7 +232,7 @@ impl Toasts {
                 body.push(Line::from(vec![
                     Span::styled(
                         if i == 0 {
-                            format!(" {} ", toast.marker())
+                            format!(" {} ", toast.marker(&self.policy))
                         } else {
                             "   ".into()
                         },
@@ -237,7 +248,9 @@ impl Toasts {
                         .detail
                         .as_ref()
                         .map(|d| fit(d, max_text))
-                        .unwrap_or_else(|| "━".repeat(toast.bar_width(inner_w.saturating_sub(2)))),
+                        .unwrap_or_else(|| {
+                            "━".repeat(toast.bar_width(inner_w.saturating_sub(2), &self.policy))
+                        }),
                     style,
                 ),
             ]));
@@ -363,26 +376,28 @@ mod tests {
 
     #[test]
     fn the_line_shrinks_without_changing_the_status_marker() {
+        let policy = InteractionSettings::default();
         let mut toast = Toast::new("saved", Level::Ok);
-        assert_eq!(toast.bar_width(20), 20);
+        assert_eq!(toast.bar_width(20, &policy), 20);
         for (elapsed_ms, want) in [(1000, 16), (2500, 10), (4900, 1), (5000, 0)] {
             toast.at = Instant::now() - Duration::from_millis(elapsed_ms);
-            assert_eq!(toast.bar_width(20), want);
-            assert_eq!(toast.marker(), "✓");
+            assert_eq!(toast.bar_width(20, &policy), want);
+            assert_eq!(toast.marker(&policy), "✓");
         }
-        assert!(toast.done());
+        assert!(toast.done(&policy));
     }
 
     #[test]
     fn errors_use_their_longer_lifetime() {
+        let policy = InteractionSettings::default();
         let mut toast = Toast::new("failed", Level::Error);
         toast.at = Instant::now() - Duration::from_secs(10);
-        assert_eq!(toast.bar_width(20), 10);
-        assert_eq!(toast.marker(), "!");
-        assert!(!toast.done());
-        toast.at = Instant::now() - ERROR_LIFETIME;
-        assert_eq!(toast.bar_width(20), 0);
-        assert!(toast.done());
+        assert_eq!(toast.bar_width(20, &policy), 10);
+        assert_eq!(toast.marker(&policy), "!");
+        assert!(!toast.done(&policy));
+        toast.at = Instant::now() - policy.error_toast_lifetime;
+        assert_eq!(toast.bar_width(20, &policy), 0);
+        assert!(toast.done(&policy));
     }
 
     #[test]
@@ -430,8 +445,41 @@ mod tests {
         for i in 0..5 {
             ts.push(format!("n{i}"), Level::Ok);
         }
-        assert_eq!(ts.items.len(), MAX_VISIBLE);
+        assert_eq!(ts.items.len(), ts.policy.max_visible_toasts);
         assert_eq!(ts.items.last().unwrap().text, "n4");
         assert_eq!(ts.items[0].text, "n2");
+    }
+
+    #[test]
+    fn resolved_policy_controls_expiry_capacity_and_task_animation() {
+        let policy = InteractionSettings {
+            toast_lifetime: Duration::from_secs(2),
+            error_toast_lifetime: Duration::from_secs(8),
+            max_visible_toasts: 2,
+            // A long interval makes the selected frame deterministic without
+            // sleeping, while differing from the application's default tick.
+            tick_interval: Duration::from_secs(10),
+            ..InteractionSettings::default()
+        };
+        let mut ts = Toasts::new(policy);
+        ts.push("old", Level::Info);
+        ts.push("saved", Level::Ok);
+        ts.push("failed", Level::Error);
+        assert_eq!(ts.items.len(), 2);
+        assert_eq!(ts.items[0].text, "saved");
+        for toast in &mut ts.items {
+            toast.at = Instant::now() - Duration::from_secs(3);
+        }
+        ts.start(1, "task".into());
+        let task = ts.running.get_mut(&1).unwrap();
+        task.at = Instant::now() - Duration::from_secs(35);
+        assert_eq!(task.marker(&ts.policy), SPINNER[3]);
+        ts.expire();
+        assert_eq!(ts.items.len(), 1);
+        assert_eq!(ts.items[0].text, "failed");
+        assert!(ts.running.contains_key(&1));
+        ts.items[0].at = Instant::now() - policy.error_toast_lifetime;
+        ts.expire();
+        assert!(ts.items.is_empty());
     }
 }

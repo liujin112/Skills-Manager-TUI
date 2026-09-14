@@ -37,25 +37,17 @@ pub struct RepositoryPicker {
     candidates: Snapshot,
     searcher: Searcher,
     matching: BTreeSet<String>,
-    configured: bool,
+    configured_search: Option<skills::config::SearchConfig>,
     completion: Completion,
     preview: Overlay,
 }
 impl RepositoryPicker {
     pub fn new(fetched: FetchedRepository, ctx: &Ctx) -> Self {
         let installed = |path: &str| {
-            ctx.snap.skills.iter().any(|s| match &s.source {
-                Some(skills::meta::Source::Git {
-                    url,
-                    branch,
-                    subpath,
-                    ..
-                }) => {
-                    *url == fetched.repository.url
-                        && branch.as_deref() == Some(&fetched.repository.branch)
-                        && subpath.as_deref().unwrap_or("") == path
-                }
-                _ => false,
+            ctx.snap.skills.iter().any(|s| {
+                s.source
+                    .as_ref()
+                    .is_some_and(|source| fetched.repository.matches_source(source, path))
             })
         };
         let paths = fetched
@@ -84,7 +76,7 @@ impl RepositoryPicker {
             candidates,
             searcher: Searcher::new(),
             matching: BTreeSet::new(),
-            configured: false,
+            configured_search: None,
             completion: Completion::default(),
             preview: Overlay::default(),
             selection,
@@ -118,17 +110,27 @@ impl RepositoryPicker {
         nodes.into_iter().collect()
     }
     fn configure(&mut self, ctx: &Ctx) {
-        if !self.configured {
-            self.searcher = Searcher::for_workspace(ctx.ws);
-            self.configured = true;
-            self.refilter();
+        if self.configured_search.as_ref() != Some(&ctx.settings.search) {
+            self.refresh(ctx);
         }
+    }
+
+    /// Re-read dictionaries and the resolved settings when the app refreshes.
+    /// Preserve staged choices and input while re-evaluating the current query.
+    pub fn refresh(&mut self, ctx: &Ctx) {
+        self.searcher.configure(
+            ctx.settings.search.clone(),
+            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
+        );
+        self.configured_search = Some(ctx.settings.search.clone());
+        self.refilter();
+        self.update_completion(ctx);
     }
     fn update_completion(&mut self, ctx: &Ctx) {
         let candidate_ctx = Ctx {
             ws: ctx.ws,
             snap: &self.candidates,
-            theme: ctx.theme,
+            settings: ctx.settings,
         };
         self.completion.update_install(&self.search, &candidate_ctx);
     }
@@ -235,12 +237,13 @@ impl RepositoryPicker {
         {
             return Some("ancestor or descendant selected".into());
         }
-        if ctx.snap.skills.iter().any(|s| match &s.source {
-            Some(skills::meta::Source::Git { url, subpath, .. }) => {
-                *url == self.selection.fetched.repository.url
-                    && subpath.as_deref().unwrap_or("") == path
-            }
-            _ => false,
+        if ctx.snap.skills.iter().any(|s| {
+            s.source.as_ref().is_some_and(|source| {
+                self.selection
+                    .fetched
+                    .repository
+                    .matches_source(source, path)
+            })
         }) {
             return Some("already installed".into());
         }
@@ -293,6 +296,7 @@ impl RepositoryPicker {
         }
     }
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        self.configure(ctx);
         if self.preview.is_open() {
             return vec![];
         }
@@ -445,7 +449,8 @@ impl RepositoryPicker {
         vec![]
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.preview.handle_mouse(m) {
+        self.configure(ctx);
+        if self.preview.handle_mouse(m, ctx) {
             return vec![];
         }
         if self.focus == 1 {
@@ -460,12 +465,12 @@ impl RepositoryPicker {
         }
         let at = (m.column, m.row).into();
         match m.kind {
-            MouseEventKind::ScrollDown if self.list.rows.contains(at) => {
-                self.list.move_by(3, self.shown.len())
-            }
-            MouseEventKind::ScrollUp if self.list.rows.contains(at) => {
-                self.list.move_by(-3, self.shown.len())
-            }
+            MouseEventKind::ScrollDown if self.list.rows.contains(at) => self
+                .list
+                .move_by(ctx.settings.interaction.wheel_rows, self.shown.len()),
+            MouseEventKind::ScrollUp if self.list.rows.contains(at) => self
+                .list
+                .move_by(-ctx.settings.interaction.wheel_rows, self.shown.len()),
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.rect.contains(at) {
                     return self.key(KeyEvent::new(KeyCode::Esc, m.modifiers), ctx);
@@ -499,7 +504,7 @@ impl RepositoryPicker {
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         self.configure(ctx);
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let w = area.width.saturating_sub(4).min(110);
         let h = area.height.saturating_sub(4).min(32);
         let r = Rect::new(
@@ -639,7 +644,7 @@ impl RepositoryPicker {
         let candidate_ctx = Ctx {
             ws: ctx.ws,
             snap: &self.candidates,
-            theme: ctx.theme,
+            settings: ctx.settings,
         };
         self.preview.draw(f, area, &candidate_ctx);
     }
@@ -670,12 +675,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                 name_mismatch: false,
                 tags: vec![],
                 note: None,
-                source: Some(skills::meta::Source::Git {
-                    url: fetched.repository.url.clone(),
-                    branch: Some(fetched.repository.branch.clone()),
-                    subpath: Some(key.clone()),
-                    revision: Some(fetched.revision.clone()),
-                }),
+                source: Some(fetched.repository.source(key, Some(&fetched.revision))),
                 current_hash: None,
                 baseline_hash: None,
                 deploy: BTreeMap::new(),
@@ -697,6 +697,85 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, repository::Repository};
+
+    #[test]
+    fn archive_picker_preserves_source_kind_and_excludes_only_matching_installs() {
+        let temp = skills::ops::DownloadDir::new("archive-picker").unwrap();
+        let root = temp.path().join("library");
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let fetched = FetchedRepository {
+            repository: Repository {
+                kind: skills::meta::SourceKind::Archive,
+                alias: "sample-tools".into(),
+                url: "https://example.com/sample/tools".into(),
+                branch: String::new(),
+            },
+            revision: "digest".into(),
+            workdir: temp.path().join("download"),
+            choices: vec!["bundle/reader".into(), "bundle/writer".into()],
+            invalid: BTreeMap::new(),
+        };
+        for name in ["reader", "writer"] {
+            let path = fetched.workdir.join("bundle").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Sample tool\n---\nBody\n"),
+            )
+            .unwrap();
+        }
+        let mut snap = candidate_snapshot(&fetched);
+        assert!(
+            snap.skills
+                .iter()
+                .all(|skill| matches!(skill.source, Some(skills::meta::Source::Archive { .. })))
+        );
+        snap.skills[0].key = "repos/previous/reader".into();
+        snap.skills[1].key = "repos/git-source/writer".into();
+        snap.skills[1].source = Some(skills::meta::Source::Git {
+            url: fetched.repository.url.clone(),
+            branch: Some("main".into()),
+            subpath: Some("bundle/writer".into()),
+            revision: Some("commit".into()),
+        });
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = RepositoryPicker::new(fetched, &ctx);
+        picker.configure(&ctx);
+        assert_eq!(picker.selection.paths, ["bundle/writer"]);
+        assert_eq!(
+            picker.disabled("bundle/reader", &ctx).as_deref(),
+            Some("already installed")
+        );
+        picker.toggle("bundle/writer", &ctx);
+        assert_eq!(picker.disabled("bundle/writer", &ctx), None);
+        picker.search = Input::with_value("repo:sample/");
+        picker.update_completion(&ctx);
+        assert!(picker.completion.active());
+        picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
+        assert_eq!(picker.search.value(), "repo:sample/tools ");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("reader"));
+        assert!(text.contains("writer"));
+    }
 
     #[test]
     fn candidate_search_reuses_names_body_fuzzy_filters_and_preview() {
@@ -725,11 +804,16 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut picker = RepositoryPicker::new(
             FetchedRepository {
                 repository: Repository {
+                    kind: Default::default(),
                     alias: "sample--tools".into(),
                     url: "https://github.com/sample/tools".into(),
                     branch: "main".into(),
@@ -766,6 +850,27 @@ mod tests {
             assert!(picker.matches_filter("skills/print"), "{query}");
             assert!(!picker.matches_filter("internal/print"), "{query}");
         }
+
+        // A still-open picker follows the resolved configuration without
+        // clearing its query or the installation choices already staged.
+        picker.search = Input::with_value("skills/ prnter");
+        picker.refilter();
+        let staged = picker.selection.paths.clone();
+        assert!(picker.matches_filter("skills/print"));
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        settings.search.fuzzy = false;
+        let changed_ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        picker.configure(&changed_ctx);
+        assert!(picker.shown.is_empty());
+        assert_eq!(picker.search.value(), "skills/ prnter");
+        assert_eq!(picker.selection.paths, staged);
+        picker.refresh(&ctx);
+        assert!(picker.matches_filter("skills/print"));
+
         picker.search = Input::with_value("repo:other/tools");
         picker.refilter();
         assert!(picker.shown.is_empty());
@@ -793,6 +898,7 @@ mod tests {
         let mut picker = RepositoryPicker::restore(InstallSelection {
             fetched: FetchedRepository {
                 repository: Repository {
+                    kind: Default::default(),
                     alias: "sampleorg--kit".into(),
                     url: "https://github.com/sampleorg/kit".into(),
                     branch: "main".into(),
@@ -864,10 +970,15 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let fetched = FetchedRepository {
             repository: Repository {
+                kind: Default::default(),
                 alias: "sample--tools".into(),
                 url: "https://example.com/sample/tools.git".into(),
                 branch: "main".into(),

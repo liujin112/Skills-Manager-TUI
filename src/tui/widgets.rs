@@ -279,6 +279,28 @@ impl Input {
         self.cursor = idx.min(self.len());
     }
 
+    /// Empty search fields distinguish the prompt from usage examples while
+    /// retaining the same cursor, scrolling and hit geometry as other inputs.
+    pub fn render_hint(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        focused: bool,
+        hint: (&str, &str),
+        theme: &Theme,
+    ) {
+        self.render(f, area, focused, "", theme);
+        if self.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(hint.0, Style::default().fg(theme.placeholder)),
+                    Span::styled(hint.1, Style::default().fg(theme.usage)),
+                ])),
+                area,
+            );
+        }
+    }
+
     /// Render inside `area` (already the inner area of a block). Sets the terminal cursor when focused.
     pub fn render(
         &mut self,
@@ -307,7 +329,10 @@ impl Input {
         }
         let visible: String = self.value.chars().skip(self.scroll).collect();
         let line = if self.value.is_empty() && !placeholder.is_empty() {
-            Line::from(Span::styled(fit(placeholder, w), theme.dim()))
+            Line::from(Span::styled(
+                fit(placeholder, w),
+                Style::default().fg(theme.placeholder),
+            ))
         } else {
             Line::from(Span::raw(fit(&visible, w + 1)))
         };
@@ -460,6 +485,47 @@ impl ScrollTrack {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn variable_cards_keep_selection_visible_and_hit_the_right_item() {
+        use super::*;
+        let mut grid = CardGrid::default();
+        for height in 1..15 {
+            for selected in 0..4 {
+                grid.select(Some(selected));
+                grid.layout_heights(Rect::new(2, 3, 30, height), vec![3, 4, 3, 4]);
+                let cell = grid.cell(selected).unwrap();
+                assert_eq!(cell.height, [3, 4, 3, 4][selected].min(height));
+                assert!(cell.bottom() <= 3 + height);
+                assert_eq!(grid.hit(cell.x, cell.y), Some(selected));
+                assert!(grid.visible().contains(&selected));
+            }
+        }
+        grid.select(Some(0));
+        grid.layout_heights(Rect::new(0, 0, 30, 14), vec![3, 4, 3, 4]);
+        assert_eq!(grid.cell(1).unwrap().y, 3);
+        assert_eq!(grid.cell(2).unwrap().y, 7);
+    }
+    #[test]
+    fn filter_hint_colors_do_not_leak_into_typed_text() {
+        let theme = super::Theme::default();
+        let mut input = super::Input::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 1)).unwrap();
+        terminal
+            .draw(|f| input.render_hint(f, f.area(), true, ("filter", " · Enter results"), &theme))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 0)].fg, theme.placeholder);
+        assert_eq!(terminal.backend().buffer()[(9, 0)].fg, theme.usage);
+        input = super::Input::with_value("lark");
+        terminal
+            .draw(|f| input.render_hint(f, f.area(), true, ("filter", " · Enter results"), &theme))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].fg,
+            ratatui::style::Color::Reset
+        );
+        assert_eq!(terminal.backend().buffer()[(9, 0)].symbol(), " ");
+    }
+    #[test]
     fn paste_is_atomic_and_respects_unicode_cursor() {
         let mut input = super::Input::with_value("a尾");
         input.handle_key(crossterm::event::KeyEvent::new(
@@ -585,6 +651,7 @@ mod tests {
 /// leaves half a card at the top.
 #[derive(Debug, Clone, Default)]
 pub struct CardGrid {
+    heights: Vec<u16>,
     sel: Option<usize>,
     /// First visible grid row.
     offset: usize,
@@ -615,6 +682,18 @@ impl CardGrid {
     }
     /// Grid rows that fit on screen.
     pub fn visible_rows(&self) -> usize {
+        if !self.heights.is_empty() {
+            let mut used = 0;
+            return self
+                .heights
+                .iter()
+                .skip(self.offset)
+                .take_while(|&&h| {
+                    used += h;
+                    used <= self.rows.height
+                })
+                .count();
+        }
         (self.rows.height / self.cell_h.max(1)) as usize
     }
     pub fn page(&self) -> i32 {
@@ -664,6 +743,7 @@ impl CardGrid {
     /// Record the geometry of a render and scroll so the selection is on screen.
     /// Called every frame, which is what keeps a resize from losing the cursor.
     pub fn layout(&mut self, inner: Rect, cols: usize, cell_h: u16, gap: u16, len: usize) {
+        self.heights.clear();
         self.rows = inner;
         self.cols = cols.max(1);
         self.cell_h = cell_h.max(1);
@@ -682,20 +762,68 @@ impl CardGrid {
         self.offset = self.offset.min(self.grid_rows().saturating_sub(vis));
     }
 
-    /// Where item `i` is drawn, or `None` when it is scrolled out of sight. The
+    /// A one-column list whose cards grow by one row when they have a description.
+    pub fn layout_heights(&mut self, inner: Rect, heights: Vec<u16>) {
+        self.rows = inner;
+        self.cols = 1;
+        self.cell_w = inner.width;
+        self.gap = 0;
+        self.heights = heights
+            .into_iter()
+            .map(|h| h.min(inner.height).max(1))
+            .collect();
+        self.clamp(self.heights.len());
+        self.offset = self.offset.min(self.sel.unwrap_or(0));
+        if let Some(i) = self.sel {
+            while self.offset < i
+                && self.heights[self.offset..=i]
+                    .iter()
+                    .map(|&h| h as usize)
+                    .sum::<usize>()
+                    > inner.height as usize
+            {
+                self.offset += 1;
+            }
+        }
+    }
+
+    /// Where item `i` is drawn, clipped at the viewport's bottom, or `None`
+    /// when it is scrolled out of sight. `visible()` includes full rows only;
+    /// callers can request the following row to show a continuation. The
     /// last row of a short grid is left-aligned, which falls out of laying every
     /// row out from the left rather than centring a ragged one.
     pub fn cell(&self, i: usize) -> Option<Rect> {
+        if !self.heights.is_empty() {
+            if i < self.offset || i >= self.len {
+                return None;
+            }
+            let y: usize = self.heights[self.offset..i]
+                .iter()
+                .map(|&h| h as usize)
+                .sum();
+            if y >= self.rows.height as usize {
+                return None;
+            }
+            return Some(Rect::new(
+                self.rows.x,
+                self.rows.y + y as u16,
+                self.rows.width,
+                self.heights[i].min(self.rows.height - y as u16),
+            ));
+        }
         let cols = self.cols();
         let (r, c) = (i / cols, i % cols);
-        if r < self.offset || r >= self.offset + self.visible_rows() {
+        let drawn_rows = self.rows.height.div_ceil(self.cell_h.max(1)) as usize;
+        if i >= self.len || r < self.offset || r >= self.offset + drawn_rows {
             return None;
         }
         Some(Rect {
             x: self.rows.x + c as u16 * self.cell_w,
             y: self.rows.y + (r - self.offset) as u16 * self.cell_h,
             width: self.cell_w.saturating_sub(self.gap),
-            height: self.cell_h,
+            height: self
+                .cell_h
+                .min(self.rows.height - (r - self.offset) as u16 * self.cell_h),
         })
     }
 
@@ -709,6 +837,10 @@ impl CardGrid {
 
     /// Item under the pointer, if the pointer is over one at all.
     pub fn hit(&self, x: u16, y: u16) -> Option<usize> {
+        if !self.heights.is_empty() {
+            return (self.offset..self.len)
+                .find(|&i| self.cell(i).is_some_and(|r| r.contains((x, y).into())));
+        }
         if x < self.rows.x || x >= self.rows.right() || y < self.rows.y || y >= self.rows.bottom() {
             return None;
         }

@@ -29,7 +29,6 @@ pub struct PickItem {
 }
 
 pub enum InputKind {
-    Tags { skill: String },
     PresetName,
     TagName,
     TagDescription { name: String },
@@ -54,6 +53,7 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
         scroll: u16,
+        return_to: Option<Box<Modal>>,
     },
     /// Preview of link changes with Apply / Cancel.
     Confirm {
@@ -137,6 +137,7 @@ impl Modal {
             title: title.into(),
             lines,
             scroll: 0,
+            return_to: None,
         }
     }
     pub fn confirm(title: String, actions: Vec<deploy::Action>) -> Self {
@@ -196,17 +197,6 @@ impl Modal {
         self
     }
 
-    pub fn tags(skill: &str, tags: &[String]) -> Self {
-        Modal::Input {
-            title: format!(" tags for {skill} "),
-            input: Input::with_value(&tags.join(", ")),
-            kind: InputKind::Tags {
-                skill: skill.into(),
-            },
-            hint: "comma separated · Enter save · Esc cancel".into(),
-            rect: Rect::default(),
-        }
-    }
     pub fn new_preset() -> Self {
         Modal::Input {
             title: " new preset ".into(),
@@ -217,14 +207,8 @@ impl Modal {
         }
     }
 
-    /// Edit what a preset is for. A single-line prompt, prefilled, rather
-    /// than `$EDITOR` or editing on the card: a preset description is one
-    /// sentence, like the description in a SKILL.md, and leaving the screen
-    /// for an editor is a heavy round trip for that; editing inside a grid
-    /// cell that is laid out again every frame is fragile; and create, tags
-    /// and install already ask through this same box, so it is the one the
-    /// user knows. Prefilled because a description is usually corrected, not
-    /// replaced, and clearing the field is how it is removed.
+    /// Edit a preset description in a prefilled single-line prompt. Submitting
+    /// an empty value clears the description.
     pub fn preset_description(name: &str, current: Option<&str>) -> Self {
         Modal::Input {
             title: format!(" description of {name} "),
@@ -253,7 +237,8 @@ impl Modal {
             title: " install a skill ".into(),
             input: Input::default(),
             kind: InputKind::Install,
-            hint: "owner/repo[/path] · git URL · local path\nEnter install · Esc cancel".into(),
+            hint: "owner/repo[/path] · Git or archive URL · local path\nEnter install · Esc cancel"
+                .into(),
             rect: Rect::default(),
         }
     }
@@ -353,22 +338,15 @@ impl Modal {
             kind: InputKind::SetSource {
                 skill: skill.into(),
             },
-            hint: format!("now {now} · owner/repo[/path], a git URL or a path replaces it"),
+            hint: format!("now {now} · owner/repo[/path], Git or archive URL"),
             rect: Rect::default(),
         }
     }
 
-    /// Take a directory the agent has of its own into the root. What follows
-    /// is what `install::adopt` does on that branch: the directory moves into
-    /// the root, the agent is left a link to it there, and metadata is created
-    /// with the content as it stands for its baseline.
-    ///
-    /// Not logged. Taking it back would mean moving the directory out of the
-    /// root, deleting the link the agent now reads through and recreating a
-    /// real directory in its place — three writes on a live path with nothing
-    /// on disk to re-derive them from. Nor is it an `Intent::OneWay`: nothing
-    /// consumes those yet, and one on top of the stack would only refuse every
-    /// undo and hide the reversible steps beneath it.
+    /// Adopt an agent-owned directory into the library and leave a link at its
+    /// original location. `install::adopt` creates the library metadata/baseline.
+    /// Session undo does not cover adoption: restoring the original directory
+    /// and metadata requires a reverse plan that this action does not record.
     pub fn adopt(agent: &str, name: &str, path: PathBuf) -> Self {
         let a = agent.to_string();
         Self::confirm_write(
@@ -483,19 +461,18 @@ impl Modal {
                                 skills::repository::alias_of(&s.key) == Some(r.alias.as_str())
                             })
                             .count();
+                        let source = r.source("", None);
                         PickItem {
                             id: r.alias.clone(),
                             label: format!(
                                 "{} {}",
-                                crate::tui::icons::git(ctx.ws.config.ui.icons, &r.url),
+                                crate::tui::icons::source_icon(ctx.settings.ui.icons, &source),
                                 skills::repository::source_name(&r.url).unwrap_or(r.alias)
                             ),
                             sub: format!(
-                                "{} {count} skills · {} {} · {}",
-                                crate::tui::icons::package(ctx.ws.config.ui.icons),
-                                crate::tui::icons::branch(ctx.ws.config.ui.icons),
-                                r.branch,
-                                r.url
+                                "{} {count} skills · {}",
+                                crate::tui::icons::package(ctx.settings.ui.icons),
+                                crate::tui::icons::source(ctx.settings.ui.icons, &source)
                             ),
                         }
                     })
@@ -574,7 +551,11 @@ impl Modal {
         }
     }
 
-    pub fn refresh(&mut self, _ctx: &Ctx) {}
+    pub fn refresh(&mut self, ctx: &Ctx) {
+        if let Self::Repository(picker) = self {
+            picker.refresh(ctx);
+        }
+    }
 
     pub fn hints(&self) -> Hints {
         match self {
@@ -583,7 +564,16 @@ impl Modal {
             Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
             Modal::DeployTargets(p) => p.hints(),
-            Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
+            Modal::Message {
+                return_to: Some(_), ..
+            } => &[
+                ("↑↓", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("Esc", "back to selection"),
+            ],
+            Modal::Help { .. } | Modal::Message { .. } => {
+                &[("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("Esc", "close")]
+            }
             Modal::Confirm { btn: 0, .. } | Modal::ConfirmWrite { btn: 0, .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
@@ -654,6 +644,12 @@ impl Modal {
 
     pub fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if matches!(self, Modal::Confirm { .. } | Modal::ConfirmWrite { .. })
+            && k.modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return vec![];
+        }
         match self {
             Modal::DeploymentChoices(picker) => picker.key(k),
             Modal::PresetSkills(view) => view.handle_key(k, ctx),
@@ -669,7 +665,20 @@ impl Modal {
                     *scroll = scroll.saturating_sub(1);
                     vec![]
                 }
-                _ => vec![Action::CloseModal],
+                KeyCode::PageDown => {
+                    *scroll = scroll.saturating_add(10);
+                    vec![]
+                }
+                KeyCode::PageUp => {
+                    *scroll = scroll.saturating_sub(10);
+                    vec![]
+                }
+                KeyCode::Home => {
+                    *scroll = 0;
+                    vec![]
+                }
+                KeyCode::Esc | KeyCode::Char('q') => vec![Action::CloseModal],
+                _ => vec![],
             },
             Modal::Confirm {
                 actions,
@@ -1061,7 +1070,7 @@ impl Modal {
     // ---- drawing ----------------------------------------------------------
 
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         match self {
             Modal::DeploymentChoices(picker) => picker.draw(f, area, ctx),
             Modal::PresetSkills(view) => {
@@ -1083,17 +1092,28 @@ impl Modal {
                 let lines: Vec<Line> = HELP
                     .lines()
                     .filter(|l| {
-                        ctx.ws.config.tags_enabled
+                        ctx.settings.tags_enabled
                             || (!l.to_lowercase().contains("tag") && !l.starts_with("  t "))
                     })
                     .map(|l| help_line(l, th))
                     .collect();
-                let r = centered(area, 78, lines.len() as u16 + 2);
+                let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+                let content_width = 78.min(area.width.saturating_sub(2)).saturating_sub(2);
+                let total = paragraph.line_count(content_width).min(u16::MAX as usize) as u16;
+                let r = centered(area, 78, total.saturating_add(2));
+                let visible = r.height.saturating_sub(2);
+                *scroll = (*scroll).min(total.saturating_sub(visible));
                 f.render_widget(Clear, r);
                 f.render_widget(
-                    Paragraph::new(lines)
-                        .scroll((*scroll, 0))
-                        .block(th.block(" help ", true)),
+                    paragraph.scroll((*scroll, 0)).block(th.block(
+                        format!(
+                            " help · {}–{}/{} ",
+                            (*scroll + 1).min(total),
+                            (*scroll + visible).min(total),
+                            total
+                        ),
+                        true,
+                    )),
                     r,
                 );
             }
@@ -1101,12 +1121,20 @@ impl Modal {
                 title,
                 lines,
                 scroll,
+                return_to,
             } => {
                 let r = centered(area, 84, lines.len() as u16 + 4);
                 f.render_widget(Clear, r);
                 let mut ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
                 ls.push(Line::from(""));
-                ls.push(Line::from(Span::styled("press any key", th.dim())));
+                ls.push(Line::from(Span::styled(
+                    if return_to.is_some() {
+                        "Esc returns to your selection; fix the error and apply again."
+                    } else {
+                        "↑↓ scroll · PgUp/PgDn page · Esc close"
+                    },
+                    th.dim(),
+                )));
                 f.render_widget(
                     Paragraph::new(ls)
                         .wrap(Wrap { trim: false })
@@ -1504,32 +1532,7 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 Err(e) => vec![Action::Error(format!("{e:#}"))],
             }
         }
-        InputKind::Tags { skill } => {
-            let skill = skill.clone();
-            let tags: Vec<String> = value
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            vec![Action::WriteMeta(Box::new(move |ws| {
-                history::tag_edit(ws, |ws| {
-                    edit::tag_set(ws, &skill, &tags).map(|m| {
-                        format!(
-                            "{skill}: {}",
-                            if m.is_empty() {
-                                "no tags".into()
-                            } else {
-                                m.join(", ")
-                            }
-                        )
-                    })
-                })
-            }))]
-        }
-        // Name only. What comes next — members, a description — is done on
-        // the card the new preset lands on, and the notice says which keys;
-        // a second prompt here would be one more thing to dismiss before
-        // seeing the result.
+        // Create the empty definition, then select it for member/description editing.
         InputKind::PresetName => {
             let name = value.trim().to_string();
             if name.is_empty() {
@@ -1537,18 +1540,7 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             }
             let land_on = name.clone();
             vec![
-                Action::Write(Box::new(move |ws| {
-                    if ws.presets.load(&name)?.is_some() {
-                        anyhow::bail!("preset {name} already exists");
-                    }
-                    ws.presets.save(&skills::preset::Preset {
-                        name: name.clone(),
-                        ..Default::default()
-                    })?;
-                    Ok(format!(
-                        "created {name} — a adds skills, e sets the description"
-                    ))
-                })),
+                Action::WriteMeta(Box::new(move |ws| history::preset_create(ws, &name))),
                 Action::SelectPreset(land_on),
             ]
         }
@@ -1731,7 +1723,13 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
     }
 }
 
-const HELP: &str = "Library
+const HELP: &str = "Global
+  Ctrl-Z  Ctrl-Y    undo and redo the last change
+  1-6               switch tabs outside text inputs
+  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
+  /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit
+
+Library
   F2                settings
   type              fuzzy search over name, tags, description, note
   tag:x agent:y     filters; also status:modified  source:repository  untagged
@@ -1745,8 +1743,9 @@ const HELP: &str = "Library
   Space  Ctrl-A     toggle skill / select current results in multi-select
   t  d  p           selected skills: tags / deploy / add to preset
   Esc               cancel multi-select; hidden selections never participate
-  u  U              check upstream / update from upstream (git sources)
+  u  U              check upstream / update from upstream (Git or archive sources)
 Tags / Presets
+  C                 choose group colour (name or #rrggbb; none resets)
   c / a             create a group / add skills
   e / r / D         description / rename / delete group
   C / m             Tags: color / merge (left panel)
@@ -1757,19 +1756,24 @@ Tags / Presets
   t / d / p         batch tags / deploy / add to preset
   x                 remove selected skills from the current tag or preset
   Enter / click     toggle or create a tag immediately; Esc closes the picker
+  Tab               complete an existing tag in the picker
+  Backspace         empty tag input: select last token; press again to remove
+  Esc               clear a local name filter; press again to go back
 Agents
   /                 filter preset pills or skills, according to focus
+  arrows            agent → scope → presets → skills; ↑ returns to the group above
+  Enter / Space     install or uninstall the focused preset
+  Enter             preview the focused skill
+  i / x / m         install / uninstall / multi-uninstall skills
+  v                 change skill layout
+  [ / ]             previous / next agent
   a                 adopt an entry the agent has but the root does not
 Mouse
   click             focus panes, select rows, press buttons, switch tabs
   double-click      open preview (or tag / preset / health item)
   right-click       deploy picker for that skill
   wheel             scroll lists and preview
-Global
-  Ctrl-Z  Ctrl-Y    undo and redo the last change
-  1-6               switch tabs outside text inputs
-  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
-  /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit";
+";
 
 fn repository_query(alias: &str, ctx: &Ctx) -> String {
     let name = ctx
@@ -1777,9 +1781,11 @@ fn repository_query(alias: &str, ctx: &Ctx) -> String {
         .skills
         .iter()
         .filter(|r| skills::repository::alias_of(&r.key) == Some(alias))
-        .find_map(|r| match &r.source {
-            Some(skills::meta::Source::Git { url, .. }) => skills::repository::source_name(url),
-            _ => None,
+        .find_map(|r| {
+            r.source
+                .as_ref()
+                .and_then(skills::meta::Source::url)
+                .and_then(skills::repository::source_name)
         })
         .unwrap_or_else(|| alias.to_string());
     format!("repo:{name}")
@@ -1808,7 +1814,11 @@ mod picker_tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         for width in [40, 60, 80] {
             let mut modal = Modal::install();
@@ -1849,7 +1859,11 @@ mod picker_tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut modal = Modal::picker(
             "repositories".into(),
@@ -1973,7 +1987,11 @@ mod picker_tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut modal = Modal::preset_members("reading", &ctx);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);

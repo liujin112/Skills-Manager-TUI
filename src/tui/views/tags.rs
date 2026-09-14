@@ -1,57 +1,29 @@
 //! Tags tab: the tags themselves, and a look at what carries each one.
 //!
 //! Each pane filters its own collection. A tag can be edited directly: renamed, merged into another,
-//! deleted, given a colour. The left column uses spaced text rows with colour
-//! markers; the right
+//! deleted, given a colour. The left column uses shared group cards; the right
 //! pane is the skills under the selected tag, as the cards the search and
 //! presets pages use, so a skill reads the same wherever it turns up.
 
-use super::cards::{self, CARD_H, cols_for, frame, skill_card, tag_fill};
-use super::preview::Overlay;
-use super::{View, split_panes, wheel};
+use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::components::group::{self, tag_fill};
+use crate::tui::components::group_prompt::{Ask, Prompt};
+use crate::tui::components::layout::frame;
+use crate::tui::components::layout::split_panes;
 use crate::tui::modal::Modal;
-use crate::tui::widgets::OverlayClear as Clear;
-use crate::tui::widgets::{CardGrid, Input, ListNav, ScrollTrack, fit, pad, width};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crate::tui::settings::LayoutScope;
+use crate::tui::widgets::{CardGrid, ScrollTrack};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
-use skills::Workspace;
+use ratatui::widgets::Paragraph;
 use skills::config::Config;
 use skills::history;
 use skills::ops::edit;
 use skills::reconcile::Snapshot;
 
 pub const UNTAGGED: &str = "(untagged)";
-
-/// Colours a tag can be given by name, one row each in the colour prompt.
-/// Anything `ratatui` can parse is accepted when typed, including `#rrggbb`;
-/// these are just the ones worth listing.
-const PALETTE: [&str; 16] = [
-    "red",
-    "green",
-    "yellow",
-    "blue",
-    "magenta",
-    "cyan",
-    "white",
-    "gray",
-    "darkgray",
-    "lightred",
-    "lightgreen",
-    "lightyellow",
-    "lightblue",
-    "lightmagenta",
-    "lightcyan",
-    "black",
-];
-/// The row in the colour prompt that takes a tag's colour away again.
-const NO_COLOR: &str = "none";
 
 #[derive(Default)]
 pub struct TagsView {
@@ -62,121 +34,19 @@ pub struct TagsView {
     skill_search: Option<super::search::SearchView>,
     /// Skills under the selected tag, in snapshot order.
     members: Vec<String>,
+    members_tag: Option<String>,
     list: CardGrid,
-    grid: CardGrid,
     focus_grid: bool,
     left: Rect,
     right: Rect,
     list_track: ScrollTrack,
-    grid_track: ScrollTrack,
-    /// Which track a drag started on, so it keeps hold of the thumb even when
-    /// the pointer wanders off the column.
-    drag: Option<Pane>,
-    /// A skill opened for reading, over the page rather than instead of it.
-    preview: Overlay,
+    list_drag: bool,
     /// The merge target or colour being chosen, over the page.
     prompt: Option<Prompt>,
-    /// The workspace with the config as it is on disk now. The app holds the
-    /// config it started with and a page cannot reach in to reload it, so a
-    /// colour just written would only show after a restart; this page reads
-    /// `config.toml` again after every scan and draws with that copy.
-    fresh: Option<Workspace>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pane {
-    List,
-    Grid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ask {
-    /// Which tag the selected one is merged into.
-    Merge,
-    /// What colour the selected tag is filled with.
-    Color,
-}
-
-/// A small chooser drawn over the page. It lives in the view rather than in
-/// `Modal` because the modal's prompts each submit to one fixed action, and
-/// this page needs two of its own. Typing filters the rows; for a colour the
-/// text is also taken as it stands when it names one.
-struct Prompt {
-    ask: Ask,
-    tag: String,
-    input: Input,
-    choices: Vec<String>,
-    /// Indices into `choices` matching the filter, in display order.
-    shown: Vec<usize>,
-    list: ListNav,
-    rect: Rect,
-}
-
-impl Prompt {
-    fn new(ask: Ask, tag: &str, choices: Vec<String>) -> Self {
-        let shown: Vec<usize> = (0..choices.len()).collect();
-        let mut list = ListNav::default();
-        list.clamp(shown.len());
-        Self {
-            ask,
-            tag: tag.to_string(),
-            input: Input::default(),
-            choices,
-            shown,
-            list,
-            rect: Rect::default(),
-        }
-    }
-
-    fn refilter(&mut self) {
-        let q = self.input.value().trim().to_lowercase();
-        self.shown = (0..self.choices.len())
-            .filter(|&i| q.is_empty() || self.choices[i].to_lowercase().contains(&q))
-            .collect();
-        self.list.clamp(self.shown.len());
-    }
-
-    fn chosen(&self) -> Option<&str> {
-        self.list
-            .selected()
-            .and_then(|i| self.shown.get(i))
-            .map(|&i| self.choices[i].as_str())
-    }
-
-    /// The colour the prompt would apply now: what was typed when that names
-    /// one, else the highlighted row. `Some(None)` is "no colour".
-    fn color(&self) -> Option<Option<Color>> {
-        let typed = self.input.value().trim();
-        if let Ok(c) = typed.parse::<Color>() {
-            return Some(Some(c));
-        }
-        match self.chosen() {
-            Some(NO_COLOR) => Some(None),
-            Some(name) => name.parse::<Color>().ok().map(Some),
-            None => None,
-        }
-    }
-
-    /// The text written to the config for `color()`, as typed or as listed.
-    fn color_text(&self) -> Option<Option<String>> {
-        let typed = self.input.value().trim();
-        if typed.parse::<Color>().is_ok() {
-            return Some(Some(typed.to_string()));
-        }
-        match self.chosen() {
-            Some(NO_COLOR) => Some(None),
-            Some(name) => Some(Some(name.to_string())),
-            None => None,
-        }
-    }
 }
 
 impl TagsView {
-    /// Whether keys typed now belong to a text field on this page. The app
-    /// routes digits, `/`, `?` and Tab to itself unless the search page's
-    /// field has focus, so `app.rs` needs to consult this too before a hex
-    /// colour with a 1 to 5 in it can be typed here; until it does, nothing
-    /// calls it.
+    /// Route pasted text to the same control that currently owns keyboard input.
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
         if self.filter.editing {
             let actions = self.filter.paste(text);
@@ -191,14 +61,7 @@ impl TagsView {
         let Some(prompt) = self.prompt.as_mut() else {
             return vec![];
         };
-        match prompt.input.paste(text) {
-            Ok(true) => {
-                prompt.refilter();
-                vec![]
-            }
-            Ok(false) => vec![],
-            Err(error) => vec![Action::Error(error.into())],
-        }
+        prompt.paste(text)
     }
 
     pub fn input_focused(&self) -> bool {
@@ -270,10 +133,20 @@ impl TagsView {
         }))]
     }
 
+    fn ensure_skill_search(&mut self, ctx: &Ctx) {
+        if self.skill_search.is_none() {
+            let focused = self.focus_grid;
+            self.search_members(ctx);
+            self.skill_search.as_mut().unwrap().focus_list();
+            self.focus_grid = focused;
+        }
+    }
+
     fn search_members(&mut self, ctx: &Ctx) {
         self.skill_search = Some(super::search::SearchView::panel(
             self.members.clone(),
             format!("Tag: {}", self.selected_tag().unwrap_or("none")),
+            LayoutScope::Tags,
             ctx,
         ));
         self.skill_search.as_mut().unwrap().hide_tags = true;
@@ -292,19 +165,6 @@ impl TagsView {
         self.selected_tag()
             .filter(|t| *t != UNTAGGED)
             .map(str::to_string)
-    }
-
-    fn select_skills(&mut self, checked: Option<String>, ctx: &Ctx) -> Vec<Action> {
-        self.search_members(ctx);
-        self.skill_search.as_mut().unwrap().start_multi(checked);
-        vec![]
-    }
-
-    fn selected_member(&self) -> Option<String> {
-        self.grid
-            .selected()
-            .and_then(|i| self.members.get(i))
-            .cloned()
     }
 
     /// Recompute the right pane for the tag under the cursor. Called after
@@ -327,19 +187,10 @@ impl TagsView {
                 .collect(),
             None => Vec::new(),
         };
-        if old_members != self.members {
+        if old_members != self.members || self.members_tag != tag {
             self.skill_search = None;
         }
-        self.grid.clamp(self.members.len());
-    }
-
-    /// Reading a skill must not cost the place on this page, so it opens in a
-    /// window over it rather than by jumping to the search tab.
-    fn open_member(&mut self) -> Vec<Action> {
-        if let Some(k) = self.selected_member() {
-            self.preview.open(k);
-        }
-        vec![]
+        self.members_tag = tag;
     }
 
     fn ask_merge(&mut self) -> Vec<Action> {
@@ -355,17 +206,21 @@ impl TagsView {
         if others.is_empty() {
             return vec![Action::Error("no other tag to merge into".into())];
         }
-        self.prompt = Some(Prompt::new(Ask::Merge, &tag, others));
+        self.prompt = Some(Prompt::for_merge(&tag, others));
         vec![]
     }
 
-    fn ask_color(&mut self) -> Vec<Action> {
+    fn ask_color(&mut self, ctx: &Ctx) -> Vec<Action> {
         let Some(tag) = self.actionable_tag() else {
             return vec![];
         };
-        let mut choices: Vec<String> = PALETTE.iter().map(|c| c.to_string()).collect();
-        choices.push(NO_COLOR.into());
-        self.prompt = Some(Prompt::new(Ask::Color, &tag, choices));
+        let config = &ctx.ws.config;
+        let current = config
+            .tags
+            .iter()
+            .find(|t| t.name == tag)
+            .and_then(|t| t.color.as_deref());
+        self.prompt = Some(Prompt::for_color(&tag, current, &ctx.settings.theme));
         vec![]
     }
 
@@ -374,8 +229,8 @@ impl TagsView {
         let Some(p) = self.prompt.as_ref() else {
             return vec![];
         };
-        let tag = p.tag.clone();
-        match p.ask {
+        let tag = p.name().to_string();
+        match p.kind() {
             Ask::Merge => {
                 let Some(into) = p.chosen().map(str::to_string) else {
                     return vec![Action::Error("pick a tag to merge into".into())];
@@ -392,12 +247,11 @@ impl TagsView {
                 let Some(color) = p.color_text() else {
                     return vec![Action::Error(format!(
                         "{:?} is not a colour: use a name or #rrggbb",
-                        p.input.value().trim()
+                        p.value().trim()
                     ))];
                 };
                 self.prompt = None;
-                // Not a history step: the log knows tags on skills, not the
-                // config, and a colour is cheap to set back by hand.
+                // Tag colour changes are not recorded in session undo.
                 vec![Action::Write(Box::new(move |ws| {
                     Config::set_tag_color(&ws.root, &tag, color.as_deref())?;
                     Ok(match color {
@@ -410,59 +264,25 @@ impl TagsView {
     }
 
     fn prompt_key(&mut self, k: KeyEvent) -> Vec<Action> {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let Some(p) = self.prompt.as_mut() else {
-            return vec![];
-        };
-        match k.code {
-            KeyCode::Esc => {
-                self.prompt = None;
-            }
-            KeyCode::Enter => return self.submit_prompt(),
-            KeyCode::Down => p.list.move_by(1, p.shown.len()),
-            KeyCode::Up => p.list.move_by(-1, p.shown.len()),
-            KeyCode::Char('n') if ctrl => p.list.move_by(1, p.shown.len()),
-            KeyCode::Char('p') if ctrl => p.list.move_by(-1, p.shown.len()),
-            KeyCode::PageUp => p.list.first(p.shown.len()),
-            KeyCode::PageDown => p.list.last(p.shown.len()),
-            _ => {
-                if p.input.handle_key(k) {
-                    p.refilter();
-                }
-            }
+        match self.prompt.as_mut().and_then(|p| p.key(k)) {
+            Some(true) => return self.submit_prompt(),
+            Some(false) => self.prompt = None,
+            None => {}
         }
         vec![]
     }
 
-    /// Mouse while the prompt is up: a click outside closes it, a click on a
-    /// row picks it, and anything else stays with the prompt so the page does
-    /// not react to a click it cannot see.
     fn prompt_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
-        let Some(p) = self.prompt.as_mut() else {
-            return vec![];
-        };
-        let at = (m.column, m.row).into();
-        match m.kind {
-            MouseEventKind::ScrollDown => p.list.move_by(1, p.shown.len()),
-            MouseEventKind::ScrollUp => p.list.move_by(-1, p.shown.len()),
-            MouseEventKind::Down(MouseButton::Left) if !p.rect.contains(at) => {
-                self.prompt = None;
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, double)) = p.list.click(m.row, p.shown.len())
-                    && double
-                {
-                    return self.submit_prompt();
-                }
-                p.input.click(m.column);
-            }
-            _ => {}
+        match self.prompt.as_mut().and_then(|p| p.mouse(m)) {
+            Some(true) => return self.submit_prompt(),
+            Some(false) => self.prompt = None,
+            None => {}
         }
         vec![]
     }
 
     fn draw_tags(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let focused = !self.focus_grid && self.prompt.is_none();
         let block = th.block(" tags ", focused);
         let inner = block.inner(area);
@@ -471,274 +291,63 @@ impl TagsView {
             width: inner.width.saturating_sub(1),
             ..inner
         };
-        self.list.layout(content, 1, 1, 0, self.rows.len());
+        let descriptions: Vec<_> = self
+            .rows
+            .iter()
+            .map(|(tag, _)| {
+                ctx.ws
+                    .config
+                    .tags
+                    .iter()
+                    .find(|t| &t.name == tag)
+                    .and_then(|t| t.description.as_deref())
+            })
+            .collect();
+        self.list.layout_heights(
+            content,
+            descriptions
+                .iter()
+                .map(|description| group::card_height(*description))
+                .collect(),
+        );
         let selected = self.list.selected();
-        let w = content.width as usize;
         for i in self.list.visible() {
             let Some(cell) = self.list.cell(i) else {
                 continue;
             };
             let (tag, count) = &self.rows[i];
             let on = selected == Some(i);
-            let count = count.to_string();
-            let count_w = width(&count).max(3);
-            // The count sits at the right edge; whatever is left after the
-            // marker and the count goes to the name and the description.
-            let body_w = w.saturating_sub(2 + count_w + 1);
-            let mut spans = vec![Span::styled(if on { "▸ " } else { "  " }, th.accent())];
-            let mut used = 0;
-            if tag == UNTAGGED {
-                let s = fit(UNTAGGED, body_w);
-                used += width(&s);
-                spans.push(Span::raw(s));
+            let inner = if cell.height < 3 {
+                cell
             } else {
-                let marker = fit("● ", body_w);
-                used += width(&marker);
-                spans.push(Span::styled(
-                    marker,
-                    Style::default().fg(tag_fill(tag, ctx)),
-                ));
-                let name = fit(tag, body_w.saturating_sub(used));
-                used += width(&name);
-                spans.push(Span::raw(name));
-                let desc = ctx
-                    .ws
-                    .config
-                    .tags
-                    .iter()
-                    .find(|t| &t.name == tag)
-                    .and_then(|t| t.description.as_deref())
-                    .unwrap_or("");
-                if !desc.is_empty() && used + 3 < body_w {
-                    let d = fit(desc, body_w - used - 2);
-                    used += width(&d) + 2;
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled(d, th.dim()));
-                }
-            }
-            spans.push(Span::raw(" ".repeat(body_w.saturating_sub(used) + 1)));
-            spans.push(Span::raw(pad(&count, count_w)));
-            let style = if on && focused {
-                th.selected()
-            } else if on {
-                th.selected_unfocused()
-            } else {
-                Style::default()
+                frame(f, cell, on, focused && !self.filter.editing, th)
             };
-            f.render_widget(Paragraph::new(Line::from(spans)).style(style), cell);
-        }
-        draw_track(f, inner, &self.list, selected, &mut self.list_track, th);
-    }
-
-    fn draw_members(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
-        let focused = self.focus_grid && self.prompt.is_none();
-        let Some(tag) = self.selected_tag().map(str::to_string) else {
-            let block = th.block(" skills ", focused);
-            f.render_widget(block, area);
-            self.grid_track.clear();
-            return;
-        };
-        let count = match self.members.len() {
-            1 => "1 skill".to_string(),
-            n => format!("{n} skills"),
-        };
-        let mut title = vec![Span::raw(" ")];
-        if tag == UNTAGGED {
-            title.push(Span::styled("untagged", th.bold()));
-        } else {
-            title.push(Span::raw("tagged "));
-            title.extend(cards::pill(format!(" {tag} "), tag_fill(&tag, ctx), ctx));
-        }
-        title.push(Span::styled(format!(" · {count} "), th.dim()));
-        let block = th.block(Line::from(title), focused);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let content = Rect {
-            width: inner.width.saturating_sub(1),
-            ..inner
-        };
-        let cols = cols_for(content.width);
-        self.grid.layout(
-            content,
-            cols,
-            CARD_H,
-            if cols > 1 { 1 } else { 0 },
-            self.members.len(),
-        );
-        if self.members.is_empty() {
-            let text = if tag == UNTAGGED {
-                "every skill has a tag"
-            } else {
-                "no skill carries this tag"
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(text, th.dim())),
-                Rect {
-                    height: 1,
-                    ..content
-                },
+            let lines = group::group_card(
+                tag,
+                *count,
+                descriptions[i],
+                tag_fill(tag, ctx),
+                inner.width as usize,
+                th,
             );
-            self.grid_track.clear();
-            return;
+            f.render_widget(Paragraph::new(lines), inner);
         }
-        let selected = self.grid.selected();
-        for i in self.grid.visible() {
-            let (Some(cell), Some(r)) = (self.grid.cell(i), ctx.snap.get(&self.members[i])) else {
-                continue;
-            };
-            let on = selected == Some(i);
-            let ci = frame(f, cell, on, focused, th);
-            let tail = r
-                .source
-                .as_ref()
-                .map(|s| s.kind().to_string())
-                .unwrap_or_default();
-            let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[], false);
-            f.render_widget(Paragraph::new(lines), ci);
-        }
-        draw_track(f, inner, &self.grid, selected, &mut self.grid_track, th);
+        group::draw_track(f, inner, &self.list, selected, &mut self.list_track, th);
     }
 
     fn draw_prompt(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
-        let Some(p) = self.prompt.as_mut() else {
-            return;
-        };
-        let (title, placeholder) = match p.ask {
-            Ask::Merge => (format!(" merge {} into ", p.tag), "type to filter…"),
-            Ask::Color => (format!(" colour of {} ", p.tag), "a name, or #rrggbb"),
-        };
-        // Room for the field, a swatch line, the rows, and the frame.
-        let want = p.shown.len() as u16 + 6;
-        let w = 56.min(area.width.saturating_sub(2)).max(1);
-        let h = want.clamp(8, area.height.saturating_sub(2)).max(1);
-        let rect = Rect::new(
-            area.x + (area.width - w) / 2,
-            area.y + (area.height - h) / 2,
-            w,
-            h,
-        );
-        p.rect = rect;
-        f.render_widget(Clear, rect);
-        let block = th.block(title, true);
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        let field = Rect {
-            x: inner.x + 1,
-            width: inner.width.saturating_sub(2),
-            height: 1,
-            ..inner
-        };
-        p.input.render(f, field, true, placeholder, th);
-        // The swatch shows the pill as it would look, which is the only way
-        // to judge a colour, and says so when the text is not one.
-        let swatch = Rect {
-            y: inner.y + 1,
-            height: 1,
-            ..field
-        };
-        let mut preview = vec![Span::raw("  ")];
-        match p.ask {
-            Ask::Merge => {
-                preview.extend(cards::pill(
-                    format!(" {} ", p.tag),
-                    tag_fill(&p.tag, ctx),
-                    ctx,
-                ));
-                preview.push(Span::styled(" → ", th.dim()));
-                match p.chosen() {
-                    Some(into) => {
-                        preview.extend(cards::pill(format!(" {into} "), tag_fill(into, ctx), ctx))
-                    }
-                    None => preview.push(Span::styled("nothing matches", th.dim())),
-                }
-            }
-            Ask::Color => match p.color() {
-                Some(Some(c)) => preview.extend(cards::pill(format!(" {} ", p.tag), c, ctx)),
-                Some(None) => preview.extend(cards::pill(format!(" {} ", p.tag), th.tag, ctx)),
-                None => preview.push(Span::styled("not a colour", th.warn())),
-            },
+        if let Some(p) = self.prompt.as_mut() {
+            p.draw(f, area, ctx);
         }
-        f.render_widget(Paragraph::new(Line::from(preview)), swatch);
-        let list_area = Rect {
-            y: inner.y + 3,
-            height: inner.height.saturating_sub(3),
-            ..inner
-        };
-        p.list.rows = list_area;
-        let rows: Vec<ListItem> = p
-            .shown
-            .iter()
-            .map(|&i| {
-                let name = &p.choices[i];
-                let spans = match p.ask {
-                    Ask::Merge => cards::pill(format!(" {name} "), tag_fill(name, ctx), ctx),
-                    Ask::Color if name == NO_COLOR => {
-                        vec![Span::styled("none — the default", th.dim())]
-                    }
-                    Ask::Color => {
-                        let fill = name.parse::<Color>().unwrap_or(th.tag);
-                        let mut s = cards::pill(format!(" {} ", p.tag), fill, ctx);
-                        s.push(Span::styled(format!("  {name}"), th.dim()));
-                        s
-                    }
-                };
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
-        f.render_stateful_widget(
-            List::new(rows)
-                .highlight_style(th.selected())
-                .highlight_symbol("▸ "),
-            list_area,
-            &mut p.list.state,
-        );
-        if p.shown.is_empty() {
-            f.render_widget(
-                Paragraph::new(Span::styled("nothing matches", th.dim())),
-                list_area,
-            );
-        }
-    }
-}
-
-/// The scrollbar for a grid, in grid rows, drawn only once there is something
-/// to scroll to.
-fn draw_track(
-    f: &mut Frame,
-    inner: Rect,
-    grid: &CardGrid,
-    selected: Option<usize>,
-    track: &mut ScrollTrack,
-    th: &crate::tui::theme::Theme,
-) {
-    let vis = grid.visible_rows();
-    if grid.grid_rows() > vis && inner.height > 0 {
-        let rect = Rect {
-            x: inner.right().saturating_sub(1),
-            y: inner.y,
-            width: 1,
-            height: inner.height,
-        };
-        track.set(rect);
-        let mut sb = ScrollbarState::new(grid.grid_rows())
-            .position(selected.unwrap_or(0) / grid.cols())
-            .viewport_content_length(vis);
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .style(th.dim()),
-            rect,
-            &mut sb,
-        );
-    } else {
-        track.clear();
     }
 }
 
 impl View for TagsView {
+    fn status(&self, ctx: &Ctx) -> String {
+        self.skill_search
+            .as_ref()
+            .map_or_else(String::new, |v| v.status(ctx))
+    }
     fn refresh(&mut self, ctx: &Ctx) {
         let selected = self.selected_tag().map(str::to_owned);
         let panel = self.skill_search.take();
@@ -769,13 +378,10 @@ impl View for TagsView {
             view.update_panel(self.members.clone(), ctx);
             self.skill_search = Some(view);
         }
-        self.fresh = ctx.ws.load_config().ok().map(|config| Workspace {
-            config,
-            ..ctx.ws.clone()
-        });
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        self.ensure_skill_search(ctx);
         if self.prompt.is_some() {
             return self.prompt_key(k);
         }
@@ -801,76 +407,8 @@ impl View for TagsView {
             self.refilter(ctx);
             return vec![];
         }
-        if self.focus_grid && matches!(k.code, KeyCode::Char('/' | 'm')) {
-            self.search_members(ctx);
-            let view = self.skill_search.as_mut().unwrap();
-            if k.code == KeyCode::Char('m') {
-                view.focus_list();
-                return view.handle_key(k, ctx);
-            }
-            return vec![];
-        }
-        if self.preview.handle_key(k) {
-            return vec![];
-        }
         let n = self.rows.len();
         let m = self.members.len();
-        if self.focus_grid {
-            return match k.code {
-                KeyCode::Char('m') => self.select_skills(None, ctx),
-                KeyCode::Esc | KeyCode::Char('h') => {
-                    self.focus_grid = false;
-                    vec![]
-                }
-                // Along a row while there is a row; off the left edge is back
-                // to the tag list, which is where the eye goes anyway.
-                KeyCode::Left => {
-                    if self
-                        .grid
-                        .selected()
-                        .unwrap_or(0)
-                        .is_multiple_of(self.grid.cols())
-                    {
-                        self.focus_grid = false;
-                    } else {
-                        self.grid.move_by(-1, m);
-                    }
-                    vec![]
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    self.grid.move_by(1, m);
-                    vec![]
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.grid.move_rows(1, m);
-                    vec![]
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.grid.move_rows(-1, m);
-                    vec![]
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    self.grid.first(m);
-                    vec![]
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    self.grid.last(m);
-                    vec![]
-                }
-                KeyCode::Char('a') => self.add_members(ctx),
-                KeyCode::Char('x') | KeyCode::Delete => {
-                    self.remove_members(self.selected_member().into_iter().collect())
-                }
-                KeyCode::Enter => self.open_member(),
-                // Fixing one skill's tags from here saves a trip to search,
-                // which is where the same key lives.
-                KeyCode::Char('t') => match self.selected_member().and_then(|k| ctx.snap.get(&k)) {
-                    Some(r) => vec![Action::OpenModal(Box::new(Modal::tags(&r.key, &r.tags)))],
-                    None => vec![],
-                },
-                _ => vec![],
-            };
-        }
         match k.code {
             KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
             // Esc means "back" everywhere else in the program, so here it goes
@@ -882,6 +420,10 @@ impl View for TagsView {
                 vec![]
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                if self.list.selected().unwrap_or(0) == 0 {
+                    self.filter.editing = true;
+                    return vec![];
+                }
                 self.list.move_by(-1, n);
                 self.sync_members(ctx.snap);
                 vec![]
@@ -899,7 +441,6 @@ impl View for TagsView {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if m > 0 {
                     self.focus_grid = true;
-                    self.grid.clamp(m);
                 }
                 vec![]
             }
@@ -926,7 +467,7 @@ impl View for TagsView {
                 }
                 None => vec![],
             },
-            KeyCode::Char('C') => self.ask_color(),
+            KeyCode::Char('C') => self.ask_color(ctx),
             KeyCode::Char('D' | 'x') | KeyCode::Delete => match self.actionable_tag() {
                 Some(t) => vec![Action::OpenModal(Box::new(Modal::delete_tag(&t)))],
                 None => vec![],
@@ -939,85 +480,45 @@ impl View for TagsView {
         if self.prompt.is_some() {
             return self.prompt_mouse(m);
         }
-        if self.preview.handle_mouse(m) {
-            return vec![];
-        }
+        self.ensure_skill_search(ctx);
         let at = (m.column, m.row).into();
-        if m.kind == MouseEventKind::Down(MouseButton::Left) && self.filter.rect.contains(at) {
+        let pressing = m.kind == MouseEventKind::Down(MouseButton::Left);
+        let dragging = m.kind == MouseEventKind::Drag(MouseButton::Left);
+        if pressing && self.filter.rect.contains(at) {
             self.focus_grid = false;
             self.filter.editing = true;
             return vec![];
         }
-        if self.right.contains(at)
-            && let Some(view) = self.skill_search.as_mut()
-        {
+        if self.right.contains(at) {
             self.focus_grid = true;
-            return view.handle_mouse(m, ctx);
+            self.filter.editing = false;
+            return self.skill_search.as_mut().unwrap().handle_mouse(m, ctx);
         }
-        if let Some(d) = wheel(&m) {
+        if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
                 self.list.move_by(d.signum(), self.rows.len());
                 self.sync_members(ctx.snap);
-            } else if self.right.contains(at) {
-                self.grid.move_rows(d.signum(), self.members.len());
             }
             return vec![];
         }
-        let pressing = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
-        let dragging = matches!(m.kind, MouseEventKind::Drag(MouseButton::Left));
-        // The tracks sit inside the panes, so they get first refusal.
-        let pane = if pressing && self.list_track.hit(m.column, m.row) {
-            Some(Pane::List)
-        } else if pressing && self.grid_track.hit(m.column, m.row) {
-            Some(Pane::Grid)
-        } else if dragging {
-            self.drag
-        } else {
-            None
-        };
-        if let Some(pane) = pane {
-            self.drag = Some(pane);
-            match pane {
-                Pane::List => {
-                    self.focus_grid = false;
-                    if let Some(r) = self.list_track.index_at(m.row, self.list.grid_rows()) {
-                        self.list.select_row(r);
-                        self.sync_members(ctx.snap);
-                    }
-                }
-                Pane::Grid => {
-                    self.focus_grid = true;
-                    if let Some(r) = self.grid_track.index_at(m.row, self.grid.grid_rows()) {
-                        self.grid.select_row(r);
-                    }
-                }
+        if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.list_drag) {
+            self.list_drag = true;
+            self.focus_grid = false;
+            if let Some(row) = self.list_track.index_at(m.row, self.list.grid_rows()) {
+                self.list.select_row(row);
+                self.sync_members(ctx.snap);
             }
             return vec![];
         }
         if !dragging {
-            self.drag = None;
+            self.list_drag = false;
         }
-        if pressing {
-            if self.left.contains(at) {
-                self.focus_grid = false;
-                if let Some((_, double)) = self.list.click(m.column, m.row) {
-                    self.sync_members(ctx.snap);
-                    if double && !self.members.is_empty() {
-                        self.focus_grid = true;
-                    }
-                }
-            } else if self.right.contains(at)
-                && let Some((index, double)) = self.grid.click(m.column, m.row)
-            {
-                self.focus_grid = true;
-                if self.grid.cell(index).is_some_and(|cell| {
-                    m.row == cell.y + 1
-                        && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16).contains(&m.column)
-                }) {
-                    return self.select_skills(self.selected_member(), ctx);
-                }
-                if double {
-                    return self.open_member();
+        if pressing && self.left.contains(at) {
+            self.focus_grid = false;
+            if let Some((_, double)) = self.list.click(m.column, m.row) {
+                self.sync_members(ctx.snap);
+                if double && !self.members.is_empty() {
+                    self.focus_grid = true;
                 }
             }
         }
@@ -1025,44 +526,29 @@ impl View for TagsView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let (left, right) = split_panes(area, 38);
+        self.ensure_skill_search(ctx);
+        let (left, right) = split_panes(area, 38, ctx);
         self.left = left;
         self.right = right;
-        // Draw with the config as it is on disk, so a pill shows its colour
-        // the moment it is set. The reloaded workspace is taken out of `self`
-        // for the duration, since a borrow of it would lock the rest.
-        let fresh = self.fresh.take();
-        let ctx = &Ctx {
-            ws: fresh.as_ref().unwrap_or(ctx.ws),
-            snap: ctx.snap,
-            theme: ctx.theme,
-        };
         let content = self.filter.draw(f, left, "Filter tags", ctx);
         self.draw_tags(f, content, ctx);
         if let Some(view) = self.skill_search.as_mut() {
             view.set_panel_active(self.focus_grid);
             view.draw(f, right, ctx);
-        } else {
-            self.draw_members(f, right, ctx);
         }
-        self.preview.draw(f, area, ctx);
         self.draw_prompt(f, area, ctx);
-        self.fresh = fresh;
     }
 
     fn hints(&self) -> Hints {
         if self.filter.editing {
-            return &[("Enter/↓", "tags"), ("Esc", "finish filter")];
+            return &[("Enter/↓", "tags"), ("Esc", "clear filter")];
         }
         if self.focus_grid
             && let Some(view) = self.skill_search.as_ref()
         {
             return view.hints();
         }
-        if let Some(hints) = self.preview.hints() {
-            return hints;
-        }
-        match self.prompt.as_ref().map(|p| p.ask) {
+        match self.prompt.as_ref().map(Prompt::kind) {
             Some(Ask::Merge) => &[("↑/↓", "target"), ("Enter", "merge"), ("Esc", "cancel")],
             Some(Ask::Color) => &[
                 ("type", "a name or #rrggbb"),
@@ -1090,6 +576,76 @@ impl View for TagsView {
                 ("Enter/→", "skills"),
                 ("q", "library"),
             ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use skills::config::TagConfig;
+
+    #[test]
+    fn tags_draw_and_edit_from_the_supplied_configuration_snapshot() {
+        let tmp = skills::ops::DownloadDir::new("tags-config-snapshot").unwrap();
+        Config {
+            agents: vec![],
+            tags: vec![TagConfig {
+                name: "sample".into(),
+                skills: vec![],
+                color: Some("blue".into()),
+                description: Some("Original description".into()),
+            }],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let mut ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+
+        // A page must not silently acquire newer settings than other pages.
+        Config::edit_tags(&ws.root, |tags| {
+            tags[0].color = Some("green".into());
+            tags[0].description = Some("Updated description".into());
+        })
+        .unwrap();
+        let mut view = TagsView::default();
+        for (expected_color, expected_description) in [
+            ("blue", "Original description"),
+            ("green", "Updated description"),
+        ] {
+            if expected_color == "green" {
+                ws.config = ws.load_config().unwrap();
+            }
+            let ctx = Ctx {
+                ws: &ws,
+                snap: &snap,
+                settings: &{
+                    let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                    settings.theme = theme;
+                    settings
+                },
+            };
+            view.refresh(&ctx);
+            view.select("sample", &snap);
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+            term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            let text: String = term
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(expected_description));
+            view.ask_color(&ctx);
+            assert_eq!(
+                view.prompt.as_ref().unwrap().color_text(),
+                Some(Some(expected_color.into()))
+            );
+            view.prompt = None;
         }
     }
 }

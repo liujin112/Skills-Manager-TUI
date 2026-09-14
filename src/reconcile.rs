@@ -103,7 +103,10 @@ pub struct SkillRecord {
 
 impl SkillRecord {
     pub fn source_kind(&self) -> &'static str {
-        if matches!(self.source, Some(crate::meta::Source::Git { .. }))
+        if self
+            .source
+            .as_ref()
+            .is_some_and(crate::meta::Source::is_remote)
             || crate::repository::alias_of(&self.key).is_some()
         {
             "repository"
@@ -482,8 +485,9 @@ fn scan_inventory(
         }
     }
 
-    let tag_config = Config::load(root)?;
-    let mut references: Vec<String> = tag_config
+    // The caller supplies one validated configuration snapshot, including any
+    // explicit scope overrides. Do not mix its options with a second file read.
+    let mut references: Vec<String> = config
         .tags
         .iter()
         .filter(|_| config.tags_enabled)
@@ -521,7 +525,10 @@ fn scan_inventory(
     for rec in records.values_mut() {
         if rec.status == SkillStatus::MissingSource
             && crate::repository::alias_of(&rec.key).is_none()
-            && !matches!(rec.source, Some(crate::meta::Source::Git { .. }))
+            && !rec
+                .source
+                .as_ref()
+                .is_some_and(crate::meta::Source::is_remote)
         {
             rec.status = SkillStatus::Local;
         }
@@ -529,7 +536,7 @@ fn scan_inventory(
 
     for rec in records.values_mut() {
         rec.tags = if config.tags_enabled {
-            tag_config.skill_tags(&rec.key)
+            config.skill_tags(&rec.key)
         } else {
             Vec::new()
         };
@@ -542,7 +549,9 @@ fn scan_inventory(
             .values()
             .filter(|r| {
                 r.status == SkillStatus::MissingSource
-                    && matches!(r.source, Some(crate::meta::Source::Git { .. }))
+                    && r.source
+                        .as_ref()
+                        .is_some_and(crate::meta::Source::is_remote)
                     && r.baseline_hash.is_some()
             })
             .map(|r| r.path.clone())
@@ -551,7 +560,9 @@ fn scan_inventory(
     }
     for rec in records.values_mut().filter(|r| {
         r.status == SkillStatus::MissingSource
-            && matches!(r.source, Some(crate::meta::Source::Git { .. }))
+            && r.source
+                .as_ref()
+                .is_some_and(crate::meta::Source::is_remote)
     }) {
         if verify_content && rec.baseline_hash.is_some() {
             rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
@@ -922,6 +933,58 @@ mod scan_cost_tests {
         );
         assert_eq!(snap.get("two").unwrap().status, SkillStatus::Local);
         assert!(snap.skills.iter().all(|r| r.current_hash.is_none()));
+    }
+
+    #[test]
+    fn archive_skills_track_modifications_notes_and_accepted_baselines() {
+        let temp = crate::ops::DownloadDir::new("archive-scan").unwrap();
+        let mut ws = crate::Workspace::open(temp.path()).unwrap();
+        ws.config.agents.clear();
+        let key = "repos/archive/one";
+        let path = skill(&ws.root, key);
+        ws.meta
+            .save(
+                key,
+                &SkillMeta {
+                    source: Some(crate::meta::Source::Archive {
+                        url: "https://example.com/skills.tar.gz".into(),
+                        subpath: Some("one".into()),
+                        revision: Some("sha256:archive-version".into()),
+                    }),
+                    baseline: Some(Baseline {
+                        hash: hash_directory(&path).unwrap(),
+                        hash_algo: crate::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snapshot = ws.scan().unwrap();
+        let record = snapshot.get(key).unwrap();
+        assert_eq!(record.source_kind(), "repository");
+        assert_eq!(record.status, SkillStatus::Repository);
+        std::fs::write(path.join("script.py"), "print('local change')").unwrap();
+        assert_eq!(
+            ws.scan().unwrap().get(key).unwrap().status,
+            SkillStatus::Modified
+        );
+        crate::ops::edit::note_set(&ws, key, Some("review before update")).unwrap();
+        crate::ops::edit::accept(&ws, key).unwrap();
+        let snapshot = ws.scan().unwrap();
+        let record = snapshot.get(key).unwrap();
+        assert_eq!(record.status, SkillStatus::Repository);
+        assert_eq!(record.note.as_deref(), Some("review before update"));
+        assert_eq!(
+            record.source.as_ref().unwrap().revision(),
+            Some("sha256:archive-version")
+        );
+        let mut meta = ws.meta.load(key).unwrap().unwrap();
+        meta.baseline = None;
+        ws.meta.save(key, &meta).unwrap();
+        assert_eq!(
+            ws.scan().unwrap().get(key).unwrap().status,
+            SkillStatus::MissingBaseline
+        );
     }
 
     #[test]

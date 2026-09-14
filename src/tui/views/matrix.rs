@@ -1,10 +1,8 @@
 //! The preset × agent table, as a window over a page.
 //!
-//! The Presets page defines what a preset holds and the Agents page switches
-//! presets for one agent at a time; neither shows the whole picture at once.
-//! This table does, in one row per preset, and each cell is the same switch
-//! the pills are. It is a window rather than a tab because it adds nothing to
-//! define or configure — it only lets the switches be seen and thrown together.
+//! Rows are presets and columns are agents. Cell and row actions apply preset
+//! membership to the selected destinations using the same deployment planners
+//! as the Agents page; coverage comes from the supplied inventory.
 
 use crate::tui::app::{Action, Ctx};
 use crate::tui::widgets::OverlayClear as Clear;
@@ -175,7 +173,7 @@ impl Matrix {
             self.rect = Rect::default();
             return;
         }
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let agents = &ctx.ws.config.agents;
         let name_w = self
             .presets
@@ -256,7 +254,7 @@ impl Matrix {
                 };
                 let mut cell = Style::default().patch(style);
                 if ri == self.row && ci == self.col {
-                    cell = cell.bg(th.selection_bg).add_modifier(Modifier::BOLD);
+                    cell = cell.patch(th.selected());
                 }
                 let x =
                     inner.x + name_w as u16 + 2 + ((ci - cols.start) as u16) * (col_w as u16 + 2);
@@ -328,7 +326,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut matrix = Matrix {
             open: true,

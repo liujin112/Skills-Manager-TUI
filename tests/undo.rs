@@ -2,7 +2,7 @@
 //! tree that may have moved on in between.
 
 use skills::Workspace;
-use skills::config::{AgentConfig, Config, DeployConfig};
+use skills::config::{AgentConfig, Config};
 use skills::history::{self, History, Plan};
 use skills::meta::{Baseline, SkillMeta, Source};
 use skills::ops::install::InstallRef;
@@ -30,10 +30,6 @@ impl Fixture {
                 name: "Agent A".into(),
                 skills_dir: base.join("agent-a").display().to_string(),
             }],
-            deploy: DeployConfig {
-                all_to_all: false,
-                presets: vec![],
-            },
             tags: vec![],
             search: Default::default(),
             ui: Default::default(),
@@ -708,6 +704,7 @@ fn preset_case_only_rename_preserves_contents_references_and_history() {
     config_by_hand(&fx);
     let ws = fx.ws();
     let original = Preset {
+        color: Some("#b87e54".into()),
         name: "commute".into(),
         description: Some("Daily tools".into()),
         skills: vec!["bicycle".into()],
@@ -729,7 +726,6 @@ fn preset_case_only_rename_preserves_contents_references_and_history() {
             ..original.clone()
         };
         assert_eq!(ws.presets.list().unwrap(), vec![expected]);
-        assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, vec![name]);
         if name == "commute" {
             step(&ws, &mut log, false);
         } else {
@@ -769,7 +765,7 @@ fn tag_case_only_rename_preserves_style_members_and_history() {
 }
 
 #[test]
-fn renaming_a_preset_goes_back_and_forth_with_its_auto_deploy_entry() {
+fn renaming_a_preset_leaves_legacy_deploy_config_untouched() {
     let fx = Fixture::new("preset-rename");
     config_by_hand(&fx);
     let ws = fx.ws();
@@ -782,44 +778,34 @@ fn renaming_a_preset_goes_back_and_forth_with_its_auto_deploy_entry() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(ws.config.deploy.presets, ["commute"]);
 
     let (message, intent) = history::preset_rename(&ws, "commute", "errands").unwrap();
-    assert_eq!(
-        message,
-        "renamed preset commute to errands, config.toml too"
-    );
+    assert_eq!(message, "renamed preset commute to errands");
     log.record(intent.unwrap());
     let moved = ws.presets.load("errands").unwrap().unwrap();
     assert_eq!(moved.name, "errands", "the name inside the file moved too");
     assert_eq!(moved.description.as_deref(), Some("rides to work"));
     assert_eq!(moved.skills, ["bicycle"]);
     assert!(ws.presets.load("commute").unwrap().is_none());
-    assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, ["errands"]);
     let text = std::fs::read_to_string(Config::path(&fx.root)).unwrap();
     assert!(
-        text.contains("# the everyday set\npresets = [\"errands\"] # goes first"),
-        "only the name changed; the comments around it stay: {text}"
+        text.contains("# the everyday set\npresets = [\"commute\"] # goes first"),
+        "legacy deployment config is ignored and remains unchanged: {text}"
     );
 
     // Back: the file and the config entry both return to the old name.
     let message = step(&ws, &mut log, true);
-    assert_eq!(
-        message,
-        "renamed preset errands to commute, config.toml too"
-    );
+    assert_eq!(message, "renamed preset errands to commute");
     assert_eq!(
         ws.presets.load("commute").unwrap().unwrap().skills,
         ["bicycle"]
     );
     assert!(ws.presets.load("errands").unwrap().is_none());
-    assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, ["commute"]);
 
     // And forward again.
     step(&ws, &mut log, false);
     assert!(ws.presets.load("errands").unwrap().is_some());
     assert!(ws.presets.load("commute").unwrap().is_none());
-    assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, ["errands"]);
 
     // A preset the config does not list leaves the config alone.
     let before = std::fs::read_to_string(Config::path(&fx.root)).unwrap();

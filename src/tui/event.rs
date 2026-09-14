@@ -29,9 +29,8 @@ pub enum Task {
     PollRoot,
     Check(Vec<String>),
     Prepare(String),
-    /// Fetch a skill from a git repository or a local path into the root.
-    /// Cloning is slow enough that it cannot run on the UI thread. The subpath
-    /// stays separate because appending it to a URL would break the clone.
+    /// Fetch and install off the UI thread. Keep source URLs intact and pass
+    /// the skill's path separately so the source backend can resolve it.
     Install {
         reference: String,
         subpath: Option<String>,
@@ -133,12 +132,12 @@ pub fn spawn_input(tx: Sender<Msg>, gate: Arc<InputGate>) {
         .expect("spawn input thread");
 }
 
-pub fn spawn_ticker(tx: Sender<Msg>) {
+pub fn spawn_ticker(tx: Sender<Msg>, tick_interval: Duration) {
     std::thread::Builder::new()
         .name("ticker".into())
         .spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(tick_interval);
                 if tx.send(Msg::Tick).is_err() {
                     return;
                 }

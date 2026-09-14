@@ -3,17 +3,19 @@
 
 use super::event::{Msg, Task, TaskOutput, spawn_task};
 use super::modal::Modal;
+use super::settings::{LayoutScope, RuntimeSettings, SessionSettings};
 use super::theme::Theme;
 use super::toast::Toasts;
 use super::views::{
     View, agents::AgentsView, health::HealthView, presets::PresetsView, repos::ReposView,
     search::SearchView, tags::TagsView,
 };
-use super::widgets::{SPINNER, width};
+use super::widgets::{SPINNER, fit, width};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::Workspace;
@@ -72,6 +74,10 @@ pub type MetaFn = Box<dyn FnOnce(&Workspace) -> Result<(String, Option<history::
 
 /// Requests a view or modal hands back to the app.
 pub enum Action {
+    SetLayout {
+        scope: LayoutScope,
+        layout: skills::config::UiLayout,
+    },
     SelectAgentSkills {
         keys: Vec<String>,
         title: String,
@@ -160,13 +166,14 @@ pub enum Level {
 pub struct Ctx<'a> {
     pub ws: &'a Workspace,
     pub snap: &'a Snapshot,
-    pub theme: &'a Theme,
+    pub settings: &'a RuntimeSettings,
 }
 
 pub struct App {
     pub ws: Workspace,
     pub snap: Snapshot,
-    pub theme: Theme,
+    pub settings: RuntimeSettings,
+    session_settings: SessionSettings,
     pub tab: Tab,
     pub search: SearchView,
     pub tags: TagsView,
@@ -303,10 +310,13 @@ impl App {
         agents.discover(&local_project)?;
         let snap = ws.scan()?;
         let root_stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
+        let settings = RuntimeSettings::new(&ws.config);
         let mut app = Self {
             ws,
             snap,
-            theme: Theme::default(),
+            toasts: Toasts::new(settings.interaction),
+            settings,
+            session_settings: SessionSettings::default(),
             tab: Tab::Search,
             search: SearchView::default(),
             tags: TagsView::default(),
@@ -319,7 +329,6 @@ impl App {
             pending_task_ui: VecDeque::new(),
             batch_running: false,
             batch_modal_owned: false,
-            toasts: Toasts::default(),
             history: History::default(),
             tasks_running: 0,
             next_task_id: 0,
@@ -351,10 +360,15 @@ impl App {
     }
 
     fn on_snapshot(&mut self) {
+        self.settings
+            .reload(&self.ws.config, &self.session_settings);
+        if !self.settings.tags_enabled && self.tab == Tab::Tags {
+            self.tab = Tab::Search;
+        }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
-            theme: &self.theme,
+            settings: &self.settings,
         };
         self.search.refresh(&ctx);
         self.tags.refresh(&ctx);
@@ -420,7 +434,7 @@ impl App {
                 self.toasts.expire();
                 if self.tasks_running == 0
                     && !self.task_ui_blocked()
-                    && self.last_root_poll.elapsed() >= std::time::Duration::from_secs(2)
+                    && self.last_root_poll.elapsed() >= self.settings.interaction.root_poll_interval
                 {
                     self.last_root_poll = std::time::Instant::now();
                     self.spawn(Task::PollRoot);
@@ -476,15 +490,27 @@ impl App {
         match out {
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
-                if self.batch_modal_owned && matches!(self.modal, Some(Modal::Batch(_))) {
-                    self.modal = None;
-                }
+                let return_to = if self.batch_modal_owned
+                    && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
+                {
+                    if let Some(Modal::Batch(batch)) = self.modal.as_mut() {
+                        batch.set_busy(false);
+                    }
+                    self.modal.take().map(Box::new)
+                } else {
+                    None
+                };
                 self.batch_modal_owned = false;
                 if let Some(pending) = outcome.conflict {
                     return vec![Action::OpenModal(Box::new(Modal::DeploymentChoices(
                         Box::new(super::name_choices::NameChoices::new(pending)),
                     )))];
                 }
+                let undo_hint = if outcome.intent.is_some() {
+                    " · Ctrl+Z undo"
+                } else {
+                    ""
+                };
                 if let Some(intent) = outcome.intent {
                     self.history.record(intent);
                 }
@@ -493,14 +519,10 @@ impl App {
                 self.presets.batch_finished(&outcome.failed);
                 self.repos.batch_finished(&outcome.failed);
                 if outcome.errors.is_empty() {
-                    self.toast(outcome.message, Level::Ok);
+                    self.toast(format!("{}{undo_hint}", outcome.message), Level::Ok);
                 } else {
                     self.toast(
-                        format!(
-                            "{}; {} skills need attention",
-                            outcome.message,
-                            outcome.failed.len()
-                        ),
+                        format!("{}; errors: {}", outcome.message, outcome.errors.len()),
                         Level::Error,
                     );
                 }
@@ -508,10 +530,12 @@ impl App {
                 if outcome.errors.is_empty() {
                     vec![]
                 } else {
-                    vec![Action::OpenModal(Box::new(Modal::message(
-                        "Operation needs attention",
-                        outcome.errors,
-                    )))]
+                    vec![Action::OpenModal(Box::new(Modal::Message {
+                        title: "Operation needs attention".into(),
+                        lines: outcome.errors,
+                        scroll: 0,
+                        return_to,
+                    }))]
                 }
             }
 
@@ -519,7 +543,7 @@ impl App {
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
-                    theme: &self.theme,
+                    settings: &self.settings,
                 };
                 vec![Action::OpenModal(Box::new(Modal::Repository(Box::new(
                     super::repository_picker::RepositoryPicker::new(fetched, &ctx),
@@ -575,7 +599,7 @@ impl App {
                         &Ctx {
                             ws: &self.ws,
                             snap: &self.snap,
-                            theme: &self.theme,
+                            settings: &self.settings,
                         },
                     ))));
                     actions
@@ -616,7 +640,7 @@ impl App {
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
-                    theme: &self.theme,
+                    settings: &self.settings,
                 };
                 if self.tab == Tab::Health || results.len() > 1 {
                     self.health.on_check(&results, &ctx)
@@ -656,11 +680,11 @@ impl App {
                     &Ctx {
                         ws: &self.ws,
                         snap: &self.snap,
-                        theme: &self.theme,
+                        settings: &self.settings,
                     },
                 ))),
             ],
-            // Legacy git installs with several skills enter the shared repository picker.
+            // Multi-skill sources use the same repository picker as direct discovery.
             TaskOutput::Installed(reference, Err(e)) => {
                 match e.downcast_ref::<skills::ops::install::NotOneSkill>() {
                     Some(_) => vec![Action::Spawn(Task::DiscoverRepository(reference))],
@@ -672,14 +696,15 @@ impl App {
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
         if self.quit_prompt.is_some()
-            || (self.batch_running && matches!(self.modal, Some(Modal::Batch(_))))
+            || (self.batch_running
+                && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_))))
         {
             return vec![];
         }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
-            theme: &self.theme,
+            settings: &self.settings,
         };
         if let Some(modal) = self.modal.as_mut() {
             return modal.paste(text, &ctx);
@@ -712,19 +737,24 @@ impl App {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
         }
-        if self.batch_running && matches!(self.modal, Some(Modal::Batch(_))) {
+        if self.batch_running
+            && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
+        {
             return vec![];
         }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
-            theme: &self.theme,
+            settings: &self.settings,
         };
+        if let Some(m) = self.modal.as_mut() {
+            return m.handle_key(k, &ctx);
+        }
         if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
-            if self.modal.is_some() || (self.tab == Tab::Tags && self.tags.dialog_open()) {
+            if self.tab == Tab::Tags && self.tags.dialog_open() {
                 return vec![];
             }
-            let tabs = Tab::visible(self.ws.config.tags_enabled);
+            let tabs = Tab::visible(self.settings.tags_enabled);
             let index = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
             let delta = if k.code == KeyCode::Tab {
                 1
@@ -732,9 +762,6 @@ impl App {
                 tabs.len() - 1
             };
             return vec![Action::SwitchTab(tabs[(index + delta) % tabs.len()])];
-        }
-        if let Some(m) = self.modal.as_mut() {
-            return m.handle_key(k, &ctx);
         }
         if self.tab == Tab::Agents
             && let Some(actions) = self.agents.handle_matrix_key(k, &ctx)
@@ -752,7 +779,7 @@ impl App {
                 &Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
-                    theme: &self.theme,
+                    settings: &self.settings,
                 },
             );
         }
@@ -772,7 +799,7 @@ impl App {
                 return vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))];
             }
             (KeyCode::F(2), _) => {
-                let enabled = !self.ws.config.tags_enabled;
+                let enabled = !self.settings.tags_enabled;
                 return vec![Action::OpenModal(Box::new(Modal::confirm_write(
                     "Settings · Tags".into(),
                     vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
@@ -784,7 +811,7 @@ impl App {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
             (KeyCode::Char(c @ '1'..='6'), KeyModifiers::NONE) if !in_search_input => {
-                return Tab::visible(self.ws.config.tags_enabled)
+                return Tab::visible(self.settings.tags_enabled)
                     .get((c as u8 - b'1') as usize)
                     .map(|t| vec![Action::SwitchTab(*t)])
                     .unwrap_or_default();
@@ -814,13 +841,15 @@ impl App {
             }
             return vec![];
         }
-        if self.batch_running && matches!(self.modal, Some(Modal::Batch(_))) {
+        if self.batch_running
+            && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
+        {
             return vec![];
         }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
-            theme: &self.theme,
+            settings: &self.settings,
         };
         if let Some(modal) = self.modal.as_mut() {
             return modal.handle_mouse(m, &ctx);
@@ -869,6 +898,11 @@ impl App {
         }
 
         match action {
+            Action::SetLayout { scope, layout } => {
+                self.session_settings.set_layout(scope, layout);
+                self.settings
+                    .reload(&self.ws.config, &self.session_settings);
+            }
             Action::SelectAgentSkills {
                 keys,
                 title,
@@ -898,7 +932,7 @@ impl App {
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
-                    theme: &self.theme,
+                    settings: &self.settings,
                 };
                 self.search.select_scope(keys, title, checked, &ctx);
             }
@@ -907,7 +941,12 @@ impl App {
             Action::Rescan => self.rescan(),
             Action::Spawn(task) => self.spawn(task),
             Action::OpenModal(m) => self.modal = Some(*m),
-            Action::CloseModal => self.modal = None,
+            Action::CloseModal => {
+                self.modal = match self.modal.take() {
+                    Some(Modal::Message { return_to, .. }) => return_to.map(|modal| *modal),
+                    _ => None,
+                };
+            }
             Action::SubmitInput(actions) => {
                 let prompt = self.modal.take();
                 for action in actions {
@@ -953,7 +992,7 @@ impl App {
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
-                    theme: &self.theme,
+                    settings: &self.settings,
                 };
                 self.search.set_query(&query, &ctx);
                 if focus_list {
@@ -1050,7 +1089,12 @@ impl App {
             Action::WriteMeta(f) => {
                 match f(&self.ws) {
                     Ok((msg, intent)) => {
-                        self.toast(msg, Level::Ok);
+                        let undo_hint = if intent.is_some() {
+                            " · Ctrl+Z undo"
+                        } else {
+                            ""
+                        };
+                        self.toast(format!("{msg}{undo_hint}"), Level::Ok);
                         // A write that left the files as they were is not a step.
                         if let Some(intent) = intent {
                             self.history.record(intent);
@@ -1077,7 +1121,7 @@ impl App {
     /// changes: a key for the tab already showing is not a return to it, and
     /// must not throw away a focus the user has just set.
     fn switch_tab(&mut self, t: Tab) {
-        let t = if t == Tab::Tags && !self.ws.config.tags_enabled {
+        let t = if t == Tab::Tags && !self.settings.tags_enabled {
             Tab::Search
         } else {
             t
@@ -1089,14 +1133,14 @@ impl App {
         self.search.restore_results(&Ctx {
             ws: &self.ws,
             snap: &self.snap,
-            theme: &self.theme,
+            settings: &self.settings,
         });
         self.tab = t;
         if t == Tab::Agents && self.agents_dirty {
             self.agents.refresh(&Ctx {
                 ws: &self.ws,
                 snap: &self.snap,
-                theme: &self.theme,
+                settings: &self.settings,
             });
             self.agents_dirty = false;
         }
@@ -1179,7 +1223,8 @@ impl App {
             return;
         }
         self.batch_running = true;
-        self.batch_modal_owned = matches!(self.modal, Some(Modal::Batch(_)));
+        self.batch_modal_owned =
+            matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)));
         self.next_task_id += 1;
         let id = self.next_task_id;
         self.tasks_running += 1;
@@ -1204,7 +1249,7 @@ impl App {
         let id = self.next_task_id;
         let label = match &task {
             Task::Scan | Task::PollRoot => None,
-            Task::DiscoverRepository(reference) => Some(format!("Clone {reference}")),
+            Task::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
             Task::InstallRepository(selection) => {
                 Some(format!("Install {}", selection.fetched.repository.alias))
             }
@@ -1219,22 +1264,18 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
-        // The config is read once when the workspace opens, and the scan
-        // works from that copy. A preset rename rewrites `[deploy].presets`
-        // on disk behind it, so the file is read again before every rescan:
-        // that is what keeps the `auto` mark on a preset card, and the
-        // desired state `sync` plans from, in step with what is written. A
-        // file that no longer parses is reported and the last good copy kept,
-        // since a hand edit in progress should not take the program down.
+        // Refresh one configuration snapshot for every view. Invalid edits keep
+        // the last valid settings and report the error without disrupting input.
         match self.ws.load_config() {
             Ok(config) => {
                 self.ws.config = config;
-                if !self.ws.config.tags_enabled && self.tab == Tab::Tags {
-                    self.tab = Tab::Search;
-                }
                 if let Err(e) = Self::discover_local_agents(&mut self.ws) {
                     self.toast(format!("{e:#}"), Level::Error);
                 }
+                // The last successful inventory stays visible while scanning.
+                // Publish valid settings together with their dependent caches
+                // now, so a slow or failed scan cannot leave old search rules.
+                self.on_snapshot();
             }
             Err(e) => self.toast(format!("{e:#}"), Level::Error),
         }
@@ -1258,7 +1299,7 @@ impl App {
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
-            theme: &self.theme,
+            settings: &self.settings,
         };
         match self.tab {
             Tab::Search => self.search.draw(f, rows[1], &ctx),
@@ -1273,26 +1314,53 @@ impl App {
             m.draw(f, area, &ctx);
         }
         // Above everything: a notification should be readable over a dialog.
-        self.toasts.draw(f, area, &self.theme);
+        self.toasts.draw(f, area, &self.settings.theme);
         if let Some(prompt) = self.quit_prompt.as_mut() {
             let mut tasks = self.toasts.running_details();
             let scans = self.tasks_running.saturating_sub(tasks.len());
             if scans > 0 {
                 tasks.push(format!("Scan skills: {scans} running"));
             }
-            prompt.draw(f, area, &self.theme, tasks);
+            prompt.draw(f, area, &self.settings.theme, tasks);
         }
     }
 
     fn draw_header(&mut self, f: &mut Frame, area: Rect) {
-        let th = &self.theme;
-        let mut spans: Vec<Span> = vec![Span::styled(" skills ", th.bold().fg(th.accent))];
+        let th = &self.settings.theme;
         self.tab_rects.clear();
-        let mut x = area.x + width(" skills ") as u16;
-        for (i, t) in Tab::visible(self.ws.config.tags_enabled).iter().enumerate() {
-            let label = format!(" {} {} ", i + 1, t.title());
+        if area.width < self.settings.layout.narrow_header_width {
+            let title = format!(" {} ", self.tab.title());
+            self.tab_rects.push((
+                Rect::new(area.x, area.y, (width(&title) as u16).min(area.width), 1),
+                self.tab,
+            ));
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(title, th.selected()),
+                    Span::styled(
+                        "  Tab → next · Shift+Tab ←",
+                        Style::default().fg(th.placeholder),
+                    ),
+                ])),
+                area,
+            );
+            return;
+        }
+        let compact = area.width < self.settings.layout.compact_header_width;
+        let mut spans: Vec<Span> = if compact {
+            vec![]
+        } else {
+            vec![Span::styled(" skills ", th.bold().fg(th.accent))]
+        };
+        let mut x = area.x + if compact { 0 } else { width(" skills ") as u16 };
+        for (i, t) in Tab::visible(self.settings.tags_enabled).iter().enumerate() {
+            let label = if compact {
+                format!(" {} ", t.title())
+            } else {
+                format!(" {} {} ", i + 1, t.title())
+            };
             let style = if *t == self.tab {
-                th.selected().fg(th.accent)
+                th.selected()
             } else {
                 th.dim()
             };
@@ -1302,6 +1370,8 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
+        spans.push(Span::styled(" Tab ↔ ", Style::default().fg(th.placeholder)));
+        x += width(" Tab ↔ ") as u16;
         let used = (x - area.x) as usize;
         let right = if self.tasks_running > 0 {
             format!("{} working  ", SPINNER[self.spinner])
@@ -1328,8 +1398,28 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let th = &self.theme;
-        let hints = if let Some(m) = &self.modal {
+        let th = &self.settings.theme;
+        let ctx = Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            settings: &self.settings,
+        };
+        let status = if self.modal.is_some() {
+            String::new()
+        } else {
+            match self.tab {
+                Tab::Search => self.search.status(&ctx),
+                Tab::Tags => self.tags.status(&ctx),
+                Tab::Presets => self.presets.status(&ctx),
+                _ => String::new(),
+            }
+        };
+        let status = fit(&status, area.width as usize / 3);
+        let status_width = width(&status);
+        let budget = area.width as usize - status_width;
+        let hints = if self.batch_running && self.batch_modal_owned {
+            &[("…", "saving changes")][..]
+        } else if let Some(m) = &self.modal {
             m.hints()
         } else {
             match self.tab {
@@ -1344,20 +1434,48 @@ impl App {
         // Results moved out to the notification stack, so the footer is only keys.
         let mut spans: Vec<Span> = Vec::new();
         let mut hint_w = 0usize;
+        let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
+        let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3)
+            + if self.modal.is_none() { 9 } else { 0 };
         for (key, desc) in hints {
-            if !self.ws.config.tags_enabled && *key == "t" {
+            if (!self.settings.tags_enabled && *key == "t")
+                || key.contains("Esc")
+                || (*key == "F1" && self.modal.is_none())
+            {
                 continue;
             }
             let piece_w = width(key) + width(desc) + 3;
-            if hint_w + piece_w + 1 > area.width as usize {
+            if hint_w + piece_w + reserve > budget {
                 break;
             }
             spans.push(Span::styled(*key, th.key_hint()));
-            spans.push(Span::styled(format!(" {desc}  "), th.dim()));
+            spans.push(Span::styled(
+                format!(" {desc}  "),
+                Style::default().fg(th.placeholder),
+            ));
             hint_w += piece_w;
         }
-        let pad = (area.width as usize).saturating_sub(hint_w);
-        let mut line = vec![Span::raw(" ".repeat(pad))];
+        if let Some((key, desc)) = escape {
+            let piece_w = width(key) + width(desc) + 3;
+            if hint_w + piece_w <= budget {
+                spans.push(Span::styled(*key, th.key_hint()));
+                spans.push(Span::styled(
+                    format!(" {desc}  "),
+                    Style::default().fg(th.placeholder),
+                ));
+                hint_w += piece_w;
+            }
+        }
+        if self.modal.is_none() && hint_w + 9 <= budget {
+            spans.push(Span::styled("F1", th.key_hint()));
+            spans.push(Span::styled(" help  ", Style::default().fg(th.placeholder)));
+            hint_w += 9;
+        }
+        let pad = budget.saturating_sub(hint_w);
+        let mut line = vec![
+            Span::styled(status, th.skill_count()),
+            Span::raw(" ".repeat(pad)),
+        ];
         line.extend(spans);
         f.render_widget(Paragraph::new(Line::from(line)), area);
     }
@@ -1399,6 +1517,258 @@ pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn config_reload_refreshes_search_before_scan_and_keeps_valid_rules_on_scan_failure() {
+        let tmp = skills::ops::DownloadDir::new("settings-reload").unwrap();
+        std::fs::create_dir(tmp.path().join("printer")).unwrap();
+        std::fs::write(
+            tmp.path().join("printer/SKILL.md"),
+            "---\nname: printer\ndescription: Print documents\n---\n",
+        )
+        .unwrap();
+        let mut config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        config.save(tmp.path()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new_with_launch_directory(
+            Workspace::open(tmp.path()).unwrap(),
+            tx,
+            Some(tmp.path()),
+        )
+        .unwrap();
+        app.apply(Action::Search {
+            query: "prnter".into(),
+            focus_list: true,
+        });
+        let selected = |app: &App| {
+            app.search.panel_keys(&Ctx {
+                ws: &app.ws,
+                snap: &app.snap,
+                settings: &app.settings,
+            })
+        };
+        assert_eq!(selected(&app), vec!["printer"]);
+
+        config.search.fuzzy = false;
+        config.save(tmp.path()).unwrap();
+        app.rescan();
+        assert!(!app.settings.search.fuzzy);
+        assert_eq!(app.search.query(), "prnter");
+        assert!(
+            selected(&app).is_empty(),
+            "cached search rules must refresh immediately"
+        );
+
+        // Receive the worker result before dropping its temporary root, then
+        // exercise the failed-scan path while retaining the known inventory.
+        let Msg::Task(id, _) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() else {
+            panic!("expected scan completion");
+        };
+        app.handle(Msg::Task(
+            id,
+            Box::new(TaskOutput::Scan(
+                Err(anyhow::anyhow!("scan unavailable")),
+                None,
+            )),
+        ));
+        assert!(app.snap.get("printer").is_some());
+        assert!(selected(&app).is_empty());
+        assert!(!app.settings.search.fuzzy);
+
+        std::fs::write(Config::path(tmp.path()), "[invalid").unwrap();
+        app.rescan();
+        assert!(
+            !app.settings.search.fuzzy,
+            "invalid edits keep the last valid settings"
+        );
+        assert_eq!(app.search.query(), "prnter");
+        assert!(selected(&app).is_empty());
+        app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        assert!(selected(&app).is_empty());
+    }
+
+    #[test]
+    fn member_picker_apply_saves_once_and_returns_to_results() {
+        let tmp = skills::ops::DownloadDir::new("member-picker-finish").unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+        std::fs::write(
+            tmp.path().join("alpha/SKILL.md"),
+            "---\nname: alpha\n---\nBody",
+        )
+        .unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        skills::history::preset_create(&ws, "example").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        let mut picker = SearchView::preset_members("example", &ctx);
+        picker.focus_list();
+        picker.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &ctx);
+        app.modal = Some(Modal::PresetSkills(Box::new(picker)));
+        // Force a real filesystem error after the selection has been staged.
+        let path = app.ws.presets.path("example");
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        while app.batch_running || app.tasks_running > 0 {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Message {
+                return_to: Some(_),
+                ..
+            })
+        ));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(app.modal, Some(Modal::PresetSkills(_))));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        // Retry without selecting again: the original staged selection survives.
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.batch_running);
+        let task = app.next_task_id;
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.next_task_id, task,
+            "repeated apply must not submit twice"
+        );
+        while app.batch_running || app.tasks_running > 0 {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        assert!(app.modal.is_none(), "successful apply finishes editing");
+        assert_eq!(
+            app.ws.presets.load("example").unwrap().unwrap().skills,
+            ["alpha"]
+        );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Ctrl+Z undo"));
+    }
+
+    #[test]
+    fn confirmation_ignores_modified_keys_and_help_pages_without_closing() {
+        let tmp = skills::ops::DownloadDir::new("modal-key-audit").unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
+        };
+        for mut modal in [
+            Modal::confirm("test".into(), vec![]),
+            Modal::confirm_write("test".into(), vec![], Box::new(|_| Ok("saved".into()))),
+        ] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Enter] {
+                    assert!(
+                        modal
+                            .handle_key(KeyEvent::new(code, modifiers), &ctx)
+                            .is_empty()
+                    );
+                }
+            }
+            if matches!(modal, Modal::ConfirmWrite { .. }) {
+                assert!(
+                    !modal
+                        .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &ctx)
+                        .is_empty()
+                );
+            }
+        }
+        let mut help = Modal::help();
+        assert!(
+            help.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+        assert!(matches!(help, Modal::Help { scroll: 10 }));
+        assert!(
+            help.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+        assert!(matches!(help, Modal::Help { scroll: 0 }));
+    }
+
+    #[test]
+    fn tag_completion_reaches_modal_and_keeps_close_hint_in_small_windows() {
+        let tmp = skills::ops::DownloadDir::new("tag-key-route").unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+        std::fs::write(
+            tmp.path().join("alpha/SKILL.md"),
+            "---\nname: alpha\n---\nBody",
+        )
+        .unwrap();
+        let mut ws = Workspace::open(tmp.path()).unwrap();
+        skills::ops::edit::tag_add(&ws, "alpha", &["meta-skill".into()]).unwrap();
+        ws.config = ws.load_config().unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::batch_tags(vec!["alpha".into()], &ctx));
+        for c in "met".chars() {
+            assert!(
+                app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                    .is_empty()
+            );
+        }
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .is_empty()
+        );
+        for width in [40, 80] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("› meta-skill"));
+            assert!(text.contains("Tags · alpha"));
+            let footer: String = (0..width).map(|x| buffer[(x, 23)].symbol()).collect();
+            assert!(footer.contains("Enter remove"));
+            assert!(footer.contains("Esc done"));
+            assert!(!footer.contains("add / create"));
+        }
+    }
 
     #[test]
     fn header_paths_keep_the_tail_with_unicode_safe_middle_ellipsis() {
@@ -1763,6 +2133,7 @@ mod matrix_key_tests {
             }
             let fetched = skills::repository::FetchedRepository {
                 repository: skills::repository::Repository {
+                    kind: Default::default(),
                     alias: reference.into(),
                     url: format!("https://example.com/sample/{reference}"),
                     branch: "main".into(),
@@ -1949,6 +2320,39 @@ mod scope_tests {
 #[cfg(test)]
 mod panel_navigation_tests {
     use super::*;
+
+    #[test]
+    fn header_keeps_current_page_and_navigation_visible_at_small_widths() {
+        let root = std::env::temp_dir().join(format!("skills-header-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        for width in [40, 60, 70, 80, 120] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+            for tab in Tab::visible(true) {
+                app.tab = tab;
+                terminal.draw(|f| app.draw_header(f, f.area())).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(text.contains(tab.title()), "{width}: {text}");
+                assert!(text.contains("Tab"), "{width}: {text}");
+                assert!(app.tab_rects.iter().all(|(rect, _)| rect.right() <= width));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn tab_changes_pages_from_inputs_and_returning_clears_temporary_library_scope() {

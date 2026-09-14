@@ -170,7 +170,7 @@ fn reinstall_same_source_is_a_noop_even_with_another_alias() {
 
 #[test]
 fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     f.put("frontend/review", "review", "first");
     f.put("backend/review", "review", "second");
     f.commit();
@@ -228,6 +228,7 @@ fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo(
         DeployState::Deployed
     );
     edit::tag_set(&f.ws, first, &["sample".into()]).unwrap();
+    f.ws.config = f.ws.load_config().unwrap();
     f.put("frontend/review", "review", "updated");
     f.commit();
     assert!(update::check(&f.ws, first).unwrap().update_available);
@@ -818,7 +819,7 @@ fn local_name_changes_cannot_redefine_the_update_identity() {
 }
 
 #[test]
-fn cross_scope_duplicate_is_a_warning_and_new_upstream_skills_are_not_installed() {
+fn explicit_scopes_share_content_without_registering_or_installing_new_upstream_skills() {
     let f = Fixture::new();
     f.put("original-folder", "review", "v1");
     f.commit();
@@ -827,8 +828,7 @@ fn cross_scope_duplicate_is_a_warning_and_new_upstream_skills_are_not_installed(
         .install(&f.ws, &["original-folder".into()], &BTreeMap::new())
         .unwrap();
     fetched.cleanup();
-    skills::ops::targets::set_installed(&f.ws, &f.ws.config.agents[0], None, &keys, None, true)
-        .unwrap();
+    skills::ops::targets::set_deployed(&f.ws, &f.ws.config.agents[0], None, &keys, true).unwrap();
     let project = f.dir.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let project = project.canonicalize().unwrap();
@@ -838,9 +838,8 @@ fn cross_scope_duplicate_is_a_warning_and_new_upstream_skills_are_not_installed(
         skills_dir: project.join(".agents/skills").display().to_string(),
     };
     let (message, _) =
-        skills::ops::targets::set_installed(&f.ws, &local, Some(&project), &keys, None, true)
-            .unwrap();
-    assert!(message.contains("warning:"), "{message}");
+        skills::ops::targets::set_deployed(&f.ws, &local, Some(&project), &keys, true).unwrap();
+    assert!(message.contains("added"), "{message}");
     assert!(local.skills_path().join("review").is_symlink());
     assert!(f.dir.join("agent/review").is_symlink());
     f.put("original-folder", "review", "v2");

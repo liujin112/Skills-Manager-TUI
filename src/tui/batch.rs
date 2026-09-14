@@ -55,6 +55,9 @@ pub struct Batch {
     rect: Rect,
     input_rect: Rect,
     buttons: [Rect; 2],
+    tag_chips: Vec<(Rect, String)>,
+    selected_tags: Vec<String>,
+    remove_armed: bool,
     error: Option<String>,
 }
 impl Batch {
@@ -72,6 +75,9 @@ impl Batch {
             rect: Rect::default(),
             input_rect: Rect::default(),
             buttons: [Rect::default(); 2],
+            tag_chips: vec![],
+            selected_tags: vec![],
+            remove_armed: false,
             error: None,
         }
     }
@@ -98,7 +104,9 @@ impl Batch {
                 }
             })
             .collect();
-        Self::new(Kind::Tags, keys, rows)
+        let mut picker = Self::new(Kind::Tags, keys, rows);
+        picker.filter();
+        picker
     }
     pub fn deploy(keys: Vec<String>, ctx: &Ctx) -> Self {
         let rows = ctx
@@ -157,12 +165,29 @@ impl Batch {
             return &[("…", "applying changes")];
         }
         if self.kind == Kind::Tags {
-            return &[
-                ("↑↓", "choose"),
-                ("Enter", "toggle / create"),
-                ("Tab", "complete"),
-                ("Esc", "done"),
-            ];
+            return if self
+                .list
+                .selected()
+                .and_then(|i| self.shown.get(i))
+                .and_then(|i| self.rows.get(*i))
+                .is_some_and(|r| r.count == self.keys.len())
+            {
+                &[
+                    ("Enter", "remove"),
+                    ("↑↓", "choose"),
+                    ("Tab", "complete"),
+                    ("Backspace", "select last · again removes"),
+                    ("Esc", "done"),
+                ]
+            } else {
+                &[
+                    ("Enter", "add / create"),
+                    ("↑↓", "choose"),
+                    ("Tab", "complete"),
+                    ("Backspace", "select last · again removes"),
+                    ("Esc", "done"),
+                ]
+            };
         }
         if self.focus == 0 {
             &[
@@ -188,7 +213,10 @@ impl Batch {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.label.to_lowercase().contains(&query))
+            .filter(|(_, r)| {
+                r.label.to_lowercase().contains(&query)
+                    && (self.kind != Kind::Tags || r.count != self.keys.len() || !query.is_empty())
+            })
             .map(|(i, _)| i)
             .collect();
         if self.kind == Kind::Tags
@@ -214,6 +242,7 @@ impl Batch {
         }
     }
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
+        self.remove_armed = false;
         if self.focus != 0 {
             return vec![];
         }
@@ -232,10 +261,22 @@ impl Batch {
             return vec![Action::CloseModal];
         }
         if self.kind == Kind::Tags {
+            if k.code != KeyCode::Backspace {
+                self.remove_armed = false;
+            }
             match k.code {
                 KeyCode::Down => self.list.move_by(1, self.shown.len()),
                 KeyCode::Up => self.list.move_by(-1, self.shown.len()),
                 KeyCode::Enter => return self.edit_selected_tag(),
+                KeyCode::Backspace if self.input.value().is_empty() => {
+                    if let Some(name) = self.selected_tags.last() {
+                        if self.remove_armed {
+                            self.remove_armed = false;
+                            return self.edit_tag(name.clone(), false);
+                        }
+                        self.remove_armed = true;
+                    }
+                }
                 KeyCode::Tab => {
                     if let Some(row) = self
                         .list
@@ -334,6 +375,10 @@ impl Batch {
             .get(i)
             .map(|r| r.id.clone())
             .unwrap_or_else(|| self.input.value().trim().to_string());
+        let add = self.rows.get(i).is_none_or(|r| r.count != self.keys.len());
+        self.edit_tag(name, add)
+    }
+    fn edit_tag(&mut self, name: String, add: bool) -> Vec<Action> {
         let keys = self.keys.clone();
         self.input = Input::default();
         self.filter();
@@ -359,9 +404,8 @@ impl Batch {
                         });
                     }
                     let tag = tags.iter_mut().find(|t| t.name == name).unwrap();
-                    let remove = keys.iter().all(|k| tag.skills.contains(k));
                     tag.skills.retain(|k| !keys.contains(k));
-                    if !remove {
+                    if add {
                         tag.skills.extend(keys.clone());
                     }
                 })?;
@@ -449,12 +493,25 @@ impl Batch {
         }
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        self.remove_armed = false;
         let at = ratatui::layout::Position::new(m.column, m.row);
         if self.kind == Kind::Tags {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if !self.rect.contains(at) {
                         return vec![Action::CloseModal];
+                    }
+                    if let Some((rect, name)) =
+                        self.tag_chips.iter().find(|(rect, _)| rect.contains(at))
+                    {
+                        let (_, right) = ctx.settings.ui.pill_caps.glyphs();
+                        let close_x = rect
+                            .right()
+                            .saturating_sub(super::widgets::width(right) as u16 + 2);
+                        if m.column == close_x {
+                            return self.edit_tag(name.clone(), false);
+                        }
+                        return vec![];
                     }
                     if self.input_rect.contains(at) {
                         self.input.click(m.column);
@@ -524,8 +581,8 @@ impl Batch {
             if self
                 .rows
                 .iter()
-                .map(|r| &r.id)
-                .ne(fresh.rows.iter().map(|r| &r.id))
+                .map(|r| (&r.id, r.count))
+                .ne(fresh.rows.iter().map(|r| (&r.id, r.count)))
             {
                 self.rows = fresh.rows;
                 self.filter();
@@ -541,11 +598,44 @@ impl Batch {
             } else {
                 self.rows = fresh.rows;
             }
+            self.selected_tags.retain(|name| {
+                self.rows
+                    .iter()
+                    .any(|r| &r.id == name && r.count == self.keys.len())
+            });
+            for row in self.rows.iter().filter(|r| r.count == self.keys.len()) {
+                if !self.selected_tags.contains(&row.id) {
+                    self.selected_tags.push(row.id.clone());
+                }
+            }
             let w = area.width.saturating_sub(2).min(50);
+            // Selected tags form removable tokens before the search field.
+            let mut chips = Vec::new();
+            let mut x = 0u16;
+            let mut y = 0u16;
+            let available = w.saturating_sub(4);
+            for name in &self.selected_tags {
+                let (left, right) = ctx.settings.ui.pill_caps.glyphs();
+                let caps = super::widgets::width(left) + super::widgets::width(right);
+                let label = fit(name, (available as usize).saturating_sub(caps + 5));
+                let body = format!(" {label} × ");
+                let width = (super::widgets::width(&body) + caps) as u16;
+                if x > 0 && x + width > available {
+                    x = 0;
+                    y += 1;
+                }
+                chips.push((Rect::new(x, y, width, 1), name.clone(), body));
+                x += width + 1;
+            }
+            let total_chip_rows = if chips.is_empty() { 0 } else { y + 1 };
+            let chip_rows = total_chip_rows.min(area.height.saturating_sub(10) / 2);
+            let overflow = total_chip_rows > chip_rows && chip_rows > 0;
+            let first_chip_row =
+                total_chip_rows.saturating_sub(chip_rows.saturating_sub(u16::from(overflow)));
             let h = area
                 .height
                 .saturating_sub(2)
-                .min(self.shown.len().clamp(1, 7) as u16 + 6);
+                .min(self.shown.len().clamp(1, 7) as u16 + 6 + chip_rows);
             self.rect = Rect::new(
                 area.x + (area.width - w) / 2,
                 area.y + (area.height - h) / 2,
@@ -554,30 +644,90 @@ impl Batch {
             );
             f.render_widget(OverlayClear, self.rect);
             let block = ctx
+                .settings
                 .theme
                 .block("", false)
-                .title(Line::from(Span::styled(" Tags ", ctx.theme.accent())));
+                .title(Line::from(Span::styled(
+                    format!(
+                        " Tags · {} ",
+                        if self.keys.len() == 1 {
+                            fit(
+                                &ctx.snap
+                                    .get(&self.keys[0])
+                                    .and_then(|s| s.name.clone())
+                                    .unwrap_or_else(|| self.keys[0].clone()),
+                                w.saturating_sub(12) as usize,
+                            )
+                        } else {
+                            format!("{} skills · tokens shared by all", self.keys.len())
+                        }
+                    ),
+                    ctx.settings.theme.accent(),
+                )));
             let inner = block.inner(self.rect);
             f.render_widget(block, self.rect);
+            self.tag_chips.clear();
             if inner.height < 4 || inner.width < 6 {
                 return;
             }
+            if overflow {
+                let hidden = chips
+                    .iter()
+                    .filter(|(rect, _, _)| rect.y < first_chip_row)
+                    .count();
+                f.render_widget(
+                    Paragraph::new(format!("+{hidden} more · search to remove"))
+                        .style(ctx.settings.theme.dim()),
+                    Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 1),
+                );
+            }
+            for (mut rect, name, body) in chips {
+                if rect.y < first_chip_row {
+                    continue;
+                }
+                rect.x += inner.x + 1;
+                rect.y = inner.y + rect.y - first_chip_row + u16::from(overflow);
+                f.render_widget(
+                    Paragraph::new(Line::from(
+                        crate::tui::components::group::Pill::new(
+                            body.trim(),
+                            crate::tui::components::group::tag_fill(&name, ctx),
+                        )
+                        .render(ctx, rect.width as usize),
+                    ))
+                    .style(
+                        if self.remove_armed && self.selected_tags.last() == Some(&name) {
+                            Style::default().add_modifier(ratatui::style::Modifier::UNDERLINED)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    rect,
+                );
+                self.tag_chips.push((rect, name));
+            }
+            let input_y = inner.y + chip_rows;
             f.render_widget(
-                Paragraph::new("›").style(ctx.theme.accent()),
-                Rect::new(inner.x + 1, inner.y, 1, 1),
+                Paragraph::new("›").style(ctx.settings.theme.accent()),
+                Rect::new(inner.x + 1, input_y, 1, 1),
             );
-            self.input_rect = Rect::new(inner.x + 3, inner.y, inner.width.saturating_sub(4), 1);
-            self.input
-                .render(f, self.input_rect, true, "Search or create…", ctx.theme);
+            self.input_rect = Rect::new(inner.x + 3, input_y, inner.width.saturating_sub(4), 1);
+            self.input.render(
+                f,
+                self.input_rect,
+                true,
+                "Search or create…",
+                &ctx.settings.theme,
+            );
             f.render_widget(
-                Paragraph::new("─".repeat(inner.width as usize)).style(ctx.theme.dim()),
-                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+                Paragraph::new("─".repeat(inner.width as usize)).style(ctx.settings.theme.dim()),
+                Rect::new(inner.x, input_y + 1, inner.width, 1),
             );
             self.list.rows = Rect::new(
                 inner.x + 1,
-                inner.y + 2,
+                input_y + 2,
                 inner.width.saturating_sub(2),
-                inner.height.saturating_sub(4),
+                inner.height.saturating_sub(4 + chip_rows),
             );
             self.list.clamp(self.shown.len());
             let items: Vec<ListItem> = self
@@ -586,50 +736,56 @@ impl Batch {
                 .enumerate()
                 .map(|(index, i)| {
                     ListItem::new(if let Some(row) = self.rows.get(*i) {
-                        let fill = super::views::cards::tag_fill(&row.id, ctx);
-                        let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
+                        let fill = crate::tui::components::group::tag_fill(&row.id, ctx);
+                        let (left, right) = ctx.settings.ui.pill_caps.glyphs();
                         let caps_width = super::widgets::width(left) + super::widgets::width(right);
+                        let membership = if row.count == self.keys.len() {
+                            "✓".to_string()
+                        } else if row.count > 0 {
+                            format!("{}/{}", row.count, self.keys.len())
+                        } else {
+                            " ".to_string()
+                        };
                         let label = fit(
                             &row.label,
-                            (self.list.rows.width as usize).saturating_sub(7 + caps_width),
+                            (self.list.rows.width as usize).saturating_sub(
+                                6 + caps_width + super::widgets::width(&membership),
+                            ),
                         );
                         let chip = format!(" {label} ");
-                        let gap =
-                            self.list.rows.width.saturating_sub(
-                                (super::widgets::width(&chip) + caps_width) as u16 + 3,
-                            );
+                        let gap = self.list.rows.width.saturating_sub(
+                            (super::widgets::width(&chip)
+                                + caps_width
+                                + super::widgets::width(&membership))
+                                as u16
+                                + 2,
+                        );
                         let mut spans = vec![Span::raw(" ")];
-                        spans.extend(super::views::cards::pill(chip, fill, ctx));
+                        spans.extend(
+                            crate::tui::components::group::Pill::new(&label, fill)
+                                .render(ctx, usize::MAX),
+                        );
                         spans.extend([
                             Span::raw(" ".repeat(gap as usize)),
-                            Span::styled(
-                                if row.count == self.keys.len() {
-                                    "✓"
-                                } else if row.count > 0 {
-                                    "−"
-                                } else {
-                                    " "
-                                },
-                                ctx.theme.ok(),
-                            ),
+                            Span::styled(membership, ctx.settings.theme.ok()),
                             Span::raw(" "),
                         ]);
                         Line::from(spans)
                     } else {
                         Line::from(vec![
-                            Span::styled(" + ", ctx.theme.accent()),
-                            Span::styled("Create ", ctx.theme.dim()),
+                            Span::styled(" + ", ctx.settings.theme.accent()),
+                            Span::styled("Create ", ctx.settings.theme.dim()),
                             Span::styled(
                                 fit(
                                     self.input.value().trim(),
                                     self.list.rows.width.saturating_sub(10) as usize,
                                 ),
-                                ctx.theme.accent(),
+                                ctx.settings.theme.accent(),
                             ),
                         ])
                     })
                     .style(if self.list.selected() == Some(index) {
-                        ctx.theme.selected_unfocused()
+                        ctx.settings.theme.selected_unfocused()
                     } else {
                         Style::default()
                     })
@@ -637,14 +793,27 @@ impl Batch {
                 .collect();
             if items.is_empty() {
                 f.render_widget(
-                    Paragraph::new("Type to create your first tag").style(ctx.theme.dim()),
+                    Paragraph::new("Type to add or create a tag").style(ctx.settings.theme.dim()),
                     self.list.rows,
                 );
             } else {
                 f.render_stateful_widget(List::new(items), self.list.rows, &mut self.list.state);
             }
             f.render_widget(
-                Paragraph::new("↵ select                 esc close").style(ctx.theme.dim()),
+                Paragraph::new(if self.remove_armed {
+                    "Backspace removes last tag · type to cancel"
+                } else if self
+                    .list
+                    .selected()
+                    .and_then(|i| self.shown.get(i))
+                    .and_then(|i| self.rows.get(*i))
+                    .is_some_and(|r| r.count == self.keys.len())
+                {
+                    "Enter remove · Esc done"
+                } else {
+                    "Enter add · × remove · Esc done"
+                })
+                .style(ctx.settings.theme.dim()),
                 Rect::new(
                     inner.x + 2,
                     inner.bottom() - 1,
@@ -669,6 +838,7 @@ impl Batch {
             Kind::Presets => "Add to presets",
         };
         let block = ctx
+            .settings
             .theme
             .block(format!(" {title} · {} skills ", self.keys.len()), true);
         let inner = block.inner(self.rect);
@@ -678,8 +848,13 @@ impl Batch {
             return;
         }
         self.input_rect = Rect::new(inner.x, inner.y, inner.width, 1);
-        self.input
-            .render(f, self.input_rect, self.focus == 0, "Filter…", ctx.theme);
+        self.input.render(
+            f,
+            self.input_rect,
+            self.focus == 0,
+            "Filter…",
+            &ctx.settings.theme,
+        );
         self.list.rows = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 5);
         self.list.clamp(self.shown.len());
         let items: Vec<ListItem> = self
@@ -708,15 +883,15 @@ impl Batch {
             .collect();
         if items.is_empty() {
             f.render_widget(
-                Paragraph::new("No matching entries").style(ctx.theme.dim()),
+                Paragraph::new("No matching entries").style(ctx.settings.theme.dim()),
                 self.list.rows,
             );
         } else {
             f.render_stateful_widget(
                 List::new(items).highlight_style(if self.focus == 1 {
-                    ctx.theme.selected()
+                    ctx.settings.theme.selected()
                 } else {
-                    ctx.theme.selected_unfocused()
+                    ctx.settings.theme.selected_unfocused()
                 }),
                 self.list.rows,
                 &mut self.list.state,
@@ -742,9 +917,9 @@ impl Batch {
         };
         f.render_widget(
             Paragraph::new(fit(&summary, inner.width as usize)).style(if self.error.is_some() {
-                ctx.theme.err()
+                ctx.settings.theme.err()
             } else {
-                ctx.theme.dim()
+                ctx.settings.theme.dim()
             }),
             Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
         );
@@ -758,7 +933,7 @@ impl Batch {
                 Paragraph::new(Line::from(super::widgets::button(
                     label,
                     self.focus == i + 2,
-                    ctx.theme,
+                    &ctx.settings.theme,
                 ))),
                 self.buttons[i],
             );
@@ -802,12 +977,18 @@ mod tests {
         let fixture = Fixture::new();
         let ws = Workspace::open(&fixture.0).unwrap();
         edit::tag_add(&ws, "beta", &["merlin".into(), "meta".into()]).unwrap();
+        // App reloads configuration after writes before publishing a new snapshot.
+        let ws = Workspace::open(&fixture.0).unwrap();
         let snap = ws.scan().unwrap();
         let theme = super::super::theme::Theme::default();
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut batch = Batch::tags(vec!["alpha".into()], &ctx);
@@ -832,9 +1013,21 @@ mod tests {
                     .skill_tags("alpha")
                     .contains(&name.to_string())
             );
-            let snap = ws.scan().unwrap();
+            let refreshed_ws = Workspace::open(&fixture.0).unwrap();
+            let snap = refreshed_ws.scan().unwrap();
+            let settings = crate::tui::settings::RuntimeSettings::new(&refreshed_ws.config);
             terminal
-                .draw(|f| batch.draw(f, f.area(), &Ctx { snap: &snap, ..ctx }))
+                .draw(|f| {
+                    batch.draw(
+                        f,
+                        f.area(),
+                        &Ctx {
+                            ws: &refreshed_ws,
+                            snap: &snap,
+                            settings: &settings,
+                        },
+                    )
+                })
                 .unwrap();
         }
         let screen: String = terminal
@@ -847,8 +1040,11 @@ mod tests {
         assert!(!screen.contains("Apply"));
         assert!(!screen.contains("pending"));
         assert!(screen.contains(" new-tag "));
-        assert!(screen.contains('✓'));
+        assert!(screen.contains('×'));
+        assert!(batch.shown.is_empty());
+        assert_eq!(batch.selected_tags, vec!["merlin", "meta", "new-tag"]);
         let mut styled_ws = Workspace::open(&ws.root).unwrap();
+        let styled_snap = styled_ws.scan().unwrap();
         for caps in [
             skills::config::PillCaps::Round,
             skills::config::PillCaps::Block,
@@ -862,7 +1058,10 @@ mod tests {
                         f.area(),
                         &Ctx {
                             ws: &styled_ws,
-                            ..ctx
+                            snap: &styled_snap,
+                            settings: &crate::tui::settings::RuntimeSettings::new(
+                                &styled_ws.config,
+                            ),
                         },
                     )
                 })
@@ -875,19 +1074,35 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect();
             let (left, right) = caps.glyphs();
-            assert!(text.contains(&format!("{left} new-tag {right}")));
+            assert!(text.contains(&format!("{left} new-tag × {right}")));
         }
-        // Clicking the checked tag removes it immediately.
+        // Only the close glyph removes a token.
+        let chip = batch
+            .tag_chips
+            .iter()
+            .find(|(_, name)| name == "new-tag")
+            .unwrap()
+            .0;
+        assert!(
+            batch
+                .mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: chip.x,
+                        row: chip.y,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    &ctx
+                )
+                .is_empty()
+        );
         let actions = batch.mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: batch.list.rows.x,
-                row: batch.list.rows.y
-                    + batch
-                        .shown
-                        .iter()
-                        .position(|i| batch.rows[*i].id == "new-tag")
-                        .unwrap() as u16,
+                column: chip.right()
+                    - super::super::widgets::width(ws.config.ui.pill_caps.glyphs().1) as u16
+                    - 2,
+                row: chip.y,
                 modifiers: KeyModifiers::NONE,
             },
             &ctx,
@@ -914,16 +1129,94 @@ mod tests {
         );
     }
     #[test]
-    fn partial_tags_are_preserved_until_toggled_and_batch_has_one_undo() {
+    fn selected_tokens_wrap_and_backspace_removes_only_when_input_is_empty() {
         let fixture = Fixture::new();
         let ws = Workspace::open(&fixture.0).unwrap();
-        edit::tag_add(&ws, "alpha", &["existing".into()]).unwrap();
+        edit::tag_add(
+            &ws,
+            "alpha",
+            &[
+                "long-first-tag".into(),
+                "long-second-tag".into(),
+                "third".into(),
+            ],
+        )
+        .unwrap();
+        // App reloads configuration after writes before publishing a new snapshot.
+        let ws = Workspace::open(&fixture.0).unwrap();
         let snap = ws.scan().unwrap();
         let theme = super::super::theme::Theme::default();
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
+        };
+        let mut batch = Batch::tags(vec!["alpha".into()], &ctx);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 20)).unwrap();
+        terminal.draw(|f| batch.draw(f, f.area(), &ctx)).unwrap();
+        assert_eq!(batch.tag_chips.len(), 3);
+        assert!(batch.tag_chips[1].0.y > batch.tag_chips[0].0.y);
+        assert!(
+            batch
+                .tag_chips
+                .iter()
+                .all(|(rect, _)| rect.bottom() <= batch.input_rect.y)
+        );
+        assert!(batch.shown.is_empty());
+        let mut short = ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 14)).unwrap();
+        short.draw(|f| batch.draw(f, f.area(), &ctx)).unwrap();
+        assert_eq!(batch.tag_chips.last().unwrap().1, "third");
+        let text: String = short
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("more"));
+        batch.paste("long-first-tag");
+        assert_eq!(batch.rows[batch.shown[0]].id, "long-first-tag");
+        batch.input = Input::default();
+        batch.filter();
+        batch.paste("x");
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(batch.key(key, &ctx).is_empty());
+        assert!(batch.input.value().is_empty());
+        assert!(batch.key(key, &ctx).is_empty());
+        assert!(batch.remove_armed);
+        let Action::WriteMeta(write) = batch.key(key, &ctx).remove(0) else {
+            panic!("remove last token")
+        };
+        write(&ws).unwrap();
+        assert_eq!(
+            skills::config::Config::load(&ws.root)
+                .unwrap()
+                .skill_tags("alpha"),
+            vec!["long-first-tag", "long-second-tag"]
+        );
+    }
+    #[test]
+    fn partial_tags_are_preserved_until_toggled_and_batch_has_one_undo() {
+        let fixture = Fixture::new();
+        let ws = Workspace::open(&fixture.0).unwrap();
+        edit::tag_add(&ws, "alpha", &["existing".into()]).unwrap();
+        // App reloads configuration after writes before publishing a new snapshot.
+        let ws = Workspace::open(&fixture.0).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = super::super::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut batch = Batch::tags(vec!["alpha".into(), "beta".into()], &ctx);
         assert_eq!(batch.rows[0].marker(2), "[−]");
@@ -961,6 +1254,8 @@ mod tests {
         let fixture = Fixture::new();
         let ws = Workspace::open(&fixture.0).unwrap();
         edit::tag_add(&ws, "alpha", &["existing".into()]).unwrap();
+        // App reloads configuration after writes before publishing a new snapshot.
+        let ws = Workspace::open(&fixture.0).unwrap();
         let snap = ws.scan().unwrap();
         let path = skills::config::Config::path(&ws.root);
         std::fs::write(&path, "tags = 42").unwrap();
@@ -969,7 +1264,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut batch = Batch::tags(vec!["alpha".into(), "beta".into()], &ctx);
         batch.filter();
@@ -1000,7 +1299,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut batch = Batch::presets(vec!["alpha".into(), "beta".into()], &ctx);
         for row in &mut batch.rows {
@@ -1041,7 +1344,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut batch = Batch::deploy(vec!["alpha".into()], &ctx);
         batch.rows[0].desired = Some(false);
@@ -1053,7 +1360,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         batch.rows[0].desired = Some(true);
         assert!(batch.plan(&ctx).unwrap().is_empty());

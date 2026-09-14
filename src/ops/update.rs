@@ -1,9 +1,9 @@
-//! Checking upstream for new revisions and updating git-sourced skills.
+//! Checking upstream for new revisions and updating remote-sourced skills.
 
 use crate::Workspace;
 use crate::hash::{HASH_ALGO, hash_directory};
 use crate::meta::{Baseline, Source};
-use crate::ops::{DownloadDir, fresh_staging, git};
+use crate::ops::{DownloadDir, fresh_staging};
 use crate::reconcile::{SkillStatus, Snapshot};
 use crate::util::{copy_dir, is_ignored_name};
 use anyhow::{Context, Result, bail};
@@ -21,40 +21,20 @@ pub struct CheckResult {
     pub update_available: bool,
 }
 
-/// `git ls-remote` the tracked branch and compare with the installed revision.
+/// Compare the tracked Git revision or archive content hash with the installed version.
 pub fn check(ws: &Workspace, key: &str) -> Result<CheckResult> {
     let meta = ws
         .meta
         .load(key)?
         .with_context(|| format!("{key} has no metadata"))?;
-    let (url, branch, revision) = match meta.source {
-        Some(Source::Git {
-            url,
-            branch,
-            revision,
-            ..
-        }) => (url, branch, revision),
-        _ => bail!("{key} is not a git-sourced skill"),
-    };
-    let refspec = branch.clone().unwrap_or_else(|| "HEAD".into());
-    let out = git(&["ls-remote", &url, &refspec], None)?;
-    let remote = out
-        .lines()
-        .find_map(|l| {
-            let mut it = l.split_whitespace();
-            let sha = it.next()?;
-            let name = it.next()?;
-            let ok = refspec == "HEAD" && name == "HEAD"
-                || name == format!("refs/heads/{refspec}")
-                || name == format!("refs/tags/{refspec}");
-            ok.then(|| sha.to_string())
-        })
-        .or_else(|| {
-            out.lines()
-                .next()
-                .and_then(|l| l.split_whitespace().next().map(|s| s.to_string()))
-        })
-        .with_context(|| format!("no ref {refspec} at {url}"))?;
+    let source = meta
+        .source
+        .filter(Source::is_remote)
+        .with_context(|| format!("{key} is not a remote-sourced skill"))?;
+    let url = source.url().unwrap().to_owned();
+    let branch = source.branch().map(str::to_owned);
+    let revision = source.revision().map(str::to_owned);
+    let remote = crate::ops::source::latest_revision(&source)?;
     Ok(CheckResult {
         skill: key.to_string(),
         url,
@@ -138,15 +118,12 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
         .meta
         .clone()
         .with_context(|| format!("{key} has no metadata"))?;
-    let (url, subpath, branch, revision) = match meta.source.clone() {
-        Some(Source::Git {
-            url,
-            subpath,
-            branch,
-            revision,
-        }) => (url, subpath, branch, revision),
-        _ => bail!("{key} is not a git-sourced skill"),
-    };
+    let source = meta
+        .source
+        .clone()
+        .filter(Source::is_remote)
+        .with_context(|| format!("{key} is not a remote-sourced skill"))?;
+    let revision = source.revision().map(str::to_owned);
     match rec.status {
         SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified => {}
         ref s => bail!("cannot update a skill in state {}", s.label()),
@@ -164,24 +141,15 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
 
     let download = DownloadDir::new("update")?;
     let work = download.path().to_path_buf();
-    let clone = work.join("clone");
-    let mut args = vec!["clone", "--quiet", "--depth", "1"];
-    if let Some(b) = &branch {
-        args.push("--branch");
-        args.push(b);
-    }
-    args.push(&url);
-    let clone_s = clone.to_string_lossy().into_owned();
-    args.push(&clone_s);
-    git(&args, None)?;
-    let to_revision = git(&["rev-parse", "HEAD"], Some(&clone))?
-        .trim()
-        .to_string();
-    let sub = subpath.clone().unwrap_or_default();
+    let source_tree = work.join("source");
+    let reference = crate::ops::install::InstallRef::from_source(&source)?;
+    let acquired = crate::ops::source::acquire(&reference, &source_tree, &mut |_| {})?;
+    let to_revision = acquired.revision;
+    let sub = source.subpath().unwrap_or("");
     let upstream_src = if sub.is_empty() {
-        clone.clone()
+        source_tree.clone()
     } else {
-        clone.join(&sub)
+        source_tree.join(sub)
     };
     if !upstream_src.join(crate::skill::SKILL_FILE).is_file() {
         bail!("upstream no longer has a skill at {sub:?}; keeping local copy");
@@ -198,16 +166,18 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
         .skills
         .iter()
         .filter_map(|s| match &s.source {
-            Some(Source::Git {
-                url: source_url,
-                subpath,
-                ..
-            }) if source_url == &url => Some(subpath.as_deref().unwrap_or("")),
+            Some(installed)
+                if installed.kind() == source.kind()
+                    && installed.url() == source.url()
+                    && installed.branch() == source.branch() =>
+            {
+                Some(installed.subpath().unwrap_or(""))
+            }
             _ => None,
         })
         .collect();
     let mut new_skills = Vec::new();
-    for entry in walkdir::WalkDir::new(&clone)
+    for entry in walkdir::WalkDir::new(&source_tree)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
@@ -215,7 +185,7 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
         let entry = entry?;
         if entry.file_type().is_file() && entry.file_name() == crate::skill::SKILL_FILE {
             let directory = entry.path().parent().context("missing skill parent")?;
-            let path = directory.strip_prefix(&clone)?.to_string_lossy();
+            let path = directory.strip_prefix(&source_tree)?.to_string_lossy();
             if !installed_paths
                 .iter()
                 .any(|p| *p == path || crate::repository::overlaps(p, &path))
@@ -246,25 +216,21 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
     };
 
     if rec.status == SkillStatus::Modified {
-        // Try to materialize the baseline revision for a three-way classification.
-        if let Some(rev) = &revision {
-            let fetched = git(
-                &["fetch", "--quiet", "--depth", "1", "origin", rev],
-                Some(&clone),
-            )
-            .is_ok();
-            if fetched && git(&["checkout", "--quiet", rev], Some(&clone)).is_ok() {
-                let base_src = if sub.is_empty() {
-                    clone.clone()
-                } else {
-                    clone.join(&sub)
-                };
-                if base_src.is_dir() {
-                    let base_dir = work.join("baseline");
-                    copy_dir(&base_src, &base_dir)?;
-                    let _ = std::fs::remove_dir_all(base_dir.join(".git"));
-                    prepared.baseline_dir = Some(base_dir);
-                }
+        // Providers with version history can recover a three-way baseline;
+        // otherwise differences remain unclassified.
+        if let Some(rev) = &revision
+            && crate::ops::source::checkout_revision(&reference, &source_tree, rev)?
+        {
+            let base_src = if sub.is_empty() {
+                source_tree.clone()
+            } else {
+                source_tree.join(sub)
+            };
+            if base_src.is_dir() {
+                let base_dir = work.join("baseline");
+                copy_dir(&base_src, &base_dir)?;
+                let _ = std::fs::remove_dir_all(base_dir.join(".git"));
+                prepared.baseline_dir = Some(base_dir);
             }
         }
         prepared.files = classify(
@@ -369,8 +335,8 @@ pub fn apply(
         );
 
         let mut meta = ws.meta.load(key)?.context("metadata vanished")?;
-        if let Some(Source::Git { revision, .. }) = meta.source.as_mut() {
-            *revision = Some(prepared.to_revision.clone());
+        if let Some(source) = meta.source.as_mut() {
+            source.set_revision(prepared.to_revision.clone());
         }
         meta.installed_name = Some(prepared.expected_name.clone());
         meta.baseline = Some(Baseline {

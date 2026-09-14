@@ -6,8 +6,10 @@
 //! of `a`, `m`, `x` and `U` fits the row under the cursor.
 
 use super::preview::{Overlay, kv};
-use super::{View, split_panes, status_glyph, status_text, wheel};
+use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::components::layout::split_panes;
+use crate::tui::components::skill::{status_glyph, status_text};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::widgets::{ListNav, fit, pad, width};
@@ -35,7 +37,7 @@ struct Caps {
 
 impl Caps {
     fn of(r: &SkillRecord, check: Option<&Result<CheckResult, String>>) -> Self {
-        let git = matches!(r.source, Some(Source::Git { .. }));
+        let remote = r.source.as_ref().is_some_and(Source::is_remote);
         let update_available = matches!(check, Some(Ok(c)) if c.update_available);
         Caps {
             accept: matches!(
@@ -47,7 +49,7 @@ impl Caps {
             // `update::prepare` requires usable repository content, so
             // offering `U` for a missing or invalid skill would only produce
             // an error toast.
-            update: git
+            update: remote
                 && update_available
                 && matches!(
                     r.status,
@@ -208,8 +210,7 @@ impl HealthView {
                 .collect();
             let mode_issue = match &agent.mode {
                 AgentDirMode::Missing => Some(
-                    "Agent directory does not exist. Deploy or sync from Agents to create it."
-                        .to_string(),
+                    "Agent directory does not exist. Deploy from Agents to create it.".to_string(),
                 ),
                 AgentDirMode::DirForeign { target } => Some(format!(
                     "Agent directory links outside the root → {}. Review this path before changing it.",
@@ -355,7 +356,7 @@ impl HealthView {
     /// which keys act on it. Nothing here is guessed; where the record
     /// cannot answer a question, the text says so.
     fn detail_lines(&self, r: &SkillRecord, caps: Caps, ctx: &Ctx) -> Vec<Line<'static>> {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let key = r.key.clone();
         let heading = |s: &'static str| Line::from(Span::styled(s, th.bold().fg(th.accent)));
         let text = |s: String| Line::from(Span::raw(s));
@@ -423,10 +424,12 @@ impl HealthView {
                     th,
                 ));
                 source_line(&mut lines);
-                if let Some(Source::Git { revision, .. }) = &r.source {
+                if let Some(source) = &r.source
+                    && source.is_remote()
+                {
                     lines.push(kv(
                         "installed",
-                        revision.as_deref().map(short_rev).unwrap_or("-"),
+                        source.revision().map(short_rev).unwrap_or("-"),
                         th,
                     ));
                 }
@@ -475,10 +478,9 @@ impl HealthView {
                     "forget it: delete the metadata file, tags and note included".into(),
                 ));
                 match &r.source {
-                    Some(Source::Git { .. }) => actions.push(action(
+                    Some(Source::Git { .. } | Source::Archive { .. }) => actions.push(action(
                         "",
-                        "or reinstall it from the Library tab with i, from the git source above"
-                            .into(),
+                        "or reinstall it from the Library tab with i, from the source above".into(),
                     )),
                     Some(Source::Local { path: Some(p) }) => actions.push(action(
                         "",
@@ -564,7 +566,7 @@ impl HealthView {
                 }
                 if caps.update {
                     let what = if r.status == SkillStatus::Modified {
-                        "update from upstream; you choose local or upstream file by file"
+                        "update from upstream; choose local or upstream for the whole skill"
                     } else {
                         "update to the upstream revision"
                     };
@@ -607,7 +609,7 @@ impl HealthView {
     }
 
     fn draw_detail(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         let block = th.block(" detail ", false);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -689,11 +691,15 @@ impl View for HealthView {
                     .snap
                     .skills
                     .iter()
-                    .filter(|s| matches!(s.source, Some(Source::Git { .. })))
+                    .filter(|s| {
+                        s.source
+                            .as_ref()
+                            .is_some_and(skills::meta::Source::is_remote)
+                    })
                     .map(|s| s.key.clone())
                     .collect();
                 if keys.is_empty() {
-                    vec![Action::Error("no git-sourced skills to check".into())]
+                    vec![Action::Error("no remote-sourced skills to check".into())]
                 } else {
                     vec![
                         Action::Toast(format!("checking {} skill(s)…", keys.len())),
@@ -753,7 +759,7 @@ impl View for HealthView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.preview.handle_mouse(m) {
+        if self.preview.handle_mouse(m, ctx) {
             return vec![];
         }
         let at = (m.column, m.row).into();
@@ -761,7 +767,7 @@ impl View for HealthView {
             self.filter.editing = true;
             return vec![];
         }
-        if let Some(d) = wheel(&m) {
+        if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
                 self.select_by(d);
             } else if self.right.contains(at) {
@@ -784,7 +790,7 @@ impl View for HealthView {
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let area = self.filter.draw(f, area, "Filter health issues", ctx);
-        let th = ctx.theme;
+        let th = &ctx.settings.theme;
         // With nothing to show there is nothing to explain either, so the
         // message gets the whole width instead of being squeezed beside an
         // empty pane.
@@ -798,7 +804,7 @@ impl View for HealthView {
                 format!("No matching issues · {} issues in total", self.total_issues)
             } else {
                 format!(
-                    "everything is healthy\n{} skills · {} agents checked\nPress c to check git sources for updates.",
+                    "everything is healthy\n{} skills · {} agents checked\nPress c to check remote sources for updates.",
                     ctx.snap.skills.len(),
                     ctx.snap.agents.len()
                 )
@@ -818,7 +824,7 @@ impl View for HealthView {
         }
         // The list carries the name and the status text side by side, so it
         // needs a little more than the usual share of the width.
-        let (left, right) = split_panes(area, 45);
+        let (left, right) = split_panes(area, 45, ctx);
         self.left = left;
         self.right = right;
         let items: Vec<ListItem> = self
@@ -885,7 +891,7 @@ impl View for HealthView {
     /// or without `U`.
     fn hints(&self) -> Hints {
         if self.filter.editing {
-            return &[("Enter/↓", "issues"), ("Esc", "finish filter")];
+            return &[("Enter/↓", "issues"), ("Esc", "clear filter")];
         }
         if let Some(hints) = self.preview.hints() {
             return hints;
@@ -1089,7 +1095,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = HealthView::default();
         view.refresh(&ctx);
@@ -1187,7 +1197,11 @@ mod tests {
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            theme: &theme,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
         };
         let mut view = HealthView::default();
         view.refresh(&ctx);

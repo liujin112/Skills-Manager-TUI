@@ -1,5 +1,5 @@
 //! Reviewable deployment-name decisions. Nothing is written until every group
-//! has a choice and the saved selection is checked again against current state.
+//! has a choice and a fresh scan confirms that the reviewed state still holds.
 use super::{deploy, targets};
 use crate::{Workspace, config::AgentConfig, reconcile::Snapshot};
 use anyhow::{Result, ensure};
@@ -9,8 +9,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub struct Change {
     pub agent: AgentConfig,
     pub project: Option<PathBuf>,
-    pub before: targets::Selection,
-    pub after: targets::Selection,
+    pub before: targets::DeploymentState,
+    pub after: targets::DeploymentState,
 }
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -54,22 +54,19 @@ impl Pending {
     ) -> Result<Option<Self>> {
         let mut changes = Vec::new();
         for agent in &ws.config.agents {
-            let before = targets::selection_from_snapshot(ws, agent, snap)?;
+            let before = targets::deployed_in(snap, agent);
             let mut after = before.clone();
             for action in actions {
                 match action {
                     deploy::Action::Link {
                         agent: key, skill, ..
                     } if key == &agent.key => {
-                        after.manual.insert(skill.clone());
+                        after.insert(skill.clone());
                     }
                     deploy::Action::Unlink {
                         agent: key, skill, ..
                     } if key == &agent.key => {
-                        after.manual.remove(skill);
-                        for members in after.presets.values_mut() {
-                            members.remove(skill);
-                        }
+                        after.remove(skill);
                     }
                     _ => {}
                 }
@@ -194,7 +191,7 @@ impl Pending {
     }
 
     pub fn keys(&self) -> Vec<String> {
-        self.changes.iter().flat_map(|c| c.after.skills()).collect()
+        self.changes.iter().flat_map(|c| c.after.clone()).collect()
     }
     /// `None` explicitly means keep none. An agent-owned copy is archived,
     /// never deleted. Library source directories always remain in the library.
@@ -209,8 +206,8 @@ impl Pending {
         );
         for change in &self.changes {
             ensure!(
-                targets::selection(ws, &change.agent)? == change.before,
-                "deployment selection changed; refresh and retry"
+                targets::scan_deployed(ws, &change.agent)? == change.before,
+                "deployment state changed; refresh and retry"
             );
         }
         ensure!(
@@ -243,10 +240,7 @@ impl Pending {
                         .iter_mut()
                         .filter(|c| identity(&c.agent.skills_path()) == group.directory)
                     {
-                        change.after.manual.remove(key);
-                        for members in change.after.presets.values_mut() {
-                            members.remove(key);
-                        }
+                        change.after.remove(key);
                     }
                 } else {
                     archives.push(candidate.path.clone());
@@ -279,7 +273,7 @@ impl Pending {
         let mut intents = Vec::new();
         let mut applied: Vec<Change> = Vec::new();
         for change in changes {
-            match targets::restore_selection(
+            match targets::restore_deployed(
                 ws,
                 &change.agent,
                 change.project.as_deref(),
@@ -290,7 +284,7 @@ impl Pending {
                     applied.push(change.clone());
                     messages.push(message);
                     if change.before != change.after {
-                        intents.push(crate::history::Intent::TargetSelection {
+                        intents.push(crate::history::Intent::TargetDeployment {
                             agent: change.agent,
                             project: change.project,
                             before: change.before,
@@ -301,7 +295,7 @@ impl Pending {
                 Err(error) => {
                     let mut failures = Vec::new();
                     for done in applied.iter().rev() {
-                        if let Err(rollback) = targets::restore_selection(
+                        if let Err(rollback) = targets::restore_deployed(
                             ws,
                             &done.agent,
                             done.project.as_deref(),

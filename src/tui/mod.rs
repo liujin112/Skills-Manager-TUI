@@ -2,11 +2,14 @@
 //!
 //! Structure: `event` feeds a single `Msg` channel from the input thread,
 //! a ticker and background tasks; `app` owns the state and reduces messages
-//! into view changes; `views` render and handle input per tab; `modal`
-//! implements overlays. All writes go through `skills::ops`, like the CLI.
+//! into view changes and resolves `settings`; `views` arrange shared `components`
+//! and handle page input; `modal` implements overlays. Components read the same
+//! settings snapshot and own presentation rules, independent of page modules.
+//! All writes go through `skills::ops`, like the CLI, with fresh validation there.
 
 mod app;
 mod batch;
+mod components;
 mod deploy_picker;
 mod event;
 mod icons;
@@ -16,6 +19,8 @@ mod markdown;
 mod modal;
 mod name_choices;
 mod repository_picker;
+mod settings;
+mod text;
 mod theme;
 mod toast;
 mod views;
@@ -41,7 +46,7 @@ pub fn run(ws: skills::Workspace, launch_dir: Option<&std::path::Path>) -> Resul
     let mut terminal = enter()?;
     let gate = std::sync::Arc::new(event::InputGate::default());
     event::spawn_input(tx.clone(), gate.clone());
-    event::spawn_ticker(tx);
+    event::spawn_ticker(tx, app.settings.interaction.tick_interval);
 
     let result = (|| -> Result<()> {
         loop {

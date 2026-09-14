@@ -35,11 +35,10 @@ impl Completion {
                 .skills
                 .iter()
                 .filter_map(|r| {
-                    if let Some(skills::meta::Source::Git { url, .. }) = &r.source {
-                        skills::repository::source_name(url)
-                    } else {
-                        None
-                    }
+                    r.source
+                        .as_ref()
+                        .and_then(skills::meta::Source::url)
+                        .and_then(skills::repository::source_name)
                 })
                 .collect(),
             Some(("tag", _)) => ctx
@@ -71,7 +70,7 @@ impl Completion {
             _ => BTreeSet::new(),
         };
         self.choices = candidates(token, values);
-        if !ctx.ws.config.tags_enabled {
+        if !ctx.settings.tags_enabled {
             self.choices
                 .retain(|s| !s.starts_with("tag:") && s != "untagged");
         }
@@ -174,7 +173,7 @@ impl Completion {
             ..area
         };
         f.render_widget(OverlayClear, self.rect);
-        let block = ctx.theme.block(" filters · Enter accepts ", true);
+        let block = ctx.settings.theme.block(" filters · Enter accepts ", true);
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
         let lines: Vec<Line> = self
@@ -189,9 +188,9 @@ impl Completion {
                     inner.width as usize,
                 ))
                 .style(if i == self.selected {
-                    ctx.theme.selected()
+                    ctx.settings.theme.selected()
                 } else {
-                    ctx.theme.dim()
+                    ctx.settings.theme.dim()
                 })
             })
             .collect();
