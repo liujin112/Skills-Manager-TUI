@@ -1286,11 +1286,35 @@ impl App {
 
     fn draw_header(&mut self, f: &mut Frame, area: Rect) {
         let th = &self.theme;
-        let mut spans: Vec<Span> = vec![Span::styled(" skills ", th.bold().fg(th.accent))];
         self.tab_rects.clear();
-        let mut x = area.x + width(" skills ") as u16;
+        if area.width < 70 {
+            let title = format!(" {} ", self.tab.title());
+            self.tab_rects.push((
+                Rect::new(area.x, area.y, (width(&title) as u16).min(area.width), 1),
+                self.tab,
+            ));
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(title, th.selected().fg(th.accent)),
+                    Span::styled("  Tab → next · Shift+Tab ←", th.dim()),
+                ])),
+                area,
+            );
+            return;
+        }
+        let compact = area.width < 90;
+        let mut spans: Vec<Span> = if compact {
+            vec![]
+        } else {
+            vec![Span::styled(" skills ", th.bold().fg(th.accent))]
+        };
+        let mut x = area.x + if compact { 0 } else { width(" skills ") as u16 };
         for (i, t) in Tab::visible(self.ws.config.tags_enabled).iter().enumerate() {
-            let label = format!(" {} {} ", i + 1, t.title());
+            let label = if compact {
+                format!(" {} ", t.title())
+            } else {
+                format!(" {} {} ", i + 1, t.title())
+            };
             let style = if *t == self.tab {
                 th.selected().fg(th.accent)
             } else {
@@ -1302,6 +1326,8 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
+        spans.push(Span::styled(" Tab ↔ ", th.dim()));
+        x += width(" Tab ↔ ") as u16;
         let used = (x - area.x) as usize;
         let right = if self.tasks_running > 0 {
             format!("{} working  ", SPINNER[self.spinner])
@@ -1949,6 +1975,39 @@ mod scope_tests {
 #[cfg(test)]
 mod panel_navigation_tests {
     use super::*;
+
+    #[test]
+    fn header_keeps_current_page_and_navigation_visible_at_small_widths() {
+        let root = std::env::temp_dir().join(format!("skills-header-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        for width in [40, 60, 70, 80, 120] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+            for tab in Tab::visible(true) {
+                app.tab = tab;
+                terminal.draw(|f| app.draw_header(f, f.area())).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(text.contains(tab.title()), "{width}: {text}");
+                assert!(text.contains("Tab"), "{width}: {text}");
+                assert!(app.tab_rects.iter().all(|(rect, _)| rect.right() <= width));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn tab_changes_pages_from_inputs_and_returning_clears_temporary_library_scope() {

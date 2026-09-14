@@ -62,21 +62,25 @@ pub fn status_text(s: &skills::reconcile::SkillStatus) -> String {
     }
 }
 
-/// Split an area into a left list and a right detail pane, stacking vertically on narrow terminals.
-pub fn split_panes(area: Rect, left_pct: u16) -> (Rect, Rect) {
+/// Keep navigation lists compact and give remaining space to details.
+/// Narrow terminals stack the list above the content.
+pub fn split_panes(area: Rect, left_width: u16) -> (Rect, Rect) {
     use ratatui::layout::{Constraint, Direction, Layout};
     if area.width < 90 {
         let r = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .constraints([
+                Constraint::Length((area.height * 45 / 100).min(14)),
+                Constraint::Min(0),
+            ])
             .split(area);
         (r[0], r[1])
     } else {
         let r = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(left_pct),
-                Constraint::Percentage(100 - left_pct),
+                Constraint::Length(left_width.min(area.width / 2)),
+                Constraint::Min(0),
             ])
             .split(area);
         (r[0], r[1])

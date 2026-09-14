@@ -284,11 +284,13 @@ impl View for ReposView {
         self.right = right;
         let path = self
             .project
-            .map(|i| {
-                if self.projects[i].local {
+            .or_else(|| self.nav.selected())
+            .and_then(|i| self.projects.get(i))
+            .map(|project| {
+                if project.local {
                     ctx.ws.root.clone()
                 } else {
-                    ctx.ws.root.join("repos").join(&self.projects[i].name)
+                    ctx.ws.root.join("repos").join(&project.name)
                 }
             })
             .unwrap_or_else(|| ctx.ws.root.join("repos"));
@@ -311,7 +313,7 @@ impl View for ReposView {
         } else {
             self.projects
                 .iter()
-                .map(|p| format!("{}/  ({} skills)", p.name, p.keys.len()))
+                .map(|p| format!("{} · {} skills", p.name, p.keys.len()))
                 .collect()
         };
         let title = if self.project.is_some() {
@@ -327,15 +329,23 @@ impl View for ReposView {
         f.render_stateful_widget(
             List::new(items)
                 .block(block)
-                .highlight_style(ctx.theme.selected()),
+                .highlight_style(ctx.theme.selected())
+                .highlight_symbol("▸ "),
             left,
             &mut self.nav.state,
         );
-        let block = ctx.theme.block(" preview · read only ", self.reading);
+        let block = ctx.theme.block(
+            if self.project.is_some() {
+                " preview · read only "
+            } else {
+                " source details "
+            },
+            self.reading,
+        );
         let inner = block.inner(right);
         f.render_widget(block, right);
         let mut lines = vec![
-            Line::styled(path.display().to_string(), ctx.theme.dim()),
+            Line::styled(skills::paths::contract_tilde(&path), ctx.theme.dim()),
             Line::raw(""),
         ];
         if let Some(error) = &self.error {
@@ -359,11 +369,19 @@ impl View for ReposView {
                 lines.push(Line::raw("No installed skills in this repository."));
             }
         } else {
-            lines.push(Line::raw(
-                "Select a repository and press Enter to browse its installed skills.",
-            ));
             if let Some(project) = self.nav.selected().and_then(|i| self.projects.get(i)) {
+                lines.insert(
+                    0,
+                    Line::styled(project.name.clone(), ctx.theme.bold().fg(ctx.theme.accent)),
+                );
+                lines.push(Line::styled(
+                    format!("{} installed skills", project.keys.len()),
+                    ctx.theme.bold(),
+                ));
+                lines.push(Line::raw(""));
                 lines.push(Line::raw(project.source.clone()));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("Enter → browse skills", ctx.theme.accent()));
             }
             if self.projects.is_empty() {
                 lines.push(Line::raw(

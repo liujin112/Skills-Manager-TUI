@@ -1235,7 +1235,7 @@ impl AgentsView {
         let groups = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
+                Constraint::Length(5),
                 Constraint::Length(if scoped {
                     6 + self
                         .destinations
@@ -1373,28 +1373,28 @@ impl AgentsView {
             if x + w > rows[0].right() {
                 break;
             }
-            let rect = Rect::new(x, rows[0].y, w, 4.min(rows[0].height));
+            let rect = Rect::new(x, rows[0].y, w, 3.min(rows[0].height));
             let on = a.key == self.scope;
             let border = if on { th.accent() } else { th.dim() };
             let block = ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
                 .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(border);
+                .border_style(border)
+                .title(Line::from(Span::styled(
+                    format!(" {name} "),
+                    if on {
+                        th.bold().fg(th.accent)
+                    } else {
+                        th.dim()
+                    },
+                )));
             let inner = block.inner(rect).inner(ratatui::layout::Margin {
                 horizontal: 1,
                 vertical: 0,
             });
             f.render_widget(block, rect);
-            let title = if on {
-                th.bold().fg(th.accent)
-            } else {
-                th.dim()
-            };
             f.render_widget(
-                Paragraph::new(vec![
-                    Line::from(Span::styled(name, title)),
-                    Line::from(Span::styled(sub, th.dim())),
-                ]),
+                Paragraph::new(sub).style(if on { th.bold() } else { th.dim() }),
                 inner,
             );
             self.scope_rects.push((rect, a.key.clone()));
