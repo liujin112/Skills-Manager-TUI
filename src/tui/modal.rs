@@ -1786,6 +1786,13 @@ Tags / Presets
   Tab               complete an existing tag in the picker
   Backspace         empty tag input: select last token; press again to remove
   Esc / q           clear results filter, skills → group list → tab strip
+Staged selection dialogs
+  Enter / Space     toggle the current list item; activate the focused button
+  Tab / Shift-Tab   list → Apply → Cancel; reverse with Shift
+  Down at last item focus Apply; Up from buttons returns to the list
+  Left / Right      switch Apply / Cancel when a button has focus
+  o                 preview a skill in the member selector
+  Esc / q           cancel without applying; search input and preview return first
 Agents
   /                 filter presets or skills, according to focus
   arrows            navigate agents, scopes and skills

@@ -1,4 +1,5 @@
 //! Staged agent deployment with an explicit destination scope.
+use super::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 use super::{
     app::{Action, Ctx, Hints},
     widgets::{Input, ListNav, OverlayClear, fit},
@@ -7,7 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::{
     Frame,
     layout::{Position, Rect},
-    text::Line,
+    text::{Line, Span},
     widgets::{List, ListItem, Paragraph, Wrap},
 };
 use skills::{config::AgentConfig, ops::targets, reconcile::DeployState};
@@ -22,6 +23,7 @@ pub struct DeployPicker {
     rows: Vec<(AgentConfig, usize, Option<bool>)>,
     list: ListNav,
     editing: bool,
+    focus: ChoiceFocus,
     error: Option<String>,
     rect: Rect,
     project_rect: Rect,
@@ -47,6 +49,7 @@ impl DeployPicker {
             rows: vec![],
             list: ListNav::default(),
             editing: false,
+            focus: ChoiceFocus::List,
             error: None,
             rect: Rect::default(),
             project_rect: Rect::default(),
@@ -106,6 +109,9 @@ impl DeployPicker {
             self.error = Some(format!("{e:#}"));
         }
         self.list.first(self.rows.len());
+        if self.rows.is_empty() {
+            self.focus = ChoiceFocus::Apply;
+        }
     }
     fn toggle(&mut self) {
         if let Some((agent, count, desired)) = self.list.selected().and_then(|i| self.rows.get(i)) {
@@ -118,26 +124,53 @@ impl DeployPicker {
             }
         }
     }
+    fn pending_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|(_, count, desired)| {
+                desired.is_some_and(|on| {
+                    if on {
+                        *count < self.keys.len()
+                    } else {
+                        *count > 0
+                    }
+                })
+            })
+            .map(|(a, _, _)| a.skills_path())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
     fn apply(&mut self) -> Vec<Action> {
         if self.editing {
             self.error = Some("Press Enter to confirm the project path first".into());
             return vec![];
         }
+        if self.pending_count() == 0 {
+            return vec![];
+        }
         let changes: Vec<_> = self
             .rows
             .iter()
-            .filter_map(|(a, _, desired)| {
-                desired.map(|on| {
-                    (
-                        a.clone(),
-                        on,
-                        if self.local_keys.contains(&a.key) {
-                            self.resolved_project.clone()
+            .filter_map(|(a, count, desired)| {
+                desired
+                    .filter(|on| {
+                        if *on {
+                            *count < self.keys.len()
                         } else {
-                            None
-                        },
-                    )
-                })
+                            *count > 0
+                        }
+                    })
+                    .map(|on| {
+                        (
+                            a.clone(),
+                            on,
+                            if self.local_keys.contains(&a.key) {
+                                self.resolved_project.clone()
+                            } else {
+                                None
+                            },
+                        )
+                    })
             })
             .collect();
         if changes.is_empty() {
@@ -155,8 +188,8 @@ impl DeployPicker {
     }
     pub fn hints(&self) -> Hints {
         &[
-            ("Ctrl+Enter", "apply"),
-            ("Space", "select"),
+            ("Tab/Shift+Tab", "list / buttons"),
+            ("Enter/Space", "select / activate"),
             ("↑↓", "move"),
             ("p", "project path"),
             ("Esc", "cancel"),
@@ -171,6 +204,10 @@ impl DeployPicker {
         vec![]
     }
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.editing && k.code == KeyCode::Esc {
+            self.editing = false;
+            return vec![];
+        }
         if k.code == KeyCode::Esc
             || (!self.editing && k.code == KeyCode::Char('q') && k.modifiers.is_empty())
         {
@@ -184,6 +221,14 @@ impl DeployPicker {
                 self.project.handle_key(k);
             }
             return vec![];
+        }
+        let at_end = self.rows.is_empty() || self.list.selected() == Some(self.rows.len() - 1);
+        if let Some(event) = self.focus.key(k.code, at_end) {
+            return match event {
+                ChoiceEvent::Apply => self.apply(),
+                ChoiceEvent::Cancel => vec![Action::CloseModal],
+                ChoiceEvent::Moved => vec![],
+            };
         }
         match k.code {
             KeyCode::Char('p') => self.editing = true,
@@ -203,8 +248,10 @@ impl DeployPicker {
                     self.editing = true;
                     self.project.click(m.column);
                 } else if self.buttons[0].contains(at) {
+                    self.focus = ChoiceFocus::Apply;
                     return self.apply();
                 } else if self.buttons[1].contains(at) {
+                    self.focus = ChoiceFocus::Cancel;
                     return vec![Action::CloseModal];
                 } else if self.list.rows.contains(at) {
                     if self.editing {
@@ -212,6 +259,7 @@ impl DeployPicker {
                         self.reload(ctx);
                     }
                     if let Some(i) = self.list.row_at(m.row, self.rows.len()) {
+                        self.focus = ChoiceFocus::List;
                         self.list.select(Some(i));
                         self.toggle();
                     }
@@ -237,13 +285,65 @@ impl DeployPicker {
         self.project_rect = Rect::default();
         f.render_widget(OverlayClear, self.rect);
         let block = ctx.settings.theme.block(
-            format!(" Install to agents · {} skills ", self.keys.len()),
+            format!(
+                " Install to agents · {} {} ",
+                self.keys.len(),
+                if self.keys.len() == 1 {
+                    "skill"
+                } else {
+                    "skills"
+                }
+            ),
             true,
         );
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
-        if inner.height < 12 || inner.width < 40 {
-            f.render_widget(Paragraph::new("Enlarge terminal · Esc cancel"), inner);
+        if inner.height < 12 || inner.width < 26 {
+            let footer_height = inner.height.min(2);
+            self.list.rows = Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(footer_height),
+            );
+            let rows: Vec<_> = self
+                .rows
+                .iter()
+                .map(|(a, count, desired)| {
+                    ListItem::new(format!(
+                        "{} {} {count}/{}",
+                        if desired.unwrap_or(*count == self.keys.len()) {
+                            "[✓]"
+                        } else {
+                            "[ ]"
+                        },
+                        a.display_name(),
+                        self.keys.len()
+                    ))
+                })
+                .collect();
+            f.render_stateful_widget(
+                List::new(rows).highlight_style(if self.focus == ChoiceFocus::List {
+                    ctx.settings.theme.selected()
+                } else {
+                    ctx.settings.theme.dim()
+                }),
+                self.list.rows,
+                &mut self.list.state,
+            );
+            self.buttons = choice_footer::draw(
+                f,
+                Rect::new(
+                    inner.x,
+                    inner.bottom() - footer_height,
+                    inner.width,
+                    footer_height,
+                ),
+                self.focus,
+                self.pending_count() > 0,
+                "",
+                &ctx.settings.theme,
+            );
             return;
         }
         f.render_widget(
@@ -275,7 +375,12 @@ impl DeployPicker {
             .style(ctx.settings.theme.dim()),
             Rect::new(inner.x, inner.y + 3, inner.width, 1),
         );
-        self.list.rows = Rect::new(inner.x, inner.y + 5, inner.width, inner.height - 11);
+        self.list.rows = Rect::new(
+            inner.x,
+            inner.y + 5,
+            inner.width,
+            inner.height.saturating_sub(11).max(1),
+        );
         let mut previous_product = String::new();
         let rows: Vec<_> = self
             .rows
@@ -295,24 +400,41 @@ impl DeployPicker {
                     None if *count > 0 => "[−]",
                     None => "[ ]",
                 };
-                ListItem::new(Line::from(fit(
-                    &format!(
-                        "{mark} {:<15} {}  {count}/{}",
-                        label,
-                        targets::location_label(
-                            a,
-                            self.resolved_project
-                                .as_deref()
-                                .unwrap_or(std::path::Path::new(""))
-                        ),
-                        self.keys.len()
+                let th = &ctx.settings.theme;
+                let location = targets::location_label(
+                    a,
+                    self.resolved_project
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("")),
+                );
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{mark} "),
+                        if desired.is_some() {
+                            th.accent()
+                        } else if *count > 0 {
+                            th.ok()
+                        } else {
+                            th.dim()
+                        },
                     ),
-                    inner.width as usize,
-                )))
+                    Span::styled(format!("{label:<15} "), th.bold()),
+                    Span::styled(
+                        fit(
+                            &format!("{location}  {count}/{}", self.keys.len()),
+                            inner.width.saturating_sub(20) as usize,
+                        ),
+                        th.dim(),
+                    ),
+                ]))
             })
             .collect();
         f.render_stateful_widget(
-            List::new(rows).highlight_style(ctx.settings.theme.selected()),
+            List::new(rows).highlight_style(if self.focus == ChoiceFocus::List && !self.editing {
+                ctx.settings.theme.selected()
+            } else {
+                ctx.settings.theme.dim()
+            }),
             self.list.rows,
             &mut self.list.state,
         );
@@ -335,30 +457,38 @@ impl DeployPicker {
             Paragraph::new(destination).wrap(Wrap { trim: false }),
             Rect::new(inner.x, inner.bottom() - 6, inner.width, 2),
         );
-        let info = self.error.clone().unwrap_or_else(|| {
-            "Shared directories affect every agent reading them. Space selects; Apply writes."
-                .into()
-        });
+        let info = self
+            .error
+            .clone()
+            .unwrap_or_else(|| "Shared directories affect every agent reading them.".into());
         f.render_widget(
-            Paragraph::new(info)
-                .wrap(Wrap { trim: false })
-                .style(if self.error.is_some() {
-                    ctx.settings.theme.err()
-                } else {
-                    ctx.settings.theme.dim()
-                }),
+            Paragraph::new(if self.error.is_some() {
+                format!(" {info}")
+            } else {
+                info
+            })
+            .wrap(Wrap { trim: false })
+            .style(if self.error.is_some() {
+                ctx.settings.theme.err()
+            } else {
+                ctx.settings.theme.dim()
+            }),
             Rect::new(inner.x, inner.bottom() - 4, inner.width, 2),
         );
-        self.buttons = [
-            Rect::new(inner.x, inner.bottom() - 1, 12, 1),
-            Rect::new(inner.x + 14, inner.bottom() - 1, 12, 1),
-        ];
-        for (i, label) in ["[ Apply ]", "[ Cancel ]"].iter().enumerate() {
-            f.render_widget(
-                Paragraph::new(*label).style(ctx.settings.theme.bold()),
-                self.buttons[i],
-            );
-        }
+        let pending = self.pending_count();
+        let summary = if pending == 0 {
+            "No pending changes".into()
+        } else {
+            format!("{pending} pending destinations")
+        };
+        self.buttons = choice_footer::draw(
+            f,
+            Rect::new(inner.x, inner.bottom() - 2, inner.width, 2),
+            self.focus,
+            pending > 0,
+            &summary,
+            &ctx.settings.theme,
+        );
     }
 }
 
@@ -389,6 +519,25 @@ mod tests {
         };
         let mut picker =
             DeployPicker::with_home(vec!["sample".into()], &ctx, project.with_extension("home"));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(picker.pending_count(), 0);
+        picker.key(key(KeyCode::Tab), &ctx);
+        assert_eq!(picker.focus, ChoiceFocus::Apply);
+        assert!(picker.key(key(KeyCode::Enter), &ctx).is_empty());
+        picker.key(key(KeyCode::Tab), &ctx);
+        assert_eq!(picker.focus, ChoiceFocus::Cancel);
+        picker.key(key(KeyCode::Up), &ctx);
+        let last = picker.rows.len() - 1;
+        picker.list.select(Some(last));
+        picker.key(key(KeyCode::Down), &ctx);
+        assert_eq!(picker.focus, ChoiceFocus::Apply);
+        picker.key(key(KeyCode::Up), &ctx);
+        assert_eq!(picker.list.selected(), Some(last));
+        picker.key(key(KeyCode::Enter), &ctx);
+        assert_eq!(picker.focus, ChoiceFocus::List);
+        assert!(picker.pending_count() > 0);
+        picker.key(key(KeyCode::Enter), &ctx);
+        assert_eq!(picker.pending_count(), 0);
         let cursor = picker
             .rows
             .iter()
@@ -444,7 +593,7 @@ mod tests {
                     "target directory tail must remain visible"
                 );
             } else {
-                assert!(text.contains("Enlarge terminal"));
+                assert!(text.contains("Apply") && text.contains("Cancel"));
             }
         }
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();

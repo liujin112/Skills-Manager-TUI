@@ -1,5 +1,6 @@
 //! Explicit, staged edits for a fixed selection of skills.
 use super::app::{Action, Ctx, Hints};
+use super::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 use super::widgets::{Input, ListNav, OverlayClear, fit};
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -190,8 +191,8 @@ impl Batch {
             &[
                 ("type", "filter"),
                 ("↓", "list"),
-                ("Enter", "choose/create"),
-                ("Ctrl+Enter", "apply"),
+                ("Enter", "results"),
+                ("Tab/Shift+Tab", "list / buttons"),
                 ("Esc", "cancel"),
             ]
         } else {
@@ -199,7 +200,7 @@ impl Batch {
                 ("↑↓", "move"),
                 ("Space", "toggle"),
                 ("←→", "controls"),
-                ("Ctrl+Enter", "apply"),
+                ("Tab/Shift+Tab", "list / buttons"),
                 ("Esc", "cancel"),
             ]
         }
@@ -254,8 +255,20 @@ impl Batch {
     }
 
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.kind != Kind::Tags && self.focus == 0 && k.code == KeyCode::Esc {
+            if self.input.value().is_empty() {
+                self.focus = 1;
+            } else {
+                self.input = Input::default();
+                self.filter();
+            }
+            return vec![];
+        }
         if k.code == KeyCode::Esc
-            || (self.kind != Kind::Tags && k.code == KeyCode::Char('q') && k.modifiers.is_empty())
+            || (self.kind != Kind::Tags
+                && self.focus != 0
+                && k.code == KeyCode::Char('q')
+                && k.modifiers.is_empty())
         {
             return vec![Action::CloseModal];
         }
@@ -292,12 +305,41 @@ impl Batch {
             }
             return vec![];
         }
+        if self.focus == 0 && matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = if k.code == KeyCode::Tab { 2 } else { 3 };
+            return vec![];
+        }
+        if self.focus > 0 {
+            let mut focus = match self.focus {
+                2 => ChoiceFocus::Apply,
+                3 => ChoiceFocus::Cancel,
+                _ => ChoiceFocus::List,
+            };
+            let at_end =
+                self.shown.is_empty() || self.list.selected() == Some(self.shown.len() - 1);
+            if let Some(event) = focus.key(k.code, at_end) {
+                self.focus = match focus {
+                    ChoiceFocus::List => 1,
+                    ChoiceFocus::Apply => 2,
+                    ChoiceFocus::Cancel => 3,
+                };
+                return match event {
+                    ChoiceEvent::Apply => {
+                        if self.pending_count() > 0 {
+                            self.apply(ctx)
+                        } else {
+                            vec![]
+                        }
+                    }
+                    ChoiceEvent::Cancel => vec![Action::CloseModal],
+                    ChoiceEvent::Moved => vec![],
+                };
+            }
+        }
         if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::CONTROL) {
             return self.apply(ctx);
         }
         match k.code {
-            KeyCode::Right if self.focus > 0 => self.focus = (self.focus + 1).min(3),
-            KeyCode::Left if self.focus > 1 => self.focus -= 1,
             KeyCode::Down if self.focus == 0 => {
                 self.focus = 1;
                 self.list.clamp(self.shown.len());
@@ -412,7 +454,19 @@ impl Batch {
             })
         }))]
     }
+    fn pending_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| {
+                r.desired == Some(true) && r.count < self.keys.len()
+                    || self.kind == Kind::Deploy && r.desired == Some(false) && r.count > 0
+            })
+            .count()
+    }
     fn apply(&mut self, ctx: &Ctx) -> Vec<Action> {
+        if self.kind != Kind::Tags && self.pending_count() == 0 {
+            return vec![];
+        }
         if self.keys.is_empty() {
             self.error = Some("No skills selected.".into());
             return vec![];
@@ -530,6 +584,7 @@ impl Batch {
                     return vec![Action::CloseModal];
                 }
                 if self.buttons[0].contains(at) {
+                    self.focus = 2;
                     return self.apply(ctx);
                 }
                 if self.input_rect.contains(at) {
@@ -918,21 +973,24 @@ impl Batch {
             }),
             Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
         );
-        let bw = (inner.width / 2).min(18);
-        self.buttons = [
-            Rect::new(inner.x, inner.bottom() - 1, bw, 1),
-            Rect::new(inner.x + bw, inner.bottom() - 1, bw, 1),
-        ];
-        for (i, label) in ["Apply changes", "Cancel"].iter().enumerate() {
-            f.render_widget(
-                Paragraph::new(Line::from(super::widgets::button(
-                    label,
-                    self.focus == i + 2,
-                    &ctx.settings.theme,
-                ))),
-                self.buttons[i],
-            );
-        }
+        let focus = match self.focus {
+            2 => ChoiceFocus::Apply,
+            3 => ChoiceFocus::Cancel,
+            _ => ChoiceFocus::List,
+        };
+        let pending = self.pending_count();
+        self.buttons = choice_footer::draw(
+            f,
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            focus,
+            pending > 0,
+            if pending == 0 {
+                "No pending changes"
+            } else {
+                "Pending changes"
+            },
+            &ctx.settings.theme,
+        );
     }
 }
 
@@ -1307,6 +1365,31 @@ mod tests {
             },
         };
         let mut batch = Batch::presets(vec!["alpha".into(), "beta".into()], &ctx);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        batch.key(key(KeyCode::Enter), &ctx);
+        batch.key(key(KeyCode::Tab), &ctx);
+        assert_eq!(batch.focus, 2);
+        assert!(batch.key(key(KeyCode::Enter), &ctx).is_empty());
+        batch.key(key(KeyCode::Tab), &ctx);
+        assert_eq!(batch.focus, 3);
+        batch.key(key(KeyCode::Up), &ctx);
+        batch.list.select(Some(1));
+        batch.key(key(KeyCode::Down), &ctx);
+        assert_eq!(batch.focus, 2);
+        batch.key(key(KeyCode::Up), &ctx);
+        assert_eq!(batch.list.selected(), Some(1));
+        assert!(batch.key(key(KeyCode::Enter), &ctx).is_empty());
+        assert_eq!(batch.rows[1].desired, Some(true));
+        batch.key(key(KeyCode::BackTab), &ctx);
+        assert_eq!(batch.focus, 3);
+        assert!(matches!(
+            batch.key(key(KeyCode::Enter), &ctx).as_slice(),
+            [Action::CloseModal]
+        ));
+        assert_eq!(
+            ws.presets.load("two").unwrap().unwrap().skills,
+            vec!["other"]
+        );
         assert_eq!(batch.rows[0].count, 1);
         assert_eq!(batch.rows[1].count, 0);
         for row in &mut batch.rows {

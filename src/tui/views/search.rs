@@ -1,4 +1,5 @@
 //! Library tab: input, result list, preview.
+use crate::tui::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 
 use super::preview::{Overlay, preview_lines};
 use super::{View, wheel};
@@ -11,7 +12,7 @@ use crate::tui::components::skill::{SkillPresentation, SkillRenderState};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
-use crate::tui::widgets::{CardGrid, Input, ScrollTrack, fit, width};
+use crate::tui::widgets::{CardGrid, Input, ScrollTrack};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -94,6 +95,7 @@ pub struct SearchView {
     scope: Option<(BTreeSet<String>, String)>,
     checked: BTreeSet<String>,
     batch_buttons: Vec<(Rect, char)>,
+    choice_focus: ChoiceFocus,
     updates: BTreeMap<String, String>,
 }
 
@@ -129,6 +131,7 @@ impl Default for SearchView {
             scope: None,
             checked: BTreeSet::new(),
             batch_buttons: Vec::new(),
+            choice_focus: ChoiceFocus::List,
             updates: BTreeMap::new(),
         }
     }
@@ -144,7 +147,7 @@ impl SearchView {
         header: impl FnOnce(&mut Frame, Rect),
     ) {
         self.area = area;
-        let footer_height = u16::from(self.is_picker()).min(area.height);
+        let footer_height = (u16::from(self.is_picker()) * 2).min(area.height);
         let panel_area = Rect {
             height: area.height.saturating_sub(footer_height),
             ..area
@@ -169,7 +172,9 @@ impl SearchView {
                 results_title: Line::from(title),
                 hint: ("search skills…", usage),
                 input_active: self.panel_active && self.focus == Focus::Input,
-                results_active: self.panel_active && self.focus == Focus::List,
+                results_active: self.panel_active
+                    && self.focus == Focus::List
+                    && self.choice_focus == ChoiceFocus::List,
                 header_height,
             },
             &ctx.settings.theme,
@@ -206,94 +211,28 @@ impl SearchView {
         self.overlay.draw(f, content, ctx);
         self.batch_buttons.clear();
         if self.is_picker() {
-            let bar = footer;
-            let mut x = bar.x;
-            let visible = self.visible_checked(ctx).len();
-            let selected = if self.preset.is_some() {
-                self.checked.len()
-            } else {
-                visible
-            };
-            let status = if self.multi {
-                let hidden = self.checked.len().saturating_sub(visible);
-                format!(
-                    " {} · {selected} selected{} ",
-                    if self.preset.is_some() {
-                        "Members"
-                    } else {
-                        "Multi-select"
-                    },
-                    if hidden > 0 {
-                        if self.preset.is_some() {
-                            format!(" · {hidden} outside filter")
-                        } else {
-                            format!(" · {hidden} hidden (excluded)")
-                        }
-                    } else {
-                        String::new()
-                    }
-                )
-            } else {
-                self.selected(ctx)
-                    .map(|r| {
-                        if r.status.is_healthy() {
-                            format!(" {} ", r.source_kind())
-                        } else {
-                            format!(" {} · {} ", r.source_kind(), r.status.label())
-                        }
-                    })
-                    .unwrap_or_default()
-            };
-            let status = fit(&status, bar.width as usize / 2);
-            let w = width(&status) as u16;
-            f.render_widget(
-                Paragraph::new(Span::styled(status, ctx.settings.theme.dim())),
-                Rect::new(x, bar.y, w, 1),
-            );
-            x += w;
-            let buttons: &[(&str, char)] = if self.is_picker() {
-                &[
-                    ("[Select all]", 'a'),
-                    ("[Apply a]", 'c'),
-                    ("[Cancel Esc]", 'e'),
-                ]
-            } else if self.multi {
-                &[
-                    ("[Select all]", 'a'),
-                    ("[Tags t]", 't'),
-                    ("[Deploy d]", 'd'),
-                    ("[Preset p]", 'p'),
-                    ("[Cancel Esc]", 'e'),
-                ]
-            } else {
-                &[("[Multi-select m]", 'm')]
-            };
-            for (label, command) in buttons {
-                let w = width(label) as u16;
-                if x + w > bar.right() {
-                    break;
-                }
-                let rect = Rect::new(x, bar.y, w, 1);
-                let enabled = self.is_picker()
-                    || !self.multi
-                    || selected > 0
-                    || matches!(*command, 'e' | 'a');
-                f.render_widget(
-                    Paragraph::new(Span::styled(
-                        *label,
-                        if enabled {
-                            ctx.settings.theme.accent()
-                        } else {
-                            ctx.settings.theme.dim()
-                        },
-                    )),
-                    rect,
-                );
-                if enabled {
-                    self.batch_buttons.push((rect, *command));
-                }
-                x += w + 1;
+            if self.hits.is_empty()
+                && self.focus == Focus::List
+                && self.choice_focus == ChoiceFocus::List
+            {
+                self.choice_focus = ChoiceFocus::Apply;
             }
+            let enabled = self.can_apply(ctx);
+            let summary = if enabled {
+                format!("{} selected", self.checked.len())
+            } else {
+                "No pending changes".into()
+            };
+            let buttons = choice_footer::draw(
+                f,
+                footer,
+                self.choice_focus,
+                enabled,
+                &summary,
+                &ctx.settings.theme,
+            );
+            self.batch_buttons
+                .extend([(buttons[0], 'c'), (buttons[1], 'e')]);
         }
         if self.panel_active && self.focus == Focus::Input && !self.overlay.is_open() {
             self.search_panel.draw_completion(f, areas.results, ctx);
@@ -492,7 +431,22 @@ impl SearchView {
         view
     }
 
+    fn can_apply(&self, ctx: &Ctx) -> bool {
+        if self.target.is_some() {
+            return !self.visible_checked(ctx).is_empty();
+        }
+        if self.tag.is_some() {
+            return self.hits.iter().any(|h| {
+                let r = &ctx.snap.skills[h.index];
+                self.checked.contains(&r.key) != r.tags.iter().any(|t| Some(t) == self.tag.as_ref())
+            });
+        }
+        self.checked != self.preset_original
+    }
     fn apply_preset(&self, ctx: &Ctx) -> Vec<Action> {
+        if !self.can_apply(ctx) {
+            return vec![];
+        }
         if let Some((agent, project, on)) = self.target.clone() {
             let keys = self.visible_checked(ctx);
             if keys.is_empty() {
@@ -715,9 +669,11 @@ impl SearchView {
         self.focus == Focus::Input
     }
     pub fn focus_input(&mut self) {
+        self.choice_focus = ChoiceFocus::List;
         self.focus = Focus::Input;
     }
     pub fn focus_list(&mut self) {
+        self.choice_focus = ChoiceFocus::List;
         self.focus = Focus::List;
     }
     pub fn set_query(&mut self, q: &str, ctx: &Ctx) {
@@ -1093,7 +1049,13 @@ impl SearchView {
                 .join("·");
             let render_state = self.render_state(r, h, &context, searching);
             if cards {
-                let ci = skill_frame(f, cell, on, self.focus == Focus::List, ctx);
+                let ci = skill_frame(
+                    f,
+                    cell,
+                    on,
+                    self.focus == Focus::List && self.choice_focus == ChoiceFocus::List,
+                    ctx,
+                );
                 let lines = presentation.card(ctx, ci.width as usize, &render_state);
                 let style = if self.multi && self.checked.contains(&r.key) {
                     th.selected_unfocused()
@@ -1105,7 +1067,7 @@ impl SearchView {
                 // The card's lines without its frame or rule; the selection is
                 // the marker and a background, as in any list.
                 let style = if on {
-                    if self.focus == Focus::List {
+                    if self.focus == Focus::List && self.choice_focus == ChoiceFocus::List {
                         th.selected()
                     } else {
                         th.selected_unfocused()
@@ -1122,7 +1084,7 @@ impl SearchView {
                 f.render_widget(Paragraph::new(lines).style(style), cell);
             } else {
                 let style = if on {
-                    if self.focus == Focus::List {
+                    if self.focus == Focus::List && self.choice_focus == ChoiceFocus::List {
                         th.selected()
                     } else {
                         th.selected_unfocused()
@@ -1298,12 +1260,41 @@ impl View for SearchView {
             return vec![];
         }
         if self.is_picker() {
+            if self.focus == Focus::Input && matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+                self.search_panel.completion.close();
+                self.focus = Focus::List;
+                self.choice_focus = if k.code == KeyCode::Tab {
+                    ChoiceFocus::Apply
+                } else {
+                    ChoiceFocus::Cancel
+                };
+                return vec![];
+            }
             if k.code == KeyCode::Esc {
                 if self.focus == Focus::Preview {
                     self.focus = Focus::List;
                     return vec![];
                 }
                 return vec![Action::CloseModal];
+            }
+            if self.focus == Focus::List {
+                let at_end =
+                    self.hits.is_empty() || self.grid.selected() == Some(self.hits.len() - 1);
+                if let Some(event) = self.choice_focus.key(k.code, at_end) {
+                    return match event {
+                        ChoiceEvent::Apply => self.apply_preset(ctx),
+                        ChoiceEvent::Cancel => vec![Action::CloseModal],
+                        ChoiceEvent::Moved => vec![],
+                    };
+                }
+            }
+            if self.focus == Focus::List && k.code == KeyCode::Enter && k.modifiers.is_empty() {
+                self.toggle_current(ctx);
+                return vec![];
+            }
+            if self.focus == Focus::List && k.code == KeyCode::Char('o') {
+                self.open_preview(ctx);
+                return vec![];
             }
             if self.focus == Focus::List && k.code == KeyCode::Char('a') && k.modifiers.is_empty() {
                 return self.apply_preset(ctx);
@@ -1568,7 +1559,11 @@ impl View for SearchView {
                     );
                     return vec![];
                 }
-                'c' => return self.apply_preset(ctx),
+                'c' => {
+                    self.focus = Focus::List;
+                    self.choice_focus = ChoiceFocus::Apply;
+                    return self.apply_preset(ctx);
+                }
                 'e' => {
                     if self.is_picker() {
                         return vec![Action::CloseModal];
@@ -1579,6 +1574,9 @@ impl View for SearchView {
                 }
                 operation => return self.batch_action(operation, ctx),
             }
+        }
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.choice_focus = ChoiceFocus::List;
         }
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m, ctx) {
@@ -1658,6 +1656,19 @@ impl View for SearchView {
     }
 
     fn hints(&self) -> Hints {
+        if self.is_picker()
+            && self.focus == Focus::List
+            && self.choice_focus != ChoiceFocus::List
+            && !self.overlay.is_open()
+        {
+            return &[
+                ("←→", "buttons"),
+                ("Tab/Shift+Tab", "next / previous"),
+                ("↑", "list"),
+                ("Enter/Space", "activate"),
+                ("Esc/q", "cancel"),
+            ];
+        }
         if let Some(hints) = self.overlay.hints() {
             return hints;
         }
@@ -1672,7 +1683,7 @@ impl View for SearchView {
             if self.is_picker() {
                 return &[
                     ("Enter/↓", "results"),
-                    ("Ctrl+Enter", "apply"),
+                    ("Tab/Shift+Tab", "list / buttons"),
                     ("Esc", "cancel"),
                 ];
             }
@@ -1693,12 +1704,11 @@ impl View for SearchView {
         }
         if self.is_picker() {
             return &[
-                ("a", "apply"),
-                ("Space", "select"),
+                ("Enter/Space", "select"),
                 ("Ctrl+A", "select all results"),
                 ("/", "search"),
-                ("Enter", "preview"),
-                ("Ctrl+Enter", "apply"),
+                ("o", "preview"),
+                ("Tab/Shift+Tab", "list / buttons"),
                 ("Esc", "cancel"),
             ];
         }
@@ -1760,6 +1770,7 @@ impl View for SearchView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::widgets::width;
 
     #[test]
     fn preset_picker_refreshes_indices_without_dropping_pending_members() {
@@ -1787,6 +1798,21 @@ mod tests {
             settings: &settings,
         };
         let mut picker = SearchView::preset_members("daily", &ctx);
+        picker.focus_list();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        picker.handle_key(key(KeyCode::Tab), &ctx);
+        assert_eq!(picker.choice_focus, ChoiceFocus::Apply);
+        assert!(picker.handle_key(key(KeyCode::Enter), &ctx).is_empty());
+        picker.handle_key(key(KeyCode::Tab), &ctx);
+        assert_eq!(picker.choice_focus, ChoiceFocus::Cancel);
+        picker.handle_key(key(KeyCode::Up), &ctx);
+        assert_eq!(picker.choice_focus, ChoiceFocus::List);
+
+        picker.handle_key(key(KeyCode::Enter), &ctx);
+        assert!(!picker.overlay.is_open());
+        assert_eq!(picker.checked.len(), 1);
+        picker.handle_key(key(KeyCode::Enter), &ctx);
+        assert!(picker.checked.is_empty());
         picker.checked.insert("alpha".into());
         picker.set_query("beta", &ctx);
         picker.focus_list();
@@ -2004,11 +2030,11 @@ mod tests {
         let mut picker = SearchView::preset_members("example", &ctx);
         assert_eq!(picker.hits.len(), 1);
         picker.focus_input();
-        assert!(!picker.hints().iter().any(|(k, _)| *k == "Space"));
+        assert!(!picker.hints().iter().any(|(k, _)| k.contains("Space")));
         picker.focus_list();
-        assert!(picker.hints().iter().any(|(k, _)| *k == "Space"));
+        assert!(picker.hints().iter().any(|(k, _)| k.contains("Space")));
         picker.focus = Focus::Preview;
-        assert!(!picker.hints().iter().any(|(k, _)| *k == "Space"));
+        assert!(!picker.hints().iter().any(|(k, _)| k.contains("Space")));
         std::fs::remove_dir_all(root).unwrap();
     }
 

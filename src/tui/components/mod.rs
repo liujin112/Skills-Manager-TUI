@@ -12,3 +12,5 @@ pub mod skill;
 
 pub(crate) mod completion;
 pub(crate) mod search_panel;
+
+pub(crate) mod choice_footer;

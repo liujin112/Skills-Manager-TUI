@@ -1,4 +1,5 @@
 //! One explicit keep/none decision per conflicting name, staged until Apply.
+use super::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 use super::{
     app::{Action, Ctx, Hints},
     modal::Modal,
@@ -18,6 +19,8 @@ pub struct NameChoices {
     group: usize,
     list: ListNav,
     apply_rect: Rect,
+    cancel_rect: Rect,
+    focus: ChoiceFocus,
     previous_rect: Rect,
     next_rect: Rect,
 }
@@ -30,6 +33,8 @@ impl NameChoices {
             group: 0,
             list: ListNav::default(),
             apply_rect: Rect::default(),
+            cancel_rect: Rect::default(),
+            focus: ChoiceFocus::List,
             previous_rect: Rect::default(),
             next_rect: Rect::default(),
         };
@@ -82,11 +87,28 @@ impl NameChoices {
             ("↑↓", "option"),
             ("Enter/Space", "choose"),
             ("←→", "conflict"),
-            ("a", "review / apply"),
+            ("Tab/Shift+Tab", "list / buttons"),
             ("Esc", "cancel"),
         ]
     }
     pub fn key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            return vec![Action::CloseModal];
+        }
+        let at_end = self.list.selected() == Some(self.len() - 1);
+        if let Some(event) = self.focus.key(key.code, at_end) {
+            return match event {
+                ChoiceEvent::Apply => {
+                    if self.choices.iter().all(Option::is_some) {
+                        self.apply()
+                    } else {
+                        vec![]
+                    }
+                }
+                ChoiceEvent::Cancel => vec![Action::CloseModal],
+                ChoiceEvent::Moved => vec![],
+            };
+        }
         match key.code {
             KeyCode::Esc => return vec![Action::CloseModal],
             KeyCode::Up => self.list.move_by(-1, self.len()),
@@ -126,12 +148,22 @@ impl NameChoices {
                 self.move_group(1);
                 return vec![];
             }
+            if self.cancel_rect.contains((event.column, event.row).into()) {
+                self.focus = ChoiceFocus::Cancel;
+                return vec![Action::CloseModal];
+            }
             if self.apply_rect.contains((event.column, event.row).into()) {
-                return self.apply();
+                self.focus = ChoiceFocus::Apply;
+                return if self.choices.iter().all(Option::is_some) {
+                    self.apply()
+                } else {
+                    vec![]
+                };
             }
             if self.list.rows.contains((event.column, event.row).into())
                 && let Some(index) = self.list.row_at(event.row, self.len())
             {
+                self.focus = ChoiceFocus::List;
                 self.list.select(Some(index));
                 self.choose();
             }
@@ -161,6 +193,7 @@ impl NameChoices {
         f.render_widget(block, rect);
         self.list.rows = Rect::default();
         self.apply_rect = Rect::default();
+        self.cancel_rect = Rect::default();
         self.previous_rect = Rect::default();
         self.next_rect = Rect::default();
         if inner.height < 8 {
@@ -211,7 +244,11 @@ impl NameChoices {
             ))))
             .collect::<Vec<_>>();
         f.render_stateful_widget(
-            List::new(rows).highlight_style(ctx.settings.theme.selected()),
+            List::new(rows).highlight_style(if self.focus == ChoiceFocus::List {
+                ctx.settings.theme.selected()
+            } else {
+                ctx.settings.theme.dim()
+            }),
             self.list.rows,
             &mut self.list.state,
         );
@@ -220,23 +257,29 @@ impl NameChoices {
                 .style(ctx.settings.theme.dim()),
             Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
         );
-        self.apply_rect = Rect::new(inner.x, inner.bottom() - 1, 18.min(inner.width), 1);
-        if inner.width >= 48 && self.pending.groups.len() > 1 {
-            self.previous_rect = Rect::new(inner.x + 20, inner.bottom() - 1, 12, 1);
-            self.next_rect = Rect::new(inner.x + 34, inner.bottom() - 1, 10, 1);
+        let enabled = self.choices.iter().all(Option::is_some);
+        let rects = choice_footer::draw(
+            f,
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            self.focus,
+            enabled,
+            "←→ previous / next conflict",
+            &ctx.settings.theme,
+        );
+        self.apply_rect = rects[0];
+        self.cancel_rect = rects[1];
+        if inner.width >= 56 && self.pending.groups.len() > 1 {
+            self.previous_rect = Rect::new(inner.x, inner.bottom() - 1, 12, 1);
+            self.next_rect = Rect::new(inner.x + 13, inner.bottom() - 1, 10, 1);
             f.render_widget(
-                Paragraph::new("[ Previous ]").style(ctx.settings.theme.accent()),
+                Paragraph::new("[ Previous ]").style(ctx.settings.theme.dim()),
                 self.previous_rect,
             );
             f.render_widget(
-                Paragraph::new("[ Next ]").style(ctx.settings.theme.accent()),
+                Paragraph::new("[ Next ]").style(ctx.settings.theme.dim()),
                 self.next_rect,
             );
         }
-        f.render_widget(
-            Paragraph::new("[ Review / Apply ]").style(ctx.settings.theme.accent()),
-            self.apply_rect,
-        );
     }
 }
 
