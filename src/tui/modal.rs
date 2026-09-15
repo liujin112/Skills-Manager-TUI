@@ -1746,8 +1746,12 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
 
 const HELP: &str = "Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
-  1-6               switch tabs outside text inputs
-  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
+  1-6               select a tab outside text inputs; focus stays on the tab strip
+  Tab / Shift-Tab   select next / previous tab (close editing dialogs first)
+  Enter / Down      enter the selected tab from the tab strip
+  Esc / q           return one level inside the current tab; at the tab strip, quit
+                    close overlay, end search input, cancel multi-select, clear filter, parent
+                    q remains ordinary text while editing
   /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit
 
 Library
@@ -1781,10 +1785,11 @@ Tags / Presets
   Enter / click     toggle or create a tag immediately; Esc closes the picker
   Tab               complete an existing tag in the picker
   Backspace         empty tag input: select last token; press again to remove
-  Esc               clear a local name filter; press again to go back
+  Esc / q           clear results filter, skills → group list → tab strip
 Agents
   /                 filter presets or skills, according to focus
-  arrows            agent → scope → presets → tags → skills; ↑ returns to the group above
+  arrows            navigate agents, scopes and skills
+  Esc / q           skills → scope → agent → tab strip
   Enter             browse the focused Preset / Tag, or preview the focused skill
   i / x             apply / uninstall the focused Preset, or install / uninstall skills
   Tag badges        browse members and inspect coverage; do not deploy a group

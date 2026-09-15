@@ -254,7 +254,9 @@ impl Batch {
     }
 
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if k.code == KeyCode::Esc {
+        if k.code == KeyCode::Esc
+            || (self.kind != Kind::Tags && k.code == KeyCode::Char('q') && k.modifiers.is_empty())
+        {
             return vec![Action::CloseModal];
         }
         if self.kind == Kind::Tags {

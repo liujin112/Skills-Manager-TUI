@@ -171,7 +171,9 @@ impl DeployPicker {
         vec![]
     }
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if k.code == KeyCode::Esc {
+        if k.code == KeyCode::Esc
+            || (!self.editing && k.code == KeyCode::Char('q') && k.modifiers.is_empty())
+        {
             return vec![Action::CloseModal];
         }
         if self.editing {

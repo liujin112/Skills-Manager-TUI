@@ -27,27 +27,86 @@ impl Completion {
     }
 
     pub fn update(&mut self, input: &Input, ctx: &Ctx) {
+        self.update_scoped(input, ctx, None);
+    }
+
+    pub fn update_scoped(&mut self, input: &Input, ctx: &Ctx, keys: Option<&BTreeSet<String>>) {
+        let records: Vec<_> = ctx
+            .snap
+            .skills
+            .iter()
+            .filter(|r| keys.is_none_or(|keys| keys.contains(&r.key)))
+            .collect();
+        self.update_records(input, ctx, &records, keys);
+    }
+
+    pub fn update_records(
+        &mut self,
+        input: &Input,
+        ctx: &Ctx,
+        records: &[&skills::reconcile::SkillRecord],
+        keys: Option<&BTreeSet<String>>,
+    ) {
         let range = token_range(input.value(), input.cursor_byte());
         let token = &input.value()[range.clone()];
         let values = match token.split_once(':') {
-            Some(("repo", _)) => ctx
-                .snap
-                .skills
+            Some(("repo", _)) => records
                 .iter()
                 .filter_map(|r| r.source_display_name().map(str::to_owned))
                 .collect(),
-            Some(("tag", _)) => ctx
-                .snap
-                .skills
+            Some(("tag", _)) => records
                 .iter()
                 .flat_map(|r| r.tags.iter().cloned())
-                .chain(ctx.ws.config.tags.iter().map(|t| t.name.clone()))
+                .chain(
+                    ctx.ws
+                        .config
+                        .tags
+                        .iter()
+                        .filter(|t| {
+                            keys.is_none_or(|keys| t.skills.iter().any(|key| keys.contains(key)))
+                        })
+                        .map(|t| t.name.clone()),
+                )
                 .collect(),
-            Some(("agent", _)) => ctx.snap.agents.iter().map(|a| a.key.clone()).collect(),
-            Some(("preset", _)) => ctx.snap.presets.by_name.keys().cloned().collect(),
+            Some(("agent", _)) => ctx
+                .snap
+                .agents
+                .iter()
+                .filter(|a| {
+                    keys.is_none()
+                        || records.iter().any(|r| {
+                            r.deploy.get(&a.key).is_some_and(|state| {
+                                !matches!(
+                                    state,
+                                    skills::reconcile::DeployState::NotDeployed
+                                        | skills::reconcile::DeployState::NoAgentDir
+                                )
+                            })
+                        })
+                })
+                .map(|a| a.key.clone())
+                .collect(),
+            Some(("preset", _)) => ctx
+                .snap
+                .presets
+                .by_name
+                .iter()
+                .filter(|(_, members)| {
+                    keys.is_none_or(|keys| members.skills.iter().any(|key| keys.contains(key)))
+                })
+                .map(|(name, _)| name.clone())
+                .collect(),
+            Some(("source", _)) if keys.is_some() => records
+                .iter()
+                .map(|r| r.source_kind().to_string())
+                .collect(),
             Some(("source", _)) => ["local", "repository"]
                 .into_iter()
                 .map(str::to_owned)
+                .collect(),
+            Some(("status", _)) if keys.is_some() => records
+                .iter()
+                .map(|r| r.status.label().trim_end_matches('?').to_string())
                 .collect(),
             Some(("status", _)) => [
                 "local",
@@ -83,11 +142,9 @@ impl Completion {
             choice.starts_with("repo:")
                 || (choice.starts_with("status:")
                     && (choice == "status:"
-                        || ctx
-                            .snap
-                            .skills
-                            .iter()
-                            .any(|r| choice == &format!("status:{}", r.status.label()))))
+                        || ctx.snap.skills.iter().any(|r| {
+                            choice == &format!("status:{}", r.status.label().trim_end_matches('?'))
+                        })))
         });
     }
 

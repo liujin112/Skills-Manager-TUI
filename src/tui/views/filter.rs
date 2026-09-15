@@ -1,97 +1,121 @@
-//! A local filter for lists of tags, presets, repositories, or issues.
-use crate::tui::app::{Action, Ctx};
-use crate::tui::widgets::Input;
+//! Plain-text navigation search, backed by the shared panel and text index.
+use crate::tui::{
+    app::{Action, Ctx},
+    components::search_panel::{PanelLayout, PanelStyle, SearchEvent, SearchPanel},
+};
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::{Frame, layout::Rect};
+use ratatui::{Frame, layout::Rect, text::Line};
+use skills::search::{TextDocument, TextSearcher};
 
 #[derive(Default)]
 pub struct Filter {
-    pub input: Input,
-    pub editing: bool,
-    pub rect: Rect,
+    panel: SearchPanel,
+    searcher: TextSearcher,
+    dictionary: Option<(
+        std::path::PathBuf,
+        skills::config::SearchConfig,
+        skills::dict::Dictionaries,
+    )>,
 }
-
-impl Filter {
-    pub fn matches(&self, text: &str) -> bool {
-        let text = text.to_lowercase();
-        self.input.value().split_whitespace().all(|word| {
-            let word = word.to_lowercase();
-            let mut chars = text.chars();
-            word.chars()
-                .all(|c| chars.by_ref().any(|candidate| candidate == c))
-        })
+// Existing page focus code addresses the panel's input and editing state directly.
+impl std::ops::Deref for Filter {
+    type Target = SearchPanel;
+    fn deref(&self) -> &Self::Target {
+        &self.panel
     }
-
-    pub fn key(&mut self, key: KeyEvent) -> bool {
-        if key.code == KeyCode::Esc && !self.input.is_empty() {
-            self.input = Input::default();
-            self.editing = false;
-            return true;
+}
+impl std::ops::DerefMut for Filter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.panel
+    }
+}
+impl Filter {
+    pub fn rank(&mut self, documents: &[TextDocument], ctx: &Ctx) -> Vec<usize> {
+        if self
+            .dictionary
+            .as_ref()
+            .is_none_or(|(root, cfg, _)| root != &ctx.ws.root || cfg != &ctx.settings.search)
+        {
+            self.dictionary = Some((
+                ctx.ws.root.clone(),
+                ctx.settings.search.clone(),
+                skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
+            ));
         }
-        if !self.editing {
+        self.searcher.search(
+            documents,
+            self.panel.input.value(),
+            &ctx.settings.search,
+            &self.dictionary.as_ref().unwrap().2,
+        )
+    }
+    pub fn key(&mut self, key: KeyEvent) -> bool {
+        let key =
+            if !self.panel.editing && key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
+                KeyEvent::new(KeyCode::Esc, key.modifiers)
+            } else {
+                key
+            };
+        if !self.panel.editing {
             if key.code == KeyCode::Char('/') {
-                self.editing = true;
+                self.panel.editing = true;
+                return true;
+            }
+            if key.code == KeyCode::Esc && !self.panel.input.is_empty() {
+                self.panel.input.clear();
                 return true;
             }
             return false;
         }
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Down => self.editing = false,
-            _ => {
-                self.input.handle_key(key);
+        match self.panel.key(key) {
+            SearchEvent::Up => return false,
+            SearchEvent::Results => self.panel.editing = false,
+            SearchEvent::Escape => {
+                self.panel.editing = false;
+                return true;
             }
+            _ => {}
         }
         true
     }
-
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
-        match self.input.paste(text) {
-            Err(error) => vec![Action::Error(error.into())],
+        match self.panel.paste(text) {
+            Err(error) => vec![Action::Error(error)],
             _ => vec![],
         }
     }
-
-    pub fn draw(&mut self, f: &mut Frame, area: Rect, label: &str, ctx: &Ctx) -> Rect {
-        let height = area.height.min(3);
-        self.rect = Rect::new(area.x, area.y, area.width, height);
-        let block = ctx.settings.theme.block(
-            format!(
-                " {label}{} ",
-                if self.input.is_empty() {
-                    ""
-                } else {
-                    " · Esc clear"
-                }
-            ),
-            self.editing,
-        );
-        let inner = block.inner(self.rect);
-        f.render_widget(block, self.rect);
-        f.render_widget(
-            ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
-                "› ",
-                ctx.settings.theme.accent(),
-            )),
-            Rect::new(
-                inner.x + u16::from(inner.width > 0),
-                inner.y,
-                inner.width.saturating_sub(1).min(2),
-                inner.height,
-            ),
-        );
-        self.input.render_hint(
-            f,
-            Rect::new(
-                inner.x + inner.width.min(3),
-                inner.y,
-                inner.width.saturating_sub(4),
-                inner.height,
-            ),
-            self.editing,
-            ("filter…", " · Enter results"),
-            &ctx.settings.theme,
-        );
-        Rect::new(area.x, area.y + height, area.width, area.height - height)
+    pub fn draw(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        label: &str,
+        results: &str,
+        active: bool,
+        ctx: &Ctx,
+    ) -> Rect {
+        self.panel
+            .draw(
+                f,
+                area,
+                PanelStyle {
+                    layout: PanelLayout::Separate,
+                    input_title: Line::from(format!(
+                        " {label}{} ",
+                        if self.panel.input.is_empty() {
+                            ""
+                        } else {
+                            " · Esc clear"
+                        }
+                    )),
+                    results_title: Line::from(format!(" {results} ")),
+                    hint: ("filter…", " · Enter results"),
+                    input_active: self.panel.editing,
+                    results_active: active && !self.panel.editing,
+                    header_height: 0,
+                },
+                &ctx.settings.theme,
+            )
+            .results
     }
 }
 
@@ -101,18 +125,24 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     #[test]
-    fn escape_clears_filter_from_input_or_results_before_leaving_panel() {
-        for editing in [false, true] {
-            let mut filter = Filter {
-                input: Input::with_value("missing"),
-                editing,
-                ..Default::default()
-            };
-            let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-            assert!(filter.key(esc));
-            assert!(filter.input.is_empty());
-            assert!(!filter.editing);
-            assert!(!filter.key(esc));
-        }
+    fn plain_filter_has_no_completion_and_returns_empty_escape_and_up_to_page() {
+        let mut filter = Filter::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(filter.key(key(KeyCode::Char('/'))));
+        assert!(filter.paste("tag:work").is_empty());
+        assert_eq!(filter.input.value(), "tag:work");
+        assert!(!filter.completion.active());
+        assert!(!filter.key(key(KeyCode::Up)));
+        assert!(filter.editing);
+        assert!(filter.key(key(KeyCode::Esc)));
+        assert!(filter.input.is_empty());
+        assert!(filter.editing);
+        assert!(filter.key(key(KeyCode::Esc)));
+        assert!(!filter.editing);
+        filter.key(key(KeyCode::Char('/')));
+        filter.paste("文档");
+        assert!(filter.key(key(KeyCode::Down)));
+        assert!(!filter.editing);
+        assert_eq!(filter.input.value(), "文档");
     }
 }

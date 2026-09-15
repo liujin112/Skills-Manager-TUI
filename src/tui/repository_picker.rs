@@ -1,5 +1,6 @@
 //! Always-expanded repository tree with ancestry-aware multi-selection.
-use super::views::{completion::Completion, preview::Overlay};
+use super::components::search_panel::{PanelLayout, PanelStyle, SearchEvent, SearchPanel};
+use super::views::preview::Overlay;
 use super::{
     app::{Action, Ctx, Hints},
     event::Task,
@@ -29,7 +30,7 @@ pub struct RepositoryPicker {
     pub selection: InstallSelection,
     source_name: Input,
     alias: Input,
-    search: Input,
+    search_panel: SearchPanel,
     local_name: Input,
     focus: u8, // storage folder, search, list, selected skill name, source name
     list: ListNav,
@@ -40,7 +41,6 @@ pub struct RepositoryPicker {
     searcher: Searcher,
     matching: BTreeSet<String>,
     configured_search: Option<skills::config::SearchConfig>,
-    completion: Completion,
     preview: Overlay,
 }
 impl RepositoryPicker {
@@ -90,12 +90,11 @@ impl RepositoryPicker {
             searcher: Searcher::new(),
             matching: BTreeSet::new(),
             configured_search: None,
-            completion: Completion::default(),
             preview: Overlay::default(),
             selection,
             source_name,
             alias,
-            search: Input::default(),
+            search_panel: SearchPanel::default(),
             local_name: Input::default(),
             focus: if needs_name { 4 } else { 1 },
             list: ListNav::default(),
@@ -146,13 +145,15 @@ impl RepositoryPicker {
             snap: &self.candidates,
             settings: ctx.settings,
         };
-        self.completion.update_install(&self.search, &candidate_ctx);
+        self.search_panel
+            .completion
+            .update_install(&self.search_panel.input, &candidate_ctx);
     }
     fn matches_filter(&self, path: &str) -> bool {
         self.matching.contains(path)
     }
     fn refilter(&mut self) {
-        let mut query = Query::parse(self.search.value());
+        let mut query = Query::parse(self.search_panel.input.value());
         // Only free path tokens use root-relative prefix semantics; the slash
         // in repo:owner/repository is part of a normal shared query filter.
         let mut prefixes = Vec::new();
@@ -347,14 +348,14 @@ impl RepositoryPicker {
         if self.focus == 3 && !self.focus_local_name(ctx) {
             self.focus = if backwards { 2 } else { 4 };
         }
-        self.completion.close();
+        self.search_panel.completion.close();
         vec![]
     }
     pub fn hints(&self) -> Hints {
         if let Some(hints) = self.preview.hints() {
             return hints;
         }
-        if self.focus == 1 && self.completion.active() {
+        if self.focus == 1 && self.search_panel.completion.active() {
             return &[
                 ("↑↓", "suggestions"),
                 ("Enter", "complete"),
@@ -388,7 +389,7 @@ impl RepositoryPicker {
         }
         let input = match self.focus {
             0 => &mut self.alias,
-            1 => &mut self.search,
+            1 => &mut self.search_panel.input,
             3 => &mut self.local_name,
             4 => &mut self.source_name,
             _ => return vec![],
@@ -405,31 +406,35 @@ impl RepositoryPicker {
     }
 
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        let k = if self.focus == 2 && k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
+            KeyEvent::new(KeyCode::Esc, k.modifiers)
+        } else {
+            k
+        };
         self.configure(ctx);
         if self.preview.handle_key(k) {
             return vec![];
         }
-        if self.focus == 1 && self.completion.active() {
-            match k.code {
-                KeyCode::Up => {
-                    self.completion.move_by(-1);
-                    return vec![];
-                }
-                KeyCode::Down => {
-                    self.completion.move_by(1);
-                    return vec![];
-                }
-                KeyCode::Enter => {
-                    self.completion.accept(&mut self.search);
+        if self.focus == 1 && !matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            match self.search_panel.key(k) {
+                SearchEvent::Changed | SearchEvent::Accepted => {
                     self.refilter();
                     self.update_completion(ctx);
                     return vec![];
                 }
-                KeyCode::Esc => {
-                    self.completion.close();
+                SearchEvent::CursorMoved => {
+                    self.update_completion(ctx);
                     return vec![];
                 }
-                _ => {}
+                SearchEvent::Results => {
+                    self.focus = 2;
+                    return vec![];
+                }
+                SearchEvent::Escape => {
+                    self.focus = 2;
+                    return vec![];
+                }
+                _ => return vec![],
             }
         }
         if k.code == KeyCode::Esc {
@@ -446,7 +451,7 @@ impl RepositoryPicker {
                     return actions;
                 }
                 self.focus = 2;
-                self.completion.close();
+                self.search_panel.completion.close();
                 return vec![];
             }
             match self.focus {
@@ -454,7 +459,7 @@ impl RepositoryPicker {
                     self.alias.handle_key(k);
                 }
                 1 => {
-                    if self.search.handle_key(k) {
+                    if self.search_panel.input.handle_key(k) {
                         self.refilter();
                         self.update_completion(ctx);
                     }
@@ -537,7 +542,7 @@ impl RepositoryPicker {
             return vec![];
         }
         if self.focus == 1 {
-            let (consumed, accepted) = self.completion.mouse(m, &mut self.search);
+            let (consumed, accepted) = self.search_panel.mouse_completion(m);
             if accepted {
                 self.refilter();
                 self.update_completion(ctx);
@@ -581,9 +586,9 @@ impl RepositoryPicker {
                 if self.fields[0].contains(at) {
                     self.focus = 0;
                     self.alias.click(m.column);
-                } else if self.fields[1].contains(at) {
+                } else if self.search_panel.click_input(m.column, m.row) {
                     self.focus = 1;
-                    self.search.click(m.column);
+                    self.update_completion(ctx);
                 } else if self.fields[3].contains(at) {
                     self.focus = 4;
                     self.source_name.click(m.column);
@@ -645,7 +650,6 @@ impl RepositoryPicker {
         for (i, label) in [
             (3, source_label),
             (0, "Storage folder"),
-            (1, "Filter"),
             (2, "Local skill name"),
         ] {
             let y = if i == 2 {
@@ -677,13 +681,6 @@ impl RepositoryPicker {
         );
         self.alias
             .render(f, self.fields[0], self.focus == 0, "", th);
-        self.search.render(
-            f,
-            self.fields[1],
-            self.focus == 1,
-            "Filter skills/ · repo:owner/repo · status:invalid · keywords",
-            th,
-        );
         if self.focus == 3 {
             self.local_name.render(f, self.fields[2], true, "", th);
         } else if let Some(path) = self.selected() {
@@ -693,12 +690,30 @@ impl RepositoryPicker {
                 self.fields[2],
             );
         }
-        self.list.rows = Rect::new(
-            inner.x,
-            inner.y + 4,
-            inner.width,
-            inner.height.saturating_sub(5),
+        let areas = self.search_panel.draw(
+            f,
+            Rect::new(
+                inner.x,
+                inner.y + 2,
+                inner.width,
+                inner.height.saturating_sub(3),
+            ),
+            PanelStyle {
+                layout: PanelLayout::Unified,
+                input_title: Line::default(),
+                results_title: Line::from(" Candidate skills "),
+                hint: (
+                    "Filter skills…",
+                    " · repo:owner/repo · status:invalid · keywords",
+                ),
+                input_active: self.focus == 1,
+                results_active: self.focus == 2,
+                header_height: 0,
+            },
+            th,
         );
+        self.fields[1] = areas.input;
+        self.list.rows = areas.results;
         let root_skill = self.selection.fetched.choices.iter().any(String::is_empty);
         let rows: Vec<_> = self
             .shown
@@ -761,7 +776,7 @@ impl RepositoryPicker {
             &mut self.list.state,
         );
         if self.focus == 1 {
-            self.completion.draw(f, self.list.rows, ctx);
+            self.search_panel.completion.draw(f, self.list.rows, ctx);
         }
         let candidate_ctx = Ctx {
             ws: ctx.ws,
@@ -888,11 +903,11 @@ mod tests {
         );
         picker.toggle("bundle/writer", &ctx);
         assert_eq!(picker.disabled("bundle/writer", &ctx), None);
-        picker.search = Input::with_value("repo:sample/");
+        picker.search_panel.input = Input::with_value("repo:sample/");
         picker.update_completion(&ctx);
-        assert!(picker.completion.active());
+        assert!(picker.search_panel.completion.active());
         picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
-        assert_eq!(picker.search.value(), "repo:sample/tools ");
+        assert_eq!(picker.search_panel.input.value(), "repo:sample/tools ");
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
         let text: String = terminal
@@ -980,9 +995,9 @@ mod tests {
         press(&mut picker, KeyCode::Char('/'));
         picker.paste("repo:\"Merlin Tools\"", &ctx);
         assert!(picker.matches_filter("reader"));
-        picker.search = Input::default();
+        picker.search_panel.input = Input::default();
         picker.refilter();
-        picker.completion.close();
+        picker.search_panel.completion.close();
         press(&mut picker, KeyCode::Enter);
         press(&mut picker, KeyCode::Char('v'));
         assert!(picker.preview.is_open());
@@ -1175,16 +1190,16 @@ mod tests {
             &ctx,
         );
         picker.configure(&ctx);
-        picker.search = Input::with_value("repo:sampl");
+        picker.search_panel.input = Input::with_value("repo:sampl");
         picker.update_completion(&ctx);
-        assert!(picker.completion.active());
+        assert!(picker.search_panel.completion.active());
         picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
-        assert_eq!(picker.search.value(), "repo:sample/tools ");
+        assert_eq!(picker.search_panel.input.value(), "repo:sample/tools ");
         for token in ["tag:", "agent:", "status:modified"] {
-            picker.search = Input::with_value(token);
+            picker.search_panel.input = Input::with_value(token);
             picker.update_completion(&ctx);
             assert!(
-                !picker.completion.active(),
+                !picker.search_panel.completion.active(),
                 "installation must not suggest unavailable {token}"
             );
         }
@@ -1194,7 +1209,7 @@ mod tests {
             "repo:sample/tools skills/",
             "status:repository skills/",
         ] {
-            picker.search = Input::with_value(query);
+            picker.search_panel.input = Input::with_value(query);
             picker.refilter();
             assert!(picker.matches_filter("skills/print"), "{query}");
             assert!(!picker.matches_filter("internal/print"), "{query}");
@@ -1202,7 +1217,7 @@ mod tests {
 
         // A still-open picker follows the resolved configuration without
         // clearing its query or the installation choices already staged.
-        picker.search = Input::with_value("skills/ prnter");
+        picker.search_panel.input = Input::with_value("skills/ prnter");
         picker.refilter();
         let staged = picker.selection.paths.clone();
         assert!(picker.matches_filter("skills/print"));
@@ -1215,15 +1230,15 @@ mod tests {
         };
         picker.configure(&changed_ctx);
         assert!(picker.shown.is_empty());
-        assert_eq!(picker.search.value(), "skills/ prnter");
+        assert_eq!(picker.search_panel.input.value(), "skills/ prnter");
         assert_eq!(picker.selection.paths, staged);
         picker.refresh(&ctx);
         assert!(picker.matches_filter("skills/print"));
 
-        picker.search = Input::with_value("repo:other/tools");
+        picker.search_panel.input = Input::with_value("repo:other/tools");
         picker.refilter();
         assert!(picker.shown.is_empty());
-        picker.search = Input::with_value("skills/");
+        picker.search_panel.input = Input::with_value("skills/");
         picker.refilter();
         picker.focus = 2;
         picker.list.move_by(1, picker.shown.len());
@@ -1267,7 +1282,7 @@ mod tests {
             names: BTreeMap::new(),
         });
         for query in ["skills/", "./skills/", "/skills/"] {
-            picker.search = Input::with_value(query);
+            picker.search_panel.input = Input::with_value(query);
             picker.refilter();
             assert_eq!(
                 picker.shown,
@@ -1279,7 +1294,7 @@ mod tests {
                 ]
             );
         }
-        picker.search = Input::with_value("internal/tests/skills/");
+        picker.search_panel.input = Input::with_value("internal/tests/skills/");
         picker.refilter();
         assert!(
             picker
@@ -1287,7 +1302,7 @@ mod tests {
                 .contains(&"internal/tests/skills/mock-demo".into())
         );
         assert!(!picker.shown.contains(&"skills".into()));
-        picker.search = Input::with_value("mock-demo");
+        picker.search_panel.input = Input::with_value("mock-demo");
         picker.refilter();
         assert!(picker.shown.contains(&"internal".into()));
         assert!(
@@ -1295,7 +1310,7 @@ mod tests {
                 .shown
                 .contains(&"internal/tests/skills/mock-demo".into())
         );
-        picker.search = Input::with_value("missing/");
+        picker.search_panel.input = Input::with_value("missing/");
         picker.refilter();
         assert!(picker.shown.is_empty());
         assert_eq!(
@@ -1391,7 +1406,7 @@ mod tests {
             picker.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &ctx);
         }
         assert_eq!(picker.selection.paths, before); // Spaces in search never toggle.
-        picker.search = Input::with_value("tools/");
+        picker.search_panel.input = Input::with_value("tools/");
         picker.refilter();
         picker.focus = 2;
         let actions = picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);

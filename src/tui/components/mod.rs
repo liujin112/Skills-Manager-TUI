@@ -9,3 +9,6 @@ pub mod group;
 pub mod group_prompt;
 pub mod layout;
 pub mod skill;
+
+pub(crate) mod completion;
+pub(crate) mod search_panel;

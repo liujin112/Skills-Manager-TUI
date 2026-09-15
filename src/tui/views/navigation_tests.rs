@@ -92,10 +92,13 @@ fn library_tag_and_preset_pages_share_skill_styles_and_group_colours() {
         presets.refresh(&ctx);
         presets.select("bundle");
 
+        let mut repos = super::repos::ReposView::default();
+        repos.refresh(&ctx);
         for (name, view) in [
             ("Library", &mut library as &mut dyn View),
             ("Tags", &mut tags as &mut dyn View),
             ("Presets", &mut presets as &mut dyn View),
+            ("Repos", &mut repos as &mut dyn View),
         ] {
             let buffer = render(view, &ctx);
             assert!(
@@ -106,7 +109,16 @@ fn library_tag_and_preset_pages_share_skill_styles_and_group_colours() {
                 .content
                 .chunks(buffer.area.width as usize)
                 .filter(|row| row.iter().any(|cell| cell.fg == settings.theme.source))
-                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .map(|row| {
+                    row.iter()
+                        .take(if layout == UiLayout::Grid {
+                            row.len()
+                        } else {
+                            if name == "Library" { 38 } else { 76 }
+                        })
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                })
                 .find(|row| row.contains("local"))
                 .unwrap();
             // The sidebar/header already identifies the enclosing group. Its
@@ -471,7 +483,7 @@ fn agent_skill_filter_survives_refresh_without_filtering_coverage() {
     view.handle_key(key(KeyCode::Enter), &ctx);
     view.handle_key(key(KeyCode::Char('/')), &ctx);
     assert!(view.editing());
-    view.paste("bndl");
+    view.paste("bndl", &ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);
     assert!(!view.editing());
     view.refresh(&ctx);
@@ -485,11 +497,8 @@ fn agent_skill_filter_survives_refresh_without_filtering_coverage() {
         .map(|c| c.symbol())
         .collect();
     assert!(text.contains("skills") && text.contains("bndl"));
-    assert!(
-        text.contains("bundle"),
-        "coverage is independent of skill search"
-    );
-    assert!(text.contains("unrelated"), "coverage includes empty groups");
+    assert!(!text.contains("bundle"), "uninstalled preset is absent");
+    assert!(!text.contains("unrelated"), "empty preset is absent");
     assert_eq!(ws.presets.list().unwrap().len(), 2);
     std::fs::remove_dir_all(&ws.root).unwrap();
 }
@@ -526,7 +535,7 @@ fn member_search_stays_visible_and_presets_place_it_above_tags() {
     tags.handle_key(key(KeyCode::Right), &ctx);
     tags.handle_key(key(KeyCode::Char('/')), &ctx);
     tags.paste("beta", &ctx);
-    tags.handle_key(key(KeyCode::Esc), &ctx);
+    tags.handle_key(key(KeyCode::Enter), &ctx);
     tags.handle_key(key(KeyCode::Left), &ctx);
     assert!(render(&mut tags, 30)[1].contains("beta"));
     tags.refresh(&ctx);
@@ -536,8 +545,12 @@ fn member_search_stays_visible_and_presets_place_it_above_tags() {
     presets.refresh(&ctx);
     let rows = render(&mut presets, 30);
     assert!(rows[1].contains("search skills…"));
-    assert!(rows[4].contains("team") && rows[4].contains("2/2"));
-    assert!(!rows[4].contains("[ ]") && !rows[4].contains("[✓]"));
+    let coverage = rows
+        .iter()
+        .position(|row| row.contains("team") && row.contains("2/2"))
+        .unwrap();
+    assert!(coverage > 1 && coverage < 8);
+    assert!(!rows[coverage].contains("[ ]") && !rows[coverage].contains("[✓]"));
     presets.handle_key(key(KeyCode::Right), &ctx); // Skills, skipping read-only tags.
     presets.handle_key(key(KeyCode::Up), &ctx); // Search above the composition row.
     assert!(presets.input_focused());
@@ -547,7 +560,7 @@ fn member_search_stays_visible_and_presets_place_it_above_tags() {
     presets.handle_key(key(KeyCode::Up), &ctx); // Directly back to search.
     assert!(presets.input_focused());
     assert!(render(&mut presets, 30)[1].contains("alpha"));
-    presets.handle_key(key(KeyCode::Esc), &ctx);
+    presets.handle_key(key(KeyCode::Enter), &ctx);
     presets.handle_key(key(KeyCode::Left), &ctx);
     presets.refresh(&ctx);
     assert!(render(&mut presets, 30)[1].contains("alpha"));

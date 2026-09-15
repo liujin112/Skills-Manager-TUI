@@ -6,7 +6,7 @@
 
 use super::matrix::Matrix;
 use super::{View, wheel};
-use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::group;
 use crate::tui::components::group_prompt::Prompt;
 use crate::tui::components::layout::{frame, split_panes};
@@ -96,7 +96,7 @@ impl PresetsView {
         }
         if self.filter.editing {
             let actions = self.filter.paste(text);
-            self.refilter();
+            self.refilter(ctx);
             return actions;
         }
         if self.focus_members
@@ -106,19 +106,22 @@ impl PresetsView {
         }
         vec![]
     }
-    fn refilter(&mut self) {
+    fn refilter(&mut self, ctx: &Ctx) {
         let selected = self.selected().map(|p| p.name.clone());
-        self.presets = self
+        let documents = self
             .all_presets
             .iter()
-            .filter(|p| {
-                self.filter.matches(&format!(
-                    "{} {}",
-                    p.name,
-                    p.description.as_deref().unwrap_or("")
-                ))
+            .map(|p| skills::search::TextDocument {
+                name: p.name.clone(),
+                description: p.description.clone().unwrap_or_default(),
+                body: String::new(),
             })
-            .cloned()
+            .collect::<Vec<_>>();
+        self.presets = self
+            .filter
+            .rank(&documents, ctx)
+            .into_iter()
+            .map(|i| self.all_presets[i].clone())
             .collect();
         self.list
             .select(selected.and_then(|name| self.presets.iter().position(|p| p.name == name)));
@@ -160,12 +163,14 @@ impl PresetsView {
             .is_none_or(|(current, _)| current != &name)
         {
             let mut view = super::search::SearchView::panel(
-                self.visible_members.clone(),
-                format!("Preset: {name}"),
-                LayoutScope::Presets,
+                super::search::SkillPanelOptions::new(
+                    self.visible_members.clone(),
+                    format!("Preset: {name}"),
+                    LayoutScope::Presets,
+                )
+                .hide_group(group::Kind::Preset, name.clone()),
                 ctx,
             );
-            view.hidden_group = Some((group::Kind::Preset, name.clone()));
             view.focus_list();
             self.skill_search = Some((name, view));
         }
@@ -235,9 +240,7 @@ impl PresetsView {
 
     fn draw_presets(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = &ctx.settings.theme;
-        let block = th.block(" presets ", !self.focus_members && !self.filter.editing);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+        let inner = area;
         let content = Rect {
             width: inner.width.saturating_sub(1),
             ..inner
@@ -284,6 +287,16 @@ impl PresetsView {
 }
 
 impl View for PresetsView {
+    fn focus_from_above(&mut self) {
+        self.focus_members = false;
+        self.filter.editing = true;
+    }
+
+    fn focus_root(&mut self) {
+        self.focus_members = false;
+        self.filter.editing = false;
+    }
+
     fn status(&self, ctx: &Ctx) -> String {
         self.skill_search
             .as_ref()
@@ -298,7 +311,7 @@ impl View for PresetsView {
             .clone()
             .or_else(|| self.selected().map(|p| p.name.clone()));
         self.all_presets = ctx.snap.presets.by_name.values().cloned().collect();
-        self.refilter();
+        self.refilter(ctx);
         if let Some(i) = keep.and_then(|k| self.presets.iter().position(|p| p.name == k)) {
             self.list.select(Some(i));
             self.pending = None;
@@ -321,15 +334,38 @@ impl View for PresetsView {
         }
         self.refresh_groups(ctx);
         self.ensure_skill_search(ctx);
+        if !self.focus_members
+            && self.filter.editing
+            && k.code == KeyCode::Right
+            && self.filter.input.cursor_byte() == self.filter.input.value().len()
+        {
+            if let Some(view) = self.skill_search.as_mut().map(|(_, view)| view) {
+                self.filter.editing = false;
+                self.focus_members = true;
+                view.focus_input();
+            }
+            return vec![];
+        }
+        if !self.focus_members && self.filter.editing && k.code == KeyCode::Up {
+            self.filter.editing = false;
+            return vec![Action::BackToParent];
+        }
         if !self.focus_members && self.filter.key(k) {
-            self.refilter();
+            self.refilter(ctx);
             return vec![];
         }
         if self.focus_members
             && let Some((_, view)) = self.skill_search.as_mut()
         {
+            if k.code == KeyCode::Left && view.input_at_left_edge() {
+                view.close_input_completion();
+                self.focus_members = false;
+                self.filter.editing = true;
+                return vec![];
+            }
             if k.code == KeyCode::Left && view.panel_back() {
                 self.focus_members = false;
+                self.filter.editing = false;
                 return vec![];
             }
             if view.panel_actions_ready() {
@@ -342,7 +378,16 @@ impl View for PresetsView {
                     return self.add_members(ctx);
                 }
             }
-            return view.handle_key(k, ctx);
+            let mut actions = view.handle_key(k, ctx);
+            if k.code == KeyCode::Up {
+                return actions;
+            }
+            if actions.iter().any(|a| matches!(a, Action::BackToParent)) {
+                self.focus_members = false;
+                self.filter.editing = false;
+                actions.retain(|a| !matches!(a, Action::BackToParent));
+            }
+            return actions;
         }
         if k.code == KeyCode::Char('M') {
             self.matrix.open(ctx);
@@ -350,10 +395,8 @@ impl View for PresetsView {
         }
         let n = self.presets.len();
         match k.code {
-            KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
-            // Esc means "back" everywhere else in the program, so here it goes
-            // back to the search page rather than out of the door.
-            KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
+            KeyCode::Char('q') => vec![Action::BackToParent],
+            KeyCode::Esc => vec![Action::BackToParent],
             KeyCode::Down | KeyCode::Char('j') => {
                 self.skill_search = None;
                 self.list.move_by(1, n);
@@ -381,6 +424,9 @@ impl View for PresetsView {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.selected().is_some() {
                     self.focus_members = true;
+                    if let Some(view) = self.skill_search.as_mut().map(|(_, view)| view) {
+                        view.focus_list();
+                    }
                 }
                 vec![]
             }
@@ -422,14 +468,16 @@ impl View for PresetsView {
         if self.tag_area.contains(at) {
             return vec![];
         }
-        if pressing && self.filter.rect.contains(at) {
+        if pressing && self.filter.click_input(m.column, m.row) {
             self.focus_members = false;
             self.filter.editing = true;
             return vec![];
         }
         if self.right.contains(at) {
-            self.focus_members = true;
-            self.filter.editing = false;
+            if pressing {
+                self.focus_members = true;
+                self.filter.editing = false;
+            }
             return self.skill_search.as_mut().unwrap().1.handle_mouse(m, ctx);
         }
         if let Some(d) = wheel(&m, ctx) {
@@ -461,14 +509,27 @@ impl View for PresetsView {
         let (left, right) = split_panes(area, 38, ctx);
         self.left = left;
         self.right = right;
-        let content = self.filter.draw(f, left, "Filter presets", ctx);
+        let content = self.filter.draw(
+            f,
+            left,
+            "Filter presets",
+            "presets",
+            !self.focus_members,
+            ctx,
+        );
         self.draw_presets(f, content, ctx);
         self.ensure_skill_search(ctx);
         if let Some((name, mut view)) = self.skill_search.take() {
             view.set_panel_active(self.focus_members);
-            view.draw_with_content_header(f, right, ctx, |f, content| {
-                self.draw_tags(f, content, ctx)
-            });
+            view.draw_with_content_header(
+                f,
+                right,
+                ctx,
+                if self.tag_groups.is_empty() { 0 } else { 3 },
+                |f, content| {
+                    self.draw_tags(f, content, ctx);
+                },
+            );
             self.skill_search = Some((name, view));
         }
         self.matrix.draw(f, area, ctx);
@@ -512,7 +573,7 @@ impl View for PresetsView {
                 ("a", "edit skills"),
                 ("e", "description"),
                 ("D", "delete preset"),
-                ("Esc/q", "library"),
+                ("Esc/q", "clear/back"),
             ]
         }
     }
@@ -659,10 +720,10 @@ mod tests {
                 "preset must remain visible at height {height}"
             );
             if height >= 5 {
-                assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "╭");
+                assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "╭");
             }
             if height >= 6 {
-                assert_eq!(terminal.backend().buffer()[(1, 4)].symbol(), "╰");
+                assert_eq!(terminal.backend().buffer()[(0, 3)].symbol(), "╰");
             }
         }
         for width in 0..80 {

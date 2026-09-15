@@ -9,6 +9,11 @@ enum GroupIndex {
 }
 
 impl AgentsView {
+    pub(super) fn has_visible_groups(&self) -> bool {
+        self.presets.iter().any(|(_, s)| s.installed > 0)
+            || self.tags.iter().any(|t| t.included > 0)
+    }
+
     pub(super) fn draw_groups(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         self.preset_rects.clear();
         self.tag_rects.clear();
@@ -26,7 +31,12 @@ impl AgentsView {
         let budget = area.width.saturating_sub(3) as usize;
         let mut identities = Vec::with_capacity(self.presets.len() + self.tags.len());
         let mut rendered = Vec::with_capacity(identities.capacity());
-        for (i, (preset, status)) in self.presets.iter().enumerate() {
+        for (i, (preset, status)) in self
+            .presets
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, s))| s.installed > 0)
+        {
             identities.push(GroupIndex::Preset(i));
             rendered.push(
                 group::Badge {
@@ -40,7 +50,7 @@ impl AgentsView {
                 .render(ctx, budget),
             );
         }
-        for (i, tag) in self.tags.iter().enumerate() {
+        for (i, tag) in self.tags.iter().enumerate().filter(|(_, t)| t.included > 0) {
             identities.push(GroupIndex::Tag(i));
             rendered.push(
                 group::Badge {
@@ -53,10 +63,13 @@ impl AgentsView {
             );
         }
 
-        let selected = match self.focus() {
-            Focus::Tags => self.presets.len() + self.tag_cursor,
-            _ => self.preset_cursor,
-        };
+        let selected = identities
+            .iter()
+            .position(|identity| match identity {
+                GroupIndex::Preset(i) => self.focus() != Focus::Tags && *i == self.preset_cursor,
+                GroupIndex::Tag(i) => self.focus() == Focus::Tags && *i == self.tag_cursor,
+            })
+            .unwrap_or(0);
         let widths: Vec<_> = rendered
             .iter()
             .map(|spans| spans.iter().map(Span::width).sum::<usize>() + 1)

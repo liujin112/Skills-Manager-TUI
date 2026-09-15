@@ -2,7 +2,6 @@
 //! data always comes from `Ctx`.
 
 pub mod agents;
-pub(crate) mod completion;
 pub(crate) mod filter;
 pub mod health;
 pub mod matrix;
@@ -28,6 +27,12 @@ pub trait View {
     /// back where someone returning expects to find it; most have nothing to
     /// reset, so the default does nothing.
     fn enter(&mut self) {}
+    /// Enter the page from the tab strip without changing selection or filters.
+    fn focus_root(&mut self) {}
+    /// Directional entry lands on the topmost interactive region.
+    fn focus_from_above(&mut self) {
+        self.focus_root();
+    }
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action>;
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action>;
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx);

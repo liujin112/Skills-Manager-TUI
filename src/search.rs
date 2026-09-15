@@ -331,19 +331,125 @@ pub struct Index {
     weights: [f32; 6],
 }
 
+struct IndexDocument<'a> {
+    names: Vec<&'a str>,
+    fields: Vec<(Field, &'a str)>,
+}
+
+/// Plain text data for navigation lists. No skill identity or query syntax is implied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextDocument {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+#[derive(Default)]
+pub struct TextSearcher {
+    documents: Vec<TextDocument>,
+    index: Index,
+    weights: Option<FieldWeights>,
+}
+
+impl TextSearcher {
+    pub fn search(
+        &mut self,
+        documents: &[TextDocument],
+        query: &str,
+        cfg: &SearchConfig,
+        dict: &Dictionaries,
+    ) -> Vec<usize> {
+        if self.documents != documents || self.weights.as_ref() != Some(&cfg.weights) {
+            let entries: Vec<_> = documents
+                .iter()
+                .map(|d| IndexDocument {
+                    names: vec![d.name.as_str()],
+                    fields: vec![
+                        (Field::Name, d.name.as_str()),
+                        (Field::Description, d.description.as_str()),
+                        (Field::Body, d.body.as_str()),
+                    ],
+                })
+                .collect();
+            self.index = Index::build_documents(&entries, &cfg.weights);
+            self.documents = documents.to_vec();
+            self.weights = Some(cfg.weights.clone());
+        }
+        if query.trim().is_empty() {
+            return (0..documents.len()).collect();
+        }
+        let mut hits = self.index.query(query, cfg, dict);
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.doc.cmp(&b.doc)));
+        let mut order: Vec<_> = hits.into_iter().map(|h| h.doc).collect();
+        // Preserve navigation-list abbreviations (e.g. bndl -> bundle) after
+        // the stronger indexed matches, without interpreting field syntax.
+        if cfg.fuzzy {
+            for (i, document) in documents.iter().enumerate() {
+                let text = format!(
+                    "{} {} {}",
+                    document.name, document.description, document.body
+                )
+                .to_lowercase();
+                if !order.contains(&i)
+                    && query.to_lowercase().split_whitespace().all(|word| {
+                        let mut chars = text.chars();
+                        word.chars()
+                            .all(|c| chars.by_ref().any(|candidate| candidate == c))
+                    })
+                {
+                    order.push(i);
+                }
+            }
+        }
+        order
+    }
+}
+
 impl Index {
     pub fn build(records: &[SkillRecord], w: &FieldWeights) -> Self {
+        let documents: Vec<_> = records
+            .iter()
+            .map(|r| {
+                let mut names = vec![r.key.rsplit('/').next().unwrap_or(&r.key)];
+                let mut fields = Vec::new();
+                if let Some(name) = &r.name {
+                    names.push(name.as_str());
+                    fields.push((Field::Name, name.as_str()));
+                    if name != &r.key {
+                        fields.push((Field::Body, r.key.as_str()));
+                    }
+                } else {
+                    fields.push((Field::Name, r.key.as_str()));
+                }
+                fields.extend(r.tags.iter().map(|t| (Field::Tag, t.as_str())));
+                if let Some(d) = &r.description {
+                    fields.push((Field::Description, d.as_str()));
+                }
+                if let Some(n) = &r.note {
+                    fields.push((Field::Note, n.as_str()));
+                }
+                if let Some(b) = &r.body {
+                    for line in b.lines() {
+                        if let Some(h) = line.trim_start().strip_prefix('#') {
+                            fields.push((Field::Heading, h.trim_start_matches('#')));
+                        }
+                    }
+                    fields.push((Field::Body, b.as_str()));
+                }
+                IndexDocument { names, fields }
+            })
+            .collect();
+        Self::build_documents(&documents, w)
+    }
+
+    fn build_documents(records: &[IndexDocument<'_>], w: &FieldWeights) -> Self {
         let weights = [w.name, w.tag, w.description, w.note, w.heading, w.body];
         let mut docs = Vec::with_capacity(records.len());
         let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
         let mut totals = [0u64; 6];
         for (doc_id, r) in records.iter().enumerate() {
             let mut doc = Doc::default();
-            doc.names
-                .push(r.key.rsplit('/').next().unwrap_or(&r.key).to_lowercase());
-            if let Some(name) = &r.name {
-                doc.names.push(name.to_lowercase());
-            }
+            doc.names = r.names.iter().map(|name| name.to_lowercase()).collect();
             doc.name_terms = doc
                 .names
                 .iter()
@@ -357,30 +463,8 @@ impl Index {
                     e[field.idx()] = e[field.idx()].saturating_add(1);
                 }
             };
-            if let Some(name) = &r.name {
-                add(Field::Name, name, &mut doc);
-                if name != &r.key {
-                    add(Field::Body, &r.key, &mut doc);
-                }
-            } else {
-                add(Field::Name, &r.key, &mut doc);
-            }
-            for t in &r.tags {
-                add(Field::Tag, t, &mut doc);
-            }
-            if let Some(d) = &r.description {
-                add(Field::Description, d, &mut doc);
-            }
-            if let Some(n) = &r.note {
-                add(Field::Note, n, &mut doc);
-            }
-            if let Some(b) = &r.body {
-                for line in b.lines() {
-                    if let Some(h) = line.trim_start().strip_prefix('#') {
-                        add(Field::Heading, h.trim_start_matches('#'), &mut doc);
-                    }
-                }
-                add(Field::Body, b, &mut doc);
+            for (field, text) in &r.fields {
+                add(*field, text, &mut doc);
             }
             for f in Field::ALL {
                 totals[f.idx()] += doc.len[f.idx()] as u64;
@@ -1505,5 +1589,42 @@ mod tests {
         assert_eq!(keys(&records, &hits), ["x"]);
         let hits = Searcher::new().search(&records, &Query::parse("untagged"));
         assert_eq!(keys(&records, &hits), ["y"]);
+    }
+}
+
+#[cfg(test)]
+mod text_document_tests {
+    use super::*;
+    #[test]
+    fn plain_documents_reuse_ranking_fuzzy_cjk_and_literal_url_search() {
+        let docs = vec![
+            TextDocument {
+                name: "bundle".into(),
+                description: "文档工具".into(),
+                body: "https://example.test/tools".into(),
+            },
+            TextDocument {
+                name: "other".into(),
+                description: "bundle helpers".into(),
+                body: String::new(),
+            },
+        ];
+        let mut search = TextSearcher::default();
+        let config = SearchConfig::default();
+        let dict = Dictionaries::default();
+        assert_eq!(search.search(&docs, "", &config, &dict), [0, 1]);
+        assert_eq!(search.search(&docs, "bundle", &config, &dict)[0], 0);
+        for query in [
+            "bund",
+            "budnle",
+            "bndl",
+            "文档",
+            "https://example.test/tools",
+        ] {
+            assert_eq!(search.search(&docs, query, &config, &dict)[0], 0, "{query}");
+        }
+        let mut changed = docs.clone();
+        changed[0].name = "replacement".into();
+        assert_eq!(search.search(&changed, "replacement", &config, &dict)[0], 0);
     }
 }
