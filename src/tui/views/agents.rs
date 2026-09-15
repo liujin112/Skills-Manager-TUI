@@ -25,7 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget};
 use skills::config::UiLayout;
 use skills::ops::deploy::{self, PresetStatus, preset_status};
 use skills::preset::{Preset, TagCoverage, tag_coverages};
@@ -352,8 +352,12 @@ impl AgentsView {
         if self.destinations.is_empty() {
             return;
         }
-        self.destination =
-            (self.destination as i32 + delta).rem_euclid(self.destinations.len() as i32) as usize;
+        let next =
+            (self.destination as i32 + delta).clamp(0, self.destinations.len() as i32 - 1) as usize;
+        if next == self.destination {
+            return;
+        }
+        self.destination = next;
         self.entries = CardGrid::default();
         self.preset_offset = 0;
         self.filter_editing = false;
@@ -1237,7 +1241,11 @@ impl AgentsView {
                 x += w + 1;
                 continue;
             }
-            let border = if on { th.accent() } else { th.dim() };
+            let border = if on {
+                th.accent()
+            } else {
+                Style::default().fg(th.placeholder)
+            };
             let block = ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
                 .border_type(ratatui::widgets::BorderType::Rounded)
@@ -1263,31 +1271,10 @@ impl AgentsView {
         self.destination_rects.clear();
         if !self.destinations.is_empty() {
             let band = rows[1];
-            let widths: Vec<usize> = self
-                .destinations
-                .iter()
-                .map(|scope| {
-                    let (tier, kind, path) = scope_card_labels(scope);
-                    let kind = if ctx.settings.ui.icons == skills::config::Icons::Text {
-                        kind.replace("󰌷", "↔")
-                    } else {
-                        kind
-                    };
-                    let icon = crate::tui::icons::scope(
-                        ctx.settings.ui.icons,
-                        scope.project.is_none(),
-                        false,
-                    );
-                    if compact {
-                        return width(&format!("{icon}{tier} · {kind}")) + 5;
-                    }
-                    ((width(&path) + 2 + width(self.scope_count(scope)))
-                        .max(width(&format!("{icon}{tier} · {kind}")))
-                        + 4)
-                    .clamp(18, 52)
-                        + 1
-                })
-                .collect();
+            // Reserve equal slots independently of agent names, paths and counts.
+            // Narrow terminals retain the existing horizontal scope scrolling.
+            let slot_width = 33;
+            let widths = vec![slot_width; self.destinations.len()];
             let visible = pill_window(
                 &widths,
                 self.destination,
@@ -1295,13 +1282,16 @@ impl AgentsView {
                 band.width.saturating_sub(2) as usize,
             );
             let mut x = band.x + 1;
-            for i in visible.clone() {
+            for i in visible.start..(visible.end + 1).min(self.destinations.len()) {
                 let scope = &self.destinations[i];
-                let w = (widths[i] as u16 - 1).min(band.right().saturating_sub(x));
-                if w < 4 {
+                let w = widths[i] as u16 - 1;
+                let clipped_width = w.min(band.right().saturating_sub(1).saturating_sub(x));
+                if clipped_width == 0 {
                     break;
                 }
                 let rect = Rect::new(x, band.y, w, 3.min(band.height));
+                let clipped = Rect::new(x, band.y, clipped_width, rect.height);
+                let mut buffer = ratatui::buffer::Buffer::empty(rect);
                 let on = i == self.destination;
                 let (tier, kind, path) = scope_card_labels(scope);
                 let kind = if ctx.settings.ui.icons == skills::config::Icons::Text {
@@ -1327,10 +1317,10 @@ impl AgentsView {
                             if on { "▸" } else { " " }
                         ))
                         .style(title_style),
-                        Rect::new(rect.x, rect.y, rect.width, 1),
+                        Rect::new(rect.x, rect.y, clipped.width, 1),
                     );
                     self.destination_rects
-                        .push((Rect::new(rect.x, rect.y, rect.width, 1), i));
+                        .push((Rect::new(rect.x, rect.y, clipped.width, 1), i));
                     x += w + 1;
                     continue;
                 }
@@ -1351,30 +1341,38 @@ impl AgentsView {
                     horizontal: 1,
                     vertical: 0,
                 });
-                f.render_widget(block, rect);
+                block.render(rect, &mut buffer);
                 let count = fit(self.scope_count(scope), inner.width as usize);
                 let count_width = width(&count) as u16;
                 let path_width = inner.width.saturating_sub(count_width + 2);
-                f.render_widget(
-                    Paragraph::new(crate::tui::app::middle_ellipsis(&path, path_width as usize))
-                        .style(if subdued { muted } else { th.dim() }),
-                    Rect::new(inner.x, inner.y, path_width, inner.height),
-                );
+                Paragraph::new(crate::tui::app::middle_ellipsis(&path, path_width as usize))
+                    .style(if subdued { muted } else { th.dim() })
+                    .render(
+                        Rect::new(inner.x, inner.y, path_width, inner.height),
+                        &mut buffer,
+                    );
                 let count_style = match self.scope_count(scope) {
                     "Unreadable" => th.warn(),
                     "Counting…" => th.dim(),
                     _ => th.skill_count(),
                 };
-                f.render_widget(
-                    Paragraph::new(count).style(if subdued { muted } else { count_style }),
-                    Rect::new(
-                        inner.right().saturating_sub(count_width),
-                        inner.y,
-                        count_width,
-                        inner.height,
-                    ),
-                );
-                self.destination_rects.push((rect, i));
+                Paragraph::new(count)
+                    .style(if subdued { muted } else { count_style })
+                    .render(
+                        Rect::new(
+                            inner.right().saturating_sub(count_width),
+                            inner.y,
+                            count_width,
+                            inner.height,
+                        ),
+                        &mut buffer,
+                    );
+                for y in clipped.y..clipped.bottom() {
+                    for x in clipped.x..clipped.right() {
+                        f.buffer_mut()[(x, y)] = buffer[(x, y)].clone();
+                    }
+                }
+                self.destination_rects.push((clipped, i));
                 x += w + 1;
             }
             if band.height > 1 && band.width > 1 {
@@ -2183,6 +2181,89 @@ mod overflow_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::AgentConfig};
+
+    #[test]
+    fn scope_cards_keep_their_geometry_when_switching_agents() {
+        let tmp = skills::ops::DownloadDir::new("scope-card-widths").unwrap();
+        let root = tmp.path().join("root");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(project.join(".codex/skills")).unwrap();
+        let mut ws = Workspace::open(&root).unwrap();
+        ws.config.agents = vec![
+            AgentConfig {
+                key: "codex".into(),
+                name: "Codex".into(),
+                skills_dir: "~/.codex/skills".into(),
+            },
+            AgentConfig {
+                key: "trae-cli".into(),
+                name: "TraeCode CLI".into(),
+                skills_dir: "~/.trae/skills".into(),
+            },
+        ];
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = AgentsView::default();
+        view.discover(&project).unwrap();
+        for (w, h) in [(180, 40), (100, 30), (60, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            view.scope = "codex".into();
+            view.refresh_scope(&ctx);
+            terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            let before = view.destination_rects.clone();
+            assert!(!before.is_empty());
+            view.scope = "trae-cli".into();
+            view.refresh_scope(&ctx);
+            terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            assert_eq!(before, view.destination_rects, "terminal width {w}");
+            if w < 132 {
+                let (partial, index) = *view.destination_rects.last().unwrap();
+                assert!(partial.width > 0 && partial.width < 32);
+                if partial.height > 1 {
+                    assert_eq!(
+                        terminal.backend().buffer()[(partial.right() - 1, partial.bottom() - 1)]
+                            .symbol(),
+                        "─"
+                    );
+                }
+                view.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: partial.x,
+                        row: partial.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &ctx,
+                );
+                terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+                assert_eq!(view.destination, index);
+                assert_eq!(
+                    view.destination_rects
+                        .iter()
+                        .find(|(_, i)| *i == index)
+                        .unwrap()
+                        .0
+                        .width,
+                    32
+                );
+                view.move_destination(-(index as i32), &ctx);
+            }
+        }
+        view.move_destination(-(view.destination as i32), &ctx);
+        view.move_destination(-1, &ctx);
+        assert_eq!(view.destination, 0);
+        let last = view.destinations.len() - 1;
+        view.move_destination(last as i32, &ctx);
+        assert_eq!(view.destination, last);
+        view.move_destination(1, &ctx);
+        assert_eq!(view.destination, last);
+    }
 
     #[test]
     fn linked_local_skill_keeps_its_health_marker_across_layouts() {
@@ -3069,13 +3150,13 @@ mod deployment_scope_tests {
             view.agent_skill_count(&view.scope).as_deref(),
             Some("1 skills total")
         );
-        view.move_destination(1, &ctx);
+        view.move_destination(-1, &ctx);
         assert_eq!(view.agent_directories[&view.scope], directories);
         assert_eq!(
             view.agent_skill_count(&view.scope).as_deref(),
             Some("1 skills total")
         );
-        view.move_destination(-1, &ctx);
+        view.move_destination(1, &ctx);
         let first = view.scoped.clone().unwrap();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
