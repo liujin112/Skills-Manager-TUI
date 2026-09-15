@@ -204,6 +204,22 @@ fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo(
         snap.get(first).unwrap().deploy["sample"],
         DeployState::Deployed
     );
+    let link = plan
+        .iter()
+        .find_map(|action| match action {
+            deploy::Action::Link { path, .. } => Some(path),
+            _ => None,
+        })
+        .unwrap();
+    let link_before = std::fs::read_link(link).unwrap();
+    let meta_before = f.ws.meta.load(first).unwrap();
+    Repository::rename(&f.ws, "sample--tools", "Sample tools").unwrap();
+    assert_eq!(std::fs::read_link(link).unwrap(), link_before);
+    assert_eq!(f.ws.meta.load(first).unwrap(), meta_before);
+    let refresh = f.fetch("sample--tools");
+    assert_eq!(refresh.repository.name.as_deref(), Some("Sample tools"));
+    refresh.repository.validate(&f.ws).unwrap();
+    refresh.cleanup();
     let plan = deploy::plan_deploy(&f.ws, &snap, std::slice::from_ref(second), &agent).unwrap();
     assert!(deploy::resolve_names(&snap, &plan, None).is_err());
     assert!(deploy::resolve_names(&snap, &plan, Some("coexist")).is_err());
@@ -244,6 +260,10 @@ fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo(
             .contains("updated")
     );
     assert_eq!(snap.get(first).unwrap().tags, ["sample"]);
+    assert_eq!(
+        Repository::list(&f.ws.root).unwrap()[0].display_name(),
+        "Sample tools"
+    );
     assert_eq!(
         snap.get(first).unwrap().deploy["sample"],
         DeployState::Deployed

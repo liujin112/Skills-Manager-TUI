@@ -7,10 +7,25 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{
     Frame,
-    layout::Rect,
-    widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
+    layout::{Margin, Rect},
+    widgets::{BorderType, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use skills::preset::Preset;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Tag,
+    Preset,
+}
+
+impl Kind {
+    pub fn marker(self, ctx: &Ctx) -> &'static str {
+        match self {
+            Self::Tag => "●",
+            Self::Preset => crate::tui::icons::preset_caps(ctx.settings.ui.icons).0,
+        }
+    }
+}
 
 /// Tags and presets use the same neutral fallback for missing or invalid colours.
 pub fn color(explicit: Option<&str>, theme: &Theme) -> Color {
@@ -40,25 +55,54 @@ pub fn card_height(description: Option<&str>) -> u16 {
     3 + u16::from(description.is_some_and(|value| !value.trim().is_empty()))
 }
 
-/// Shared identity and optional description for tag and preset cards.
-pub fn group_card(
+/// Navigation sidebars share a coloured dot, a bold name and a skill count.
+pub fn sidebar_card(
     name: &str,
     count: usize,
     description: Option<&str>,
     color: Color,
     columns: usize,
-    th: &Theme,
+    ctx: &Ctx,
 ) -> Vec<Line<'static>> {
-    let count = fit(&format!("{count} skills"), columns);
+    card_lines(
+        Kind::Tag,
+        name,
+        &format!("{count} skills"),
+        description,
+        color,
+        columns,
+        ctx,
+    )
+}
+
+fn card_lines(
+    kind: Kind,
+    name: &str,
+    count: &str,
+    description: Option<&str>,
+    color: Color,
+    columns: usize,
+    ctx: &Ctx,
+) -> Vec<Line<'static>> {
+    let th = &ctx.settings.theme;
+    let count = fit(count, columns);
     let room = columns.saturating_sub(width(&count) + usize::from(columns > width(&count)));
-    let marker = fit("● ", room);
-    let name = pad(name, room.saturating_sub(width(&marker)));
-    let mut lines = vec![Line::from(vec![
-        Span::styled(marker, Style::default().fg(color)),
-        Span::styled(name, th.bold()),
-        Span::raw(if columns > width(&count) { " " } else { "" }),
-        Span::styled(count, th.skill_count()),
-    ])];
+    let mut identity = if kind == Kind::Preset {
+        Badge::for_kind(kind, name, color).render(ctx, room)
+    } else {
+        let marker = fit(&format!("{} ", kind.marker(ctx)), room);
+        let name = pad(name, room.saturating_sub(width(&marker)));
+        vec![
+            Span::styled(marker, Style::default().fg(color)),
+            Span::styled(name, th.bold()),
+        ]
+    };
+    let used = identity.iter().map(Span::width).sum::<usize>();
+    identity.push(Span::raw(
+        " ".repeat(columns.saturating_sub(used + width(&count))),
+    ));
+    identity.push(Span::styled(count, th.skill_count()));
+    let mut lines = vec![Line::from(identity)];
     if let Some(desc) = description.filter(|s| !s.trim().is_empty()) {
         let plain = tui_markdown::from_str(desc)
             .lines
@@ -72,6 +116,61 @@ pub fn group_card(
         )));
     }
     lines
+}
+
+/// Fixed skill packages share their identity badge with skill metadata.
+pub fn preset_card(
+    preset: &Preset,
+    ctx: &Ctx,
+    columns: usize,
+    coverage: Option<(usize, usize)>,
+) -> Vec<Line<'static>> {
+    let count = match coverage {
+        Some((installed, total)) => format!("{installed}/{total} skills"),
+        None => format!("{} skills", preset.members().len()),
+    };
+    card_lines(
+        Kind::Preset,
+        &preset.name,
+        &count,
+        preset.description.as_deref(),
+        preset_fill(preset, ctx),
+        columns,
+        ctx,
+    )
+}
+
+/// Borders, identity and an optional description.
+pub fn preset_card_height(preset: &Preset) -> u16 {
+    card_height(preset.description.as_deref())
+}
+
+/// The package identity remains visible when a terminal resize clips a card.
+pub fn fit_preset_card(mut lines: Vec<Line<'static>>, rows: u16) -> Vec<Line<'static>> {
+    lines.truncate(rows as usize);
+    lines
+}
+
+/// Packages have square borders; their focus and padding match the card grid.
+pub fn preset_frame(f: &mut Frame, area: Rect, selected: bool, focused: bool, ctx: &Ctx) -> Rect {
+    let th = &ctx.settings.theme;
+    let border = if selected && focused {
+        th.accent().add_modifier(Modifier::BOLD)
+    } else if selected {
+        th.bold()
+    } else {
+        Style::default().fg(th.border)
+    };
+    let block = th
+        .block("", selected && focused)
+        .border_type(BorderType::Plain)
+        .border_style(border);
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    f.render_widget(block, area);
+    inner
 }
 
 /// Filled labels own their palette: ANSI colours can be remapped by the
@@ -137,8 +236,9 @@ fn ink(fill: Color) -> Color {
     }
 }
 
-/// Every capsule shares spacing, clipping, contrast and selection styling.
-pub struct Pill<'a> {
+/// Shared filled identity: rounded tags and slanted preset packages.
+pub struct Badge<'a> {
+    pub kind: Kind,
     pub name: &'a str,
     pub fill: Color,
     pub coverage: Option<(usize, usize)>,
@@ -146,9 +246,16 @@ pub struct Pill<'a> {
     pub focused: bool,
 }
 
-impl<'a> Pill<'a> {
+pub type TagLabel<'a> = Badge<'a>;
+
+impl<'a> Badge<'a> {
     pub fn new(name: &'a str, fill: Color) -> Self {
+        Self::for_kind(Kind::Tag, name, fill)
+    }
+
+    pub fn for_kind(kind: Kind, name: &'a str, fill: Color) -> Self {
         Self {
+            kind,
             name,
             fill,
             coverage: None,
@@ -173,7 +280,12 @@ impl<'a> Pill<'a> {
             }
             None => ("", String::new()),
         };
-        let (left, right) = ctx.settings.ui.pill_caps.glyphs();
+        let (left, right) = match self.kind {
+            Kind::Tag => {
+                crate::tui::icons::tag_caps(ctx.settings.ui.icons, ctx.settings.ui.pill_caps)
+            }
+            Kind::Preset => crate::tui::icons::preset_caps(ctx.settings.ui.icons),
+        };
         let fixed = width(left) + width(right) + width(mark) + width(&count) + 2;
         if max_width < fixed {
             return vec![];
@@ -196,26 +308,85 @@ impl<'a> Pill<'a> {
     }
 }
 
-/// Fit whole tag pills in `max_w`, reserving space for a remaining-tag count.
-pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>> {
+/// One packing policy for membership badges in cards and full detail rows.
+pub fn membership_badges(
+    kind: Kind,
+    names: &[String],
+    ctx: &Ctx,
+    max_w: usize,
+    max_names: usize,
+) -> Vec<Span<'static>> {
+    if kind == Kind::Tag && !ctx.settings.tags_enabled {
+        return vec![];
+    }
+    let names = names.iter().collect::<std::collections::BTreeSet<_>>();
+    let badges = names
+        .into_iter()
+        .map(|name| {
+            let fill = match kind {
+                Kind::Tag => tag_fill(name, ctx),
+                Kind::Preset => ctx
+                    .snap
+                    .presets
+                    .get(name)
+                    .map_or(ctx.settings.theme.tag, |preset| preset_fill(preset, ctx)),
+            };
+            Badge::for_kind(kind, name, fill)
+        })
+        .collect::<Vec<_>>();
+    pack_badges(&badges, ctx, max_w, max_names)
+}
+
+/// Coverage is derived from the caller's current member set, never Tag ownership.
+pub fn tag_coverage_pills(
+    coverages: &[skills::preset::TagCoverage],
+    ctx: &Ctx,
+    max_w: usize,
+) -> Vec<Span<'static>> {
     if !ctx.settings.tags_enabled {
         return vec![];
     }
+    let mut coverages = coverages.iter().collect::<Vec<_>>();
+    coverages.sort_by(|a, b| a.name.cmp(&b.name));
+    let badges = coverages
+        .into_iter()
+        .map(|coverage| Badge {
+            coverage: Some((coverage.included, coverage.total)),
+            ..Badge::new(&coverage.name, tag_fill(&coverage.name, ctx))
+        })
+        .collect::<Vec<_>>();
+    pack_badges(&badges, ctx, max_w, usize::MAX)
+}
+
+fn pack_badges(
+    badges: &[Badge<'_>],
+    ctx: &Ctx,
+    max_w: usize,
+    max_names: usize,
+) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut used = 0;
-    for (i, t) in tags.iter().enumerate() {
-        let pill = Pill::new(t, tag_fill(t, ctx)).render(ctx, usize::MAX);
-        let w = pill.iter().map(Span::width).sum::<usize>() + usize::from(i > 0);
-        // Keep room for the "+n" so the last thing on the line is never a
-        // pill cut in half.
-        let rest = tags.len() - i - 1;
+    for (i, badge) in badges.iter().enumerate() {
+        let rest = badges.len() - i - 1;
         let reserve = if rest > 0 {
             width(&format!(" +{rest}"))
         } else {
             0
         };
-        if used + w + reserve > max_w {
-            let count = fit(&format!(" +{}", rest + 1), max_w.saturating_sub(used));
+        let pill = badge.render(
+            ctx,
+            if max_names == 1 {
+                max_w.saturating_sub(reserve)
+            } else {
+                usize::MAX
+            },
+        );
+        let w = pill.iter().map(Span::width).sum::<usize>() + usize::from(i > 0);
+        if i >= max_names || pill.is_empty() || used + w + reserve > max_w {
+            let count = fit(
+                &format!("{}+{}", if used > 0 { " " } else { "" }, rest + 1),
+                max_w.saturating_sub(used),
+            );
             if !count.is_empty() {
                 out.push(Span::styled(count, ctx.settings.theme.dim()));
             }
@@ -301,14 +472,19 @@ mod tests {
             Color::Rgb(0, 180, 0),
             Color::Rgb(255, 0, 128),
         ]) {
-            let spans = Pill::new("label", fill).render(&ctx, usize::MAX);
-            let bg = spans[1].style.bg.unwrap();
-            let fg = spans[1].style.fg.unwrap();
-            assert!(matches!(bg, Color::Rgb(..)));
-            assert_eq!(spans[0].style.fg, Some(bg));
-            assert_eq!(spans[2].style.fg, Some(bg));
-            let (a, b) = (luminance(fg), luminance(bg));
-            assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5, "{fill:?}");
+            for kind in [Kind::Tag, Kind::Preset] {
+                let spans = Badge::for_kind(kind, "label", fill).render(&ctx, usize::MAX);
+                let bg = spans[1].style.bg.unwrap();
+                let fg = spans[1].style.fg.unwrap();
+                assert!(matches!(bg, Color::Rgb(..)));
+                assert_eq!(spans[0].style.fg, Some(bg));
+                assert_eq!(spans[2].style.fg, Some(bg));
+                let (a, b) = (luminance(fg), luminance(bg));
+                assert!(
+                    (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5,
+                    "{kind:?} {fill:?}"
+                );
+            }
         }
     }
 
@@ -323,12 +499,61 @@ mod tests {
 
     #[test]
     fn group_card_height_tracks_its_visible_description() {
-        let theme = Theme::default();
+        let dir = skills::ops::DownloadDir::new("group-card").unwrap();
+        let mut ws = skills::Workspace::open(dir.path()).unwrap();
+        ws.config.tags.push(skills::config::TagConfig {
+            name: "dev".into(),
+            skills: vec!["shared".into(), "tool".into()],
+            color: None,
+            description: None,
+        });
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
         for description in [None, Some(""), Some(" \n "), Some("**Useful** tools")] {
-            let lines = group_card("tools", 12, description, theme.tag, 40, &theme);
+            let lines = sidebar_card("tools", 12, description, settings.theme.tag, 40, &ctx);
             assert_eq!(usize::from(card_height(description)), lines.len() + 2);
+            assert!(lines[0].to_string().starts_with(Kind::Tag.marker(&ctx)));
             assert!(lines[0].to_string().ends_with("12 skills"));
-            assert_eq!(lines[0].spans.last().unwrap().style, theme.skill_count());
+            for skills in [vec![], vec!["shared".into(), "shared".into()]] {
+                let preset = Preset {
+                    name: "tools".into(),
+                    skills,
+                    description: description.map(str::to_owned),
+                    ..Preset::default()
+                };
+                let total = usize::from(!preset.skills.is_empty());
+                let lines = preset_card(&preset, &ctx, 40, None);
+                assert_eq!(usize::from(preset_card_height(&preset)), lines.len() + 2);
+                assert!(lines[0].to_string().ends_with(&format!("{total} skills")));
+                assert!(lines[0].to_string().starts_with(Kind::Preset.marker(&ctx)));
+                assert_eq!(
+                    lines[0].spans.last().unwrap().style,
+                    settings.theme.skill_count()
+                );
+                assert!(
+                    !lines.iter().any(|line| line.to_string().contains("dev")),
+                    "overlapping Tags do not add composition rows to fixed packages"
+                );
+                for rows in 0..=3 {
+                    let clipped = fit_preset_card(lines.clone(), rows);
+                    assert!(clipped.len() <= rows as usize);
+                    if rows > 0 {
+                        assert_eq!(clipped[0], lines[0]);
+                    }
+                    if rows as usize >= lines.len() {
+                        assert_eq!(clipped, lines);
+                    }
+                }
+                for columns in [0, 1, 6, 15, 40] {
+                    let lines = preset_card(&preset, &ctx, columns, Some((1, total)));
+                    assert!(lines.iter().all(|line| line.width() <= columns));
+                }
+            }
         }
     }
 }

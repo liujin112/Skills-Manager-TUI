@@ -5,13 +5,72 @@
 //! refreshed after every scan, retaining the index when searchable text is unchanged.
 //!
 //! Query syntax: free words plus `tag:x`, `agent:y`, `status:z`, `source:w`
-//! and `untagged` filters.
+//! `preset:x` and `untagged` filters.
 
 use crate::config::{FieldWeights, SearchConfig};
 use crate::dict::Dictionaries;
 use crate::reconcile::{DeployState, SkillRecord};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
+
+/// Query token boundaries, including quoted source names such as `repo:"My Skills"`.
+/// Completion uses the same boundaries so accepting a name replaces the whole filter.
+pub fn query_token_ranges(input: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut chars = input.char_indices().peekable();
+    while let Some((start, first)) = chars.next() {
+        if first.is_whitespace() {
+            continue;
+        }
+        let quoted_source = ["repo:\"", "tag:\"", "preset:\""]
+            .iter()
+            .any(|prefix| input[start..].starts_with(prefix));
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut end = start + first.len_utf8();
+        while let Some(&(index, ch)) = chars.peek() {
+            if ch.is_whitespace() && !quoted {
+                break;
+            }
+            chars.next();
+            end = index + ch.len_utf8();
+            if quoted_source {
+                if escaped {
+                    escaped = false;
+                } else if quoted && ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quoted = !quoted;
+                }
+            }
+        }
+        ranges.push(start..end);
+    }
+    ranges
+}
+
+pub fn source_query_value(value: &str) -> String {
+    if value.starts_with('"') {
+        serde_json::from_str(value).unwrap_or_else(|_| value.trim_matches('"').into())
+    } else {
+        value.into()
+    }
+}
+
+pub fn source_query_token(name: &str) -> String {
+    if name
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '"' || ch == '\\')
+    {
+        format!(
+            "repo:{}",
+            serde_json::to_string(name).expect("string serializes")
+        )
+    } else {
+        format!("repo:{name}")
+    }
+}
 
 // ---- query ------------------------------------------------------------------
 
@@ -19,6 +78,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub struct Query {
     pub text: String,
     pub tags: Vec<String>,
+    pub presets: Vec<String>,
     pub agents: Vec<String>,
     pub statuses: Vec<String>,
     pub sources: Vec<String>,
@@ -31,12 +91,17 @@ impl Query {
     pub fn parse(input: &str) -> Self {
         let mut q = Query::default();
         let mut free = Vec::new();
-        for tok in input.split_whitespace() {
+        for range in query_token_ranges(input) {
+            let tok = &input[range];
             if let Some(v) = tok.strip_prefix("tag:") {
                 if v.is_empty() {
                     q.untagged = true;
                 } else {
-                    q.tags.push(v.to_lowercase());
+                    q.tags.push(source_query_value(v).to_lowercase());
+                }
+            } else if let Some(v) = tok.strip_prefix("preset:") {
+                if !v.is_empty() {
+                    q.presets.push(source_query_value(v).to_lowercase());
                 }
             } else if let Some(v) = tok.strip_prefix("agent:") {
                 if !v.is_empty() {
@@ -51,7 +116,7 @@ impl Query {
                     q.sources.push(v.to_lowercase());
                 }
             } else if let Some(v) = tok.strip_prefix("repo:") {
-                q.repositories.push(v.to_string());
+                q.repositories.push(source_query_value(v));
             } else if tok == "untagged" {
                 q.untagged = true;
             } else {
@@ -65,6 +130,7 @@ impl Query {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
             && self.tags.is_empty()
+            && self.presets.is_empty()
             && self.agents.is_empty()
             && self.statuses.is_empty()
             && self.sources.is_empty()
@@ -87,6 +153,11 @@ impl Query {
                 _ => return false,
             }
         }
+        for preset in &self.presets {
+            if !r.presets.iter().any(|name| name.to_lowercase() == *preset) {
+                return false;
+            }
+        }
         if !self.statuses.is_empty() {
             let label = r.status.label().trim_end_matches('?');
             if !self.statuses.iter().any(|s| s == label) {
@@ -96,11 +167,16 @@ impl Query {
         if !self.repositories.is_empty()
             && !self.repositories.iter().any(|a| {
                 crate::repository::alias_of(&r.key) == Some(a.as_str())
+                    || r.source_display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(a))
                     || r.source
                         .as_ref()
                         .and_then(crate::meta::Source::url)
-                        .and_then(crate::repository::source_name)
-                        .is_some_and(|name| name.eq_ignore_ascii_case(a))
+                        .is_some_and(|url| {
+                            url.eq_ignore_ascii_case(a)
+                                || crate::repository::source_name(url)
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(a))
+                        })
             })
         {
             return false;
@@ -257,19 +333,125 @@ pub struct Index {
     weights: [f32; 6],
 }
 
+struct IndexDocument<'a> {
+    names: Vec<&'a str>,
+    fields: Vec<(Field, &'a str)>,
+}
+
+/// Plain text data for navigation lists. No skill identity or query syntax is implied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextDocument {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+#[derive(Default)]
+pub struct TextSearcher {
+    documents: Vec<TextDocument>,
+    index: Index,
+    weights: Option<FieldWeights>,
+}
+
+impl TextSearcher {
+    pub fn search(
+        &mut self,
+        documents: &[TextDocument],
+        query: &str,
+        cfg: &SearchConfig,
+        dict: &Dictionaries,
+    ) -> Vec<usize> {
+        if self.documents != documents || self.weights.as_ref() != Some(&cfg.weights) {
+            let entries: Vec<_> = documents
+                .iter()
+                .map(|d| IndexDocument {
+                    names: vec![d.name.as_str()],
+                    fields: vec![
+                        (Field::Name, d.name.as_str()),
+                        (Field::Description, d.description.as_str()),
+                        (Field::Body, d.body.as_str()),
+                    ],
+                })
+                .collect();
+            self.index = Index::build_documents(&entries, &cfg.weights);
+            self.documents = documents.to_vec();
+            self.weights = Some(cfg.weights.clone());
+        }
+        if query.trim().is_empty() {
+            return (0..documents.len()).collect();
+        }
+        let mut hits = self.index.query(query, cfg, dict);
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.doc.cmp(&b.doc)));
+        let mut order: Vec<_> = hits.into_iter().map(|h| h.doc).collect();
+        // Preserve navigation-list abbreviations (e.g. bndl -> bundle) after
+        // the stronger indexed matches, without interpreting field syntax.
+        if cfg.fuzzy {
+            for (i, document) in documents.iter().enumerate() {
+                let text = format!(
+                    "{} {} {}",
+                    document.name, document.description, document.body
+                )
+                .to_lowercase();
+                if !order.contains(&i)
+                    && query.to_lowercase().split_whitespace().all(|word| {
+                        let mut chars = text.chars();
+                        word.chars()
+                            .all(|c| chars.by_ref().any(|candidate| candidate == c))
+                    })
+                {
+                    order.push(i);
+                }
+            }
+        }
+        order
+    }
+}
+
 impl Index {
     pub fn build(records: &[SkillRecord], w: &FieldWeights) -> Self {
+        let documents: Vec<_> = records
+            .iter()
+            .map(|r| {
+                let mut names = vec![r.key.rsplit('/').next().unwrap_or(&r.key)];
+                let mut fields = Vec::new();
+                if let Some(name) = &r.name {
+                    names.push(name.as_str());
+                    fields.push((Field::Name, name.as_str()));
+                    if name != &r.key {
+                        fields.push((Field::Body, r.key.as_str()));
+                    }
+                } else {
+                    fields.push((Field::Name, r.key.as_str()));
+                }
+                fields.extend(r.tags.iter().map(|t| (Field::Tag, t.as_str())));
+                if let Some(d) = &r.description {
+                    fields.push((Field::Description, d.as_str()));
+                }
+                if let Some(n) = &r.note {
+                    fields.push((Field::Note, n.as_str()));
+                }
+                if let Some(b) = &r.body {
+                    for line in b.lines() {
+                        if let Some(h) = line.trim_start().strip_prefix('#') {
+                            fields.push((Field::Heading, h.trim_start_matches('#')));
+                        }
+                    }
+                    fields.push((Field::Body, b.as_str()));
+                }
+                IndexDocument { names, fields }
+            })
+            .collect();
+        Self::build_documents(&documents, w)
+    }
+
+    fn build_documents(records: &[IndexDocument<'_>], w: &FieldWeights) -> Self {
         let weights = [w.name, w.tag, w.description, w.note, w.heading, w.body];
         let mut docs = Vec::with_capacity(records.len());
         let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
         let mut totals = [0u64; 6];
         for (doc_id, r) in records.iter().enumerate() {
             let mut doc = Doc::default();
-            doc.names
-                .push(r.key.rsplit('/').next().unwrap_or(&r.key).to_lowercase());
-            if let Some(name) = &r.name {
-                doc.names.push(name.to_lowercase());
-            }
+            doc.names = r.names.iter().map(|name| name.to_lowercase()).collect();
             doc.name_terms = doc
                 .names
                 .iter()
@@ -283,30 +465,8 @@ impl Index {
                     e[field.idx()] = e[field.idx()].saturating_add(1);
                 }
             };
-            if let Some(name) = &r.name {
-                add(Field::Name, name, &mut doc);
-                if name != &r.key {
-                    add(Field::Body, &r.key, &mut doc);
-                }
-            } else {
-                add(Field::Name, &r.key, &mut doc);
-            }
-            for t in &r.tags {
-                add(Field::Tag, t, &mut doc);
-            }
-            if let Some(d) = &r.description {
-                add(Field::Description, d, &mut doc);
-            }
-            if let Some(n) = &r.note {
-                add(Field::Note, n, &mut doc);
-            }
-            if let Some(b) = &r.body {
-                for line in b.lines() {
-                    if let Some(h) = line.trim_start().strip_prefix('#') {
-                        add(Field::Heading, h.trim_start_matches('#'), &mut doc);
-                    }
-                }
-                add(Field::Body, b, &mut doc);
+            for (field, text) in &r.fields {
+                add(*field, text, &mut doc);
             }
             for f in Field::ALL {
                 totals[f.idx()] += doc.len[f.idx()] as u64;
@@ -706,6 +866,8 @@ fn damerau_levenshtein(a: &str, b: &str, max: usize) -> usize {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
+    /// Stable identity for retaining a selection when a new scan reorders records.
+    pub key: String,
     pub index: usize,
     pub score: f32,
     /// Fields that contained a match, ordered by weight (best first).
@@ -817,6 +979,7 @@ impl Searcher {
             return (0..records.len())
                 .filter(|i| allowed[*i])
                 .map(|index| Hit {
+                    key: records[index].key.clone(),
                     index,
                     score: 0.0,
                     fields: Vec::new(),
@@ -832,6 +995,7 @@ impl Searcher {
             .map(|h| {
                 let excerpt = excerpt_for(&records[h.doc], &h.terms, &h.fields);
                 Hit {
+                    key: records[h.doc].key.clone(),
                     index: h.doc,
                     score: h.score,
                     fields: h.fields,
@@ -1014,8 +1178,10 @@ mod tests {
             external: false,
             name_mismatch: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            presets: Vec::new(),
             note: None,
             source: None,
+            source_name: None,
             current_hash: None,
             baseline_hash: None,
             deploy: BTreeMap::new(),
@@ -1114,6 +1280,33 @@ mod tests {
         assert!(!Query::parse("repo:other/cli").filter(&r));
         assert!(Query::parse("source:repository").filter(&r));
         assert!(!Query::parse("source:local").filter(&r));
+    }
+
+    #[test]
+    fn repository_filter_accepts_current_display_names_and_quoted_values() {
+        let mut record = rec("repos/stable-storage/one", "", "", &[]);
+        record.source_name = Some("Merlin Skills".into());
+        record.source = Some(crate::meta::Source::Archive {
+            url: "https://example.test/latest/skills.tar".into(),
+            subpath: None,
+            revision: None,
+        });
+        assert!(Query::parse("repo:\"Merlin Skills\" source:repository").filter(&record));
+        assert!(Query::parse("repo:stable-storage").filter(&record));
+        assert!(Query::parse("repo:https://example.test/latest/skills.tar").filter(&record));
+        let query = Query::parse("before repo:\"Merlin Skills\" tag:work after");
+        assert_eq!(query.repositories, ["Merlin Skills"]);
+        assert_eq!(query.text, "before after");
+        assert_eq!(query.tags, ["work"]);
+        for name in ["工具 包", "Merlin \"Skills\"", "My \\ Skills"] {
+            record.source_name = Some(name.into());
+            let encoded = source_query_token(name);
+            assert_eq!(Query::parse(&encoded).repositories, [name]);
+            assert!(Query::parse(&encoded).filter(&record));
+        }
+        record.source_name = Some("Renamed".into());
+        assert!(!Query::parse("repo:\"Merlin Skills\"").filter(&record));
+        assert!(Query::parse("repo:renamed").filter(&record));
     }
 
     #[test]
@@ -1398,5 +1591,42 @@ mod tests {
         assert_eq!(keys(&records, &hits), ["x"]);
         let hits = Searcher::new().search(&records, &Query::parse("untagged"));
         assert_eq!(keys(&records, &hits), ["y"]);
+    }
+}
+
+#[cfg(test)]
+mod text_document_tests {
+    use super::*;
+    #[test]
+    fn plain_documents_reuse_ranking_fuzzy_cjk_and_literal_url_search() {
+        let docs = vec![
+            TextDocument {
+                name: "bundle".into(),
+                description: "文档工具".into(),
+                body: "https://example.test/tools".into(),
+            },
+            TextDocument {
+                name: "other".into(),
+                description: "bundle helpers".into(),
+                body: String::new(),
+            },
+        ];
+        let mut search = TextSearcher::default();
+        let config = SearchConfig::default();
+        let dict = Dictionaries::default();
+        assert_eq!(search.search(&docs, "", &config, &dict), [0, 1]);
+        assert_eq!(search.search(&docs, "bundle", &config, &dict)[0], 0);
+        for query in [
+            "bund",
+            "budnle",
+            "bndl",
+            "文档",
+            "https://example.test/tools",
+        ] {
+            assert_eq!(search.search(&docs, query, &config, &dict)[0], 0, "{query}");
+        }
+        let mut changed = docs.clone();
+        changed[0].name = "replacement".into();
+        assert_eq!(search.search(&changed, "replacement", &config, &dict)[0], 0);
     }
 }

@@ -39,7 +39,8 @@ pub enum UiLayout {
     #[default]
     Grid,
     /// Four unframed lines per skill: identity, two description lines, and
-    /// source/tags. Search panels show an adjacent preview; Agents uses overlays.
+    /// source/Tag/Preset metadata. Search panels show an adjacent preview;
+    /// Agents uses overlays.
     List,
     /// One identity row per skill, with an optional search-excerpt row.
     #[serde(alias = "split")]
@@ -57,7 +58,7 @@ impl UiLayout {
     }
 }
 
-/// What caps the ends of a preset pill. A terminal cell is taller than it is
+/// What caps the ends of a Tag pill. A terminal cell is taller than it is
 /// wide, so a rounded end has to be drawn by a glyph that fills the whole cell:
 /// the geometric half-discs (U+25D6/U+25D7) sit at x-height and read as a bead
 /// beside the fill, not as the end of a capsule.
@@ -249,7 +250,7 @@ impl AgentConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TagConfig {
     #[serde(default)]

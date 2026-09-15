@@ -92,10 +92,17 @@ fn short_hash(h: &str) -> &str {
 }
 
 impl HealthView {
+    pub fn focus_input(&mut self) {
+        self.filter.editing = true;
+    }
+
     pub fn input_focused(&self) -> bool {
         self.filter.editing
     }
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if self.preview.is_open() {
+            return vec![];
+        }
         let actions = self.filter.paste(text);
         self.rebuild(ctx);
         actions
@@ -250,19 +257,44 @@ impl HealthView {
             }
         }
         self.total_issues = self.issue_count();
-        self.rows.retain(|row| {
-            row.heading.is_some()
-                || self.filter.matches(&format!(
-                    "{} {} {} {}",
-                    row.key,
+        let documents = self
+            .rows
+            .iter()
+            .map(|row| skills::search::TextDocument {
+                name: row.key.clone(),
+                description: row.explanation.clone().unwrap_or_default(),
+                body: format!(
+                    "{} {}",
                     row.agent.as_deref().unwrap_or(""),
-                    row.explanation.as_deref().unwrap_or(""),
                     ctx.snap
                         .get(&row.key)
                         .map(|r| status_text(&r.status))
                         .unwrap_or_default()
-                ))
-        });
+                ),
+            })
+            .collect::<Vec<_>>();
+        let order = self
+            .filter
+            .rank(&documents, ctx)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, i)| (i, rank))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut group = 0;
+        let mut ranked = std::mem::take(&mut self.rows)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                if row.heading.is_some() {
+                    group += 1;
+                    Some((group, 0, row))
+                } else {
+                    order.get(&i).map(|rank| (group, rank + 1, row))
+                }
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by_key(|(group, rank, _)| (*group, *rank));
+        self.rows = ranked.into_iter().map(|(_, _, row)| row).collect();
         // Drop empty section headings after filtering.
         let mut has_child = false;
         let mut keep = vec![false; self.rows.len()];
@@ -655,16 +687,24 @@ impl HealthView {
 }
 
 impl View for HealthView {
+    fn focus_root(&mut self) {
+        self.filter.editing = false;
+    }
+
     fn refresh(&mut self, ctx: &Ctx) {
         self.rebuild(ctx);
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.filter.key(k) {
-            self.rebuild(ctx);
+        if self.preview.handle_key(k) {
             return vec![];
         }
-        if self.preview.handle_key(k) {
+        if self.filter.editing && k.code == KeyCode::Up {
+            self.filter.editing = false;
+            return vec![Action::BackToParent];
+        }
+        if self.filter.key(k) {
+            self.rebuild(ctx);
             return vec![];
         }
         if let Some(actions) = self.agent_action(k.code, ctx) {
@@ -673,16 +713,23 @@ impl View for HealthView {
         let caps = self.selected_row().map(|r| r.caps).unwrap_or_default();
         match k.code {
             KeyCode::Char('M') => self.select_skills(None),
-            KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
-            // Esc means "back" everywhere else in the program, so here it goes
-            // back to the search page rather than out of the door.
-            KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
+            KeyCode::Char('q') => vec![Action::BackToParent],
+            KeyCode::Esc => vec![Action::BackToParent],
             KeyCode::Down | KeyCode::Char('j') => {
                 self.select_by(1);
                 vec![]
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.select_by(-1);
+                let first = self
+                    .rows
+                    .iter()
+                    .position(|r| r.heading.is_none())
+                    .unwrap_or(0);
+                if self.list.selected().unwrap_or(0) <= first {
+                    self.filter.editing = true;
+                } else {
+                    self.select_by(-1);
+                }
                 vec![]
             }
             KeyCode::Enter => self.open_selected(ctx),
@@ -763,7 +810,9 @@ impl View for HealthView {
             return vec![];
         }
         let at = (m.column, m.row).into();
-        if m.kind == MouseEventKind::Down(MouseButton::Left) && self.filter.rect.contains(at) {
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.filter.click_input(m.column, m.row)
+        {
             self.filter.editing = true;
             return vec![];
         }
@@ -789,7 +838,14 @@ impl View for HealthView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let area = self.filter.draw(f, area, "Filter health issues", ctx);
+        let area = self.filter.draw(
+            f,
+            area,
+            "Filter health issues",
+            &format!("health · {} issues", self.issue_count()),
+            true,
+            ctx,
+        );
         let th = &ctx.settings.theme;
         // With nothing to show there is nothing to explain either, so the
         // message gets the whole width instead of being squeezed beside an
@@ -797,9 +853,7 @@ impl View for HealthView {
         if self.issue_count() == 0 {
             self.left = area;
             self.right = Rect::default();
-            let block = th.block(" health ", true);
-            let inner = block.inner(area);
-            f.render_widget(block, area);
+            let inner = area;
             let msg = if self.total_issues > 0 {
                 format!("No matching issues · {} issues in total", self.total_issues)
             } else {
@@ -875,10 +929,9 @@ impl View for HealthView {
                 ListItem::new(Line::from(spans))
             })
             .collect();
-        let title = format!(" health · {} issues ", self.issue_count());
-        self.list.set_area_from_block(left);
+
+        self.list.rows = left;
         let list = List::new(items)
-            .block(th.block(title, true))
             .highlight_style(th.selected())
             .highlight_symbol("▸ ");
         f.render_stateful_widget(list, left, &mut self.list.state);
@@ -898,7 +951,7 @@ impl View for HealthView {
         }
         if let Some(row) = self.selected_row() {
             if row.heading.is_some() {
-                return &[("c", "check updates"), ("Esc/q", "library")];
+                return &[("c", "check updates"), ("Esc/q", "clear/back")];
             }
             if row.agent.is_some() {
                 return match row.state {
@@ -907,36 +960,40 @@ impl View for HealthView {
                         ("a", "adopt copy"),
                         ("Enter", "agents"),
                         ("c", "check updates"),
-                        ("Esc/q", "library"),
+                        ("Esc/q", "clear/back"),
                     ],
                     Some(EntryState::Broken { .. }) => &[
                         ("x", "remove link"),
                         ("Enter", "act"),
                         ("c", "check updates"),
-                        ("Esc/q", "library"),
+                        ("Esc/q", "clear/back"),
                     ],
                     Some(EntryState::Shadow { same_content: true }) => &[
                         ("r", "relink"),
                         ("Enter", "act"),
                         ("c", "check updates"),
-                        ("Esc/q", "library"),
+                        ("Esc/q", "clear/back"),
                     ],
                     Some(EntryState::AgentOnly) => &[
                         ("a", "adopt"),
                         ("Enter", "act"),
                         ("c", "check updates"),
-                        ("Esc/q", "library"),
+                        ("Esc/q", "clear/back"),
                     ],
                     _ => &[
                         ("Enter", "agents"),
                         ("c", "check updates"),
-                        ("Esc/q", "library"),
+                        ("Esc/q", "clear/back"),
                     ],
                 };
             }
         }
         let Some(caps) = self.selected_row().map(|r| r.caps) else {
-            return &[("c", "check updates"), ("Esc", "library"), ("q", "library")];
+            return &[
+                ("c", "check updates"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
+            ];
         };
         match (caps.update, caps.accept, caps.migrate, caps.clean) {
             (true, true, _, _) => &[
@@ -945,8 +1002,8 @@ impl View for HealthView {
                 ("a", "accept"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
             (true, false, true, _) => &[
                 ("c", "check updates"),
@@ -954,8 +1011,8 @@ impl View for HealthView {
                 ("m", "migrate"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
             (true, false, false, true) => &[
                 ("c", "check updates"),
@@ -963,47 +1020,47 @@ impl View for HealthView {
                 ("x", "clean up"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
             (true, false, false, false) => &[
                 ("c", "check updates"),
                 ("U", "update"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
             (false, true, _, _) => &[
                 ("c", "check updates"),
                 ("a", "accept"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
             (false, false, true, _) => &[
                 ("c", "check updates"),
                 ("m", "migrate"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
             (false, false, false, true) => &[
                 ("c", "check updates"),
                 ("x", "clean up"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
             (false, false, false, false) => &[
                 ("c", "check updates"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "library"),
-                ("q", "library"),
+                ("Esc", "clear/back"),
+                ("q", "clear/back"),
             ],
         }
     }
@@ -1176,7 +1233,7 @@ mod tests {
         assert!(matches!(
             view.handle_key(KeyEvent::from(KeyCode::Char('q')), &ctx)
                 .as_slice(),
-            [Action::SwitchTab(Tab::Search)]
+            [Action::BackToParent]
         ));
         std::fs::remove_dir_all(root).unwrap();
     }

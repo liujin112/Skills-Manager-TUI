@@ -271,24 +271,6 @@ fn record_lines<'a>(
         Span::raw(" "),
         Span::styled(status_text(&r.status), th.dim()),
     ])];
-    if ctx.settings.tags_enabled {
-        let mut tag_line = vec![Span::styled(format!("{:<9}", "tags"), th.dim())];
-        if r.tags.is_empty() {
-            tag_line.push(Span::styled("none", th.dim()));
-        } else {
-            for t in &r.tags {
-                tag_line.extend(
-                    crate::tui::components::group::Pill::new(
-                        t,
-                        crate::tui::components::group::tag_fill(t, ctx),
-                    )
-                    .render(ctx, usize::MAX),
-                );
-                tag_line.push(Span::raw(" "));
-            }
-        }
-        lines.push(Line::from(tag_line));
-    }
     let mut dep = vec![Span::styled(format!("{:<9}", "deploy"), th.dim())];
     for a in &ctx.snap.agents {
         let (txt, style) = match r.deploy.get(&a.key) {
@@ -308,12 +290,17 @@ fn record_lines<'a>(
     lines.push(Line::from(dep));
     lines.push(kv(
         "source",
-        r.source
-            .as_ref()
-            .map(|s| crate::tui::icons::source(ctx.settings.ui.icons, s))
+        crate::tui::components::skill::repository_badge(r, ctx.settings.ui.icons)
             .unwrap_or_else(|| r.source_kind().into()),
         th,
     ));
+    if let Some(source) = r.source.as_ref().filter(|source| source.is_remote()) {
+        lines.push(kv(
+            "location",
+            crate::tui::icons::source(ctx.settings.ui.icons, source),
+            th,
+        ));
+    }
     if r.external {
         lines.push(kv("path", format!("{} (symlink)", r.path.display()), th));
     }
@@ -323,6 +310,34 @@ fn record_lines<'a>(
             .map(|line| single_line(line, available_width))
             .collect();
     }
+    let mut memberships = Vec::new();
+    for (kind, label, names) in [
+        (crate::tui::components::group::Kind::Tag, "tags", &r.tags),
+        (
+            crate::tui::components::group::Kind::Preset,
+            "presets",
+            &r.presets,
+        ),
+    ] {
+        if kind == crate::tui::components::group::Kind::Tag && !ctx.settings.tags_enabled {
+            continue;
+        }
+        let mut spans = vec![Span::styled(format!("{label:<9}"), th.dim())];
+        if names.is_empty() {
+            spans.push(Span::styled("none", th.dim()));
+        } else {
+            spans.extend(crate::tui::components::group::membership_badges(
+                kind,
+                names,
+                ctx,
+                usize::MAX,
+                usize::MAX,
+            ));
+        }
+        memberships.push(Line::from(spans));
+    }
+    // Memberships wrap instead of truncating: details expose every association.
+    lines.splice(1..1, memberships);
     if let Some(n) = &r.note {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("note", th.bold().fg(th.tag))));

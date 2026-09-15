@@ -416,15 +416,6 @@ impl ListNav {
         self.state.select(Some(i));
         Some((i, double))
     }
-    /// Remember the rows area of a list rendered with a bordered block.
-    pub fn set_area_from_block(&mut self, outer: Rect) {
-        self.rows = Rect {
-            x: outer.x + 1,
-            y: outer.y + 1,
-            width: outer.width.saturating_sub(2),
-            height: outer.height.saturating_sub(2),
-        };
-    }
 }
 
 /// A clickable button label like `[ Apply ]`.
@@ -833,6 +824,17 @@ impl CardGrid {
         let start = self.offset * cols;
         let end = ((self.offset + self.visible_rows()) * cols).min(self.len);
         start..end.max(start)
+    }
+
+    /// Include the clipped next row so a card grid visibly continues below the frame.
+    pub fn visible_with_partial(&self) -> std::ops::Range<usize> {
+        let full = self.visible();
+        let end = if self.cell(full.end).is_some() {
+            (full.end + self.cols()).min(self.len)
+        } else {
+            full.end
+        };
+        full.start..end
     }
 
     /// Item under the pointer, if the pointer is over one at all.

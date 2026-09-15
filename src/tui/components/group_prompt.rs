@@ -1,16 +1,17 @@
 //! Shared group colour and merge chooser, independent of page implementations.
 
-use super::group::{self, tag_fill};
+use super::group::{self, Kind, tag_fill};
 use crate::tui::app::{Action, Ctx};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::OverlayClear as Clear;
-use crate::tui::widgets::{Input, ListNav};
+use crate::tui::widgets::{Input, ListNav, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
+use skills::preset::Preset;
 
 /// The row in the colour prompt that takes a tag's colour away again.
 const NO_COLOR: &str = "none";
@@ -19,7 +20,7 @@ const NO_COLOR: &str = "none";
 pub enum Ask {
     /// Which tag the selected one is merged into.
     Merge,
-    /// What colour the selected tag is filled with.
+    /// What colour identifies the selected tag or preset.
     Color,
 }
 
@@ -27,7 +28,9 @@ pub enum Ask {
 /// Pages own the write action; the chooser owns filtering, selection and preview.
 pub struct Prompt {
     ask: Ask,
-    tag: String,
+    identity: Kind,
+    name: String,
+    preset: Option<Preset>,
     input: Input,
     choices: Vec<String>,
     /// Indices into `choices` matching the filter, in display order.
@@ -38,7 +41,7 @@ pub struct Prompt {
 
 impl Prompt {
     pub fn for_merge(name: &str, choices: Vec<String>) -> Self {
-        Self::new(Ask::Merge, name, choices)
+        Self::new(Ask::Merge, Kind::Tag, name, choices)
     }
 
     pub fn kind(&self) -> Ask {
@@ -49,7 +52,7 @@ impl Prompt {
         self.input.value()
     }
 
-    pub fn for_color(name: &str, current: Option<&str>, theme: &Theme) -> Self {
+    pub fn for_color(identity: Kind, name: &str, current: Option<&str>, theme: &Theme) -> Self {
         let mut choices: Vec<String> = theme.color_choices.iter().map(|c| c.to_string()).collect();
         choices.push(NO_COLOR.into());
         if let Some(c) = current
@@ -60,13 +63,20 @@ impl Prompt {
         let selected = choices
             .iter()
             .position(|s| s == current.unwrap_or(NO_COLOR));
-        let mut prompt = Self::new(Ask::Color, name, choices);
+        let mut prompt = Self::new(Ask::Color, identity, name, choices);
         prompt.list.state.select(selected);
         prompt
     }
 
+    pub fn for_preset_color(preset: &Preset, theme: &Theme) -> Self {
+        let mut prompt =
+            Self::for_color(Kind::Preset, &preset.name, preset.color.as_deref(), theme);
+        prompt.preset = Some(preset.clone());
+        prompt
+    }
+
     pub fn name(&self) -> &str {
-        &self.tag
+        &self.name
     }
 
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
@@ -125,11 +135,12 @@ impl Prompt {
         let th = &ctx.settings.theme;
         let p = self;
         let (title, placeholder) = match p.ask {
-            Ask::Merge => (format!(" merge {} into ", p.tag), "type to filter…"),
-            Ask::Color => (format!(" colour of {} ", p.tag), "a name, or #rrggbb"),
+            Ask::Merge => (format!(" merge {} into ", p.name), "type to filter…"),
+            Ask::Color => (format!(" colour of {} ", p.name), "a name, or #rrggbb"),
         };
-        // Room for the field, a swatch line, the rows, and the frame.
-        let want = p.shown.len() as u16 + 6;
+        let package = (p.identity == Kind::Preset).then(|| p.preview_preset(None));
+        let preview_height = package.as_ref().map_or(1, group::preset_card_height);
+        let want = p.shown.len() as u16 + 5 + preview_height;
         let w = 56.min(area.width.saturating_sub(2));
         let h = want.max(8).min(area.height.saturating_sub(2));
         let rect = Rect::new(
@@ -155,43 +166,67 @@ impl Prompt {
             ..inner
         };
         p.input.render(f, field, true, placeholder, th);
-        // Preview with the shared pill renderer, including its contrast rules.
+        // Preview the same identity shown on the page within the visible swatch.
         let swatch = Rect {
             y: inner.y + 1,
-            height: 1,
+            height: preview_height.min(inner.height.saturating_sub(3)),
             ..field
         };
         let mut preview = vec![Span::raw("  ")];
+        let preview_width = swatch.width.saturating_sub(2) as usize;
         match p.ask {
             Ask::Merge => {
+                let label_width = preview_width.saturating_sub(3) / 2;
                 preview.extend(
-                    group::Pill::new(&p.tag, tag_fill(&p.tag, ctx)).render(ctx, usize::MAX),
+                    group::TagLabel::new(&p.name, tag_fill(&p.name, ctx)).render(ctx, label_width),
                 );
-                preview.push(Span::styled(" → ", th.dim()));
+                let used = preview.iter().map(Span::width).sum::<usize>();
+                let arrow = fit(" → ", (swatch.width as usize).saturating_sub(used));
+                let remaining = (swatch.width as usize).saturating_sub(used + width(&arrow));
+                preview.push(Span::styled(arrow, th.dim()));
                 match p.chosen() {
                     Some(into) => preview.extend(
-                        group::Pill::new(into, tag_fill(into, ctx)).render(ctx, usize::MAX),
+                        group::TagLabel::new(into, tag_fill(into, ctx)).render(ctx, remaining),
                     ),
-                    None => preview.push(Span::styled("nothing matches", th.dim())),
+                    None => preview.push(Span::styled(fit("nothing matches", remaining), th.dim())),
                 }
             }
+            Ask::Color if p.identity == Kind::Preset => match p.color_text() {
+                Some(color) => {
+                    let preset = p.preview_preset(color);
+                    let inside = if swatch.height >= 3 {
+                        group::preset_frame(f, swatch, false, false, ctx)
+                    } else {
+                        swatch
+                    };
+                    f.render_widget(
+                        Paragraph::new(group::fit_preset_card(
+                            group::preset_card(&preset, ctx, inside.width as usize, None),
+                            inside.height,
+                        )),
+                        inside,
+                    );
+                }
+                None => preview.push(Span::styled(fit("not a colour", preview_width), th.warn())),
+            },
             Ask::Color => match p.color() {
-                Some(Some(c)) => {
-                    preview.extend(group::Pill::new(&p.tag, c).render(ctx, usize::MAX))
-                }
-                Some(None) => {
-                    preview.extend(group::Pill::new(&p.tag, th.tag).render(ctx, usize::MAX))
-                }
-                None => preview.push(Span::styled("not a colour", th.warn())),
+                Some(color) => preview.extend(
+                    group::TagLabel::new(&p.name, color.unwrap_or(th.tag))
+                        .render(ctx, preview_width),
+                ),
+                None => preview.push(Span::styled(fit("not a colour", preview_width), th.warn())),
             },
         }
-        f.render_widget(Paragraph::new(Line::from(preview)), swatch);
+        if p.identity == Kind::Tag || p.color_text().is_none() {
+            f.render_widget(Paragraph::new(Line::from(preview)), swatch);
+        }
         let list_area = Rect {
-            y: inner.y + 3,
-            height: inner.height.saturating_sub(3),
+            y: swatch.bottom() + 1,
+            height: inner.bottom().saturating_sub(swatch.bottom() + 1),
             ..inner
         };
         p.list.rows = list_area;
+        let row_width = list_area.width.saturating_sub(2) as usize;
         let rows: Vec<ListItem> = p
             .shown
             .iter()
@@ -199,15 +234,18 @@ impl Prompt {
                 let name = &p.choices[i];
                 let spans = match p.ask {
                     Ask::Merge => {
-                        group::Pill::new(name, tag_fill(name, ctx)).render(ctx, usize::MAX)
+                        group::TagLabel::new(name, tag_fill(name, ctx)).render(ctx, row_width)
                     }
                     Ask::Color if name == NO_COLOR => {
-                        vec![Span::styled("none — the default", th.dim())]
+                        vec![Span::styled(fit("none — the default", row_width), th.dim())]
                     }
                     Ask::Color => {
                         let fill = group::color(Some(name), th);
-                        let mut s = group::Pill::new(&p.tag, fill).render(ctx, usize::MAX);
-                        s.push(Span::styled(format!("  {name}"), th.dim()));
+                        let suffix = fit(&format!("  {name}"), row_width / 2);
+                        let available = row_width.saturating_sub(width(&suffix));
+                        let mut s = group::Badge::for_kind(p.identity, &p.name, fill)
+                            .render(ctx, available);
+                        s.push(Span::styled(suffix, th.dim()));
                         s
                     }
                 };
@@ -229,19 +267,30 @@ impl Prompt {
         }
     }
 
-    fn new(ask: Ask, tag: &str, choices: Vec<String>) -> Self {
+    fn new(ask: Ask, identity: Kind, name: &str, choices: Vec<String>) -> Self {
         let shown: Vec<usize> = (0..choices.len()).collect();
         let mut list = ListNav::default();
         list.clamp(shown.len());
         Self {
             ask,
-            tag: tag.to_string(),
+            identity,
+            name: name.to_string(),
+            preset: None,
             input: Input::default(),
             choices,
             shown,
             list,
             rect: Rect::default(),
         }
+    }
+
+    fn preview_preset(&self, color: Option<String>) -> Preset {
+        let mut preset = self.preset.clone().unwrap_or_else(|| Preset {
+            name: self.name.clone(),
+            ..Preset::default()
+        });
+        preset.color = color;
+        preset
     }
 
     fn refilter(&mut self) {
@@ -293,12 +342,14 @@ mod tests {
 
     #[test]
     fn colour_picker_starts_at_current_or_default_colour() {
-        let default = Prompt::for_color("test", None, &Theme::default());
-        assert_eq!(default.color(), Some(None));
-        assert_eq!(default.color_text(), Some(None));
-        for current in ["blue", "#b87e54"] {
-            let prompt = Prompt::for_color("test", Some(current), &Theme::default());
-            assert_eq!(prompt.color_text(), Some(Some(current.into())));
+        for identity in [Kind::Tag, Kind::Preset] {
+            let default = Prompt::for_color(identity, "test", None, &Theme::default());
+            assert_eq!(default.color(), Some(None));
+            assert_eq!(default.color_text(), Some(None));
+            for current in ["blue", "#b87e54"] {
+                let prompt = Prompt::for_color(identity, "test", Some(current), &Theme::default());
+                assert_eq!(prompt.color_text(), Some(Some(current.into())));
+            }
         }
     }
 
@@ -317,8 +368,12 @@ mod tests {
                 settings
             },
         };
-        for ask in [Ask::Color, Ask::Merge] {
-            let mut prompt = Prompt::new(ask, "test", vec!["blue".into()]);
+        for (ask, identity) in [
+            (Ask::Color, Kind::Tag),
+            (Ask::Color, Kind::Preset),
+            (Ask::Merge, Kind::Tag),
+        ] {
+            let mut prompt = Prompt::new(ask, identity, "test", vec!["blue".into()]);
             for (width, height) in [(40, 12), (40, 11), (20, 8), (4, 3), (1, 1), (80, 24)] {
                 let mut term =
                     ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))

@@ -1,19 +1,22 @@
-//! Repository grouping of the existing inventory, including flat local skills.
+//! Installed sources with an embedded, shared Library skill panel.
+use super::search::{SearchView, SkillPanelOptions};
 use super::{View, wheel};
-use crate::tui::app::{Action, Ctx, Hints, Tab};
-use crate::tui::components::layout::split_panes;
-use crate::tui::widgets::ListNav;
+use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::layout::{frame, split_panes};
+use crate::tui::settings::LayoutScope;
+use crate::tui::widgets::{CardGrid, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::Rect,
     text::{Line, Span},
-    widgets::{List, ListItem, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
-use skills::repository::{Repository, alias_of};
+use skills::repository::alias_of;
 
 #[derive(Clone)]
 struct Project {
+    alias: Option<String>,
     name: String,
     local: bool,
     source: String,
@@ -25,15 +28,14 @@ pub struct ReposView {
     projects: Vec<Project>,
     all_projects: Vec<Project>,
     filter: super::filter::Filter,
-    skill_search: Option<super::search::SearchView>,
-    members: Vec<String>,
-    project: Option<usize>,
-    nav: ListNav,
-    saved_project: usize,
-    error: Option<String>,
+    skill_search: Option<SearchView>,
+    panel_source: Option<Option<String>>,
+    nav: CardGrid,
+    focus_skills: bool,
     scroll: u16,
-    reading: bool,
-    right: Rect,
+    left: Rect,
+    details: Rect,
+    skills: Rect,
 }
 
 impl ReposView {
@@ -45,415 +47,531 @@ impl ReposView {
 
     pub fn input_focused(&self) -> bool {
         self.filter.editing
-            || self
-                .skill_search
-                .as_ref()
-                .is_some_and(|v| v.input_focused())
+            || (self.focus_skills
+                && self
+                    .skill_search
+                    .as_ref()
+                    .is_some_and(|v| v.input_focused()))
     }
+
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
-        if let Some(view) = self.skill_search.as_mut() {
+        if self.focus_skills
+            && let Some(view) = self.skill_search.as_mut()
+        {
             return view.paste(text, ctx);
         }
         let actions = self.filter.paste(text);
-        self.refilter();
+        self.refilter(ctx);
         actions
     }
-    fn refilter(&mut self) {
-        self.projects = self
+
+    fn selected(&self) -> Option<&Project> {
+        self.nav.selected().and_then(|i| self.projects.get(i))
+    }
+
+    fn refilter(&mut self, ctx: &Ctx) {
+        let previous = self.selected().map(|p| p.alias.clone());
+        let documents = self
             .all_projects
             .iter()
-            .filter(|p| self.filter.matches(&format!("{} {}", p.name, p.source)))
-            .cloned()
+            .map(|p| skills::search::TextDocument {
+                name: p.name.clone(),
+                description: String::new(),
+                body: format!("{} {}", p.alias.as_deref().unwrap_or(""), p.source),
+            })
+            .collect::<Vec<_>>();
+        self.projects = self
+            .filter
+            .rank(&documents, ctx)
+            .into_iter()
+            .map(|i| self.all_projects[i].clone())
             .collect();
+        let index = self
+            .projects
+            .iter()
+            .position(|p| Some(&p.alias) == previous.as_ref());
+        self.nav.select(index);
         self.nav.clamp(self.projects.len());
+        self.sync_panel(ctx, false);
     }
 
-    fn len(&self) -> usize {
-        if self.project.is_some() {
-            self.members.len()
-        } else {
-            self.projects.len()
-        }
-    }
-
-    fn open(&mut self) {
-        if self.project.is_some() {
-            self.reading = true;
-            return;
-        }
-        let Some(i) = self.nav.selected() else { return };
-        self.saved_project = i;
-        self.members = self.projects[i].keys.clone();
-        self.project = Some(i);
-        self.nav.first(self.members.len());
-        self.scroll = 0;
-    }
-
-    fn back(&mut self) -> Vec<Action> {
-        if self.reading {
-            self.reading = false;
-        } else if self.project.take().is_some() {
-            self.members.clear();
-            self.nav.select(Some(self.saved_project));
-            self.nav.clamp(self.projects.len());
-        } else {
-            return vec![Action::SwitchTab(Tab::Search)];
-        }
-        vec![]
-    }
-
-    fn move_by(&mut self, delta: i32) {
-        if self.reading {
-            self.scroll = (i32::from(self.scroll) + delta).clamp(0, i32::from(u16::MAX)) as u16;
-        } else {
-            self.nav.move_by(delta, self.len());
+    fn sync_panel(&mut self, ctx: &Ctx, refresh: bool) {
+        let project = self.selected().cloned();
+        let identity = project.as_ref().map(|p| p.alias.clone());
+        let keys = project.as_ref().map(|p| p.keys.clone()).unwrap_or_default();
+        if self.skill_search.is_none() || self.panel_source != identity {
+            let mut view = SearchView::panel(
+                SkillPanelOptions::new(keys, "Source skills".into(), LayoutScope::Repositories),
+                ctx,
+            );
+            view.focus_list();
+            self.skill_search = Some(view);
+            self.panel_source = identity;
             self.scroll = 0;
+        } else if refresh && let Some(view) = self.skill_search.as_mut() {
+            view.update_panel(keys, ctx);
         }
+    }
+
+    fn move_by(&mut self, delta: i32, ctx: &Ctx) {
+        self.nav.move_by(delta, self.projects.len());
+        self.sync_panel(ctx, false);
+    }
+
+    fn source_icon<'a>(&self, project: &Project, ctx: &'a Ctx) -> &'a str {
+        if let Some(repo) = project
+            .alias
+            .as_ref()
+            .and_then(|a| ctx.snap.repositories.get(a))
+        {
+            return match repo.kind {
+                skills::meta::SourceKind::Git => {
+                    crate::tui::icons::git(ctx.settings.ui.icons, &repo.url)
+                }
+                skills::meta::SourceKind::Archive => {
+                    crate::tui::icons::package(ctx.settings.ui.icons)
+                }
+            };
+        }
+        if ctx.settings.ui.icons == skills::config::Icons::Text {
+            if project.local { "local" } else { "?" }
+        } else if project.local {
+            "󰉋"
+        } else {
+            ""
+        }
+    }
+
+    fn detail_lines(&self, ctx: &Ctx) -> Vec<Line<'static>> {
+        let th = &ctx.settings.theme;
+        let Some(project) = self.selected() else {
+            return vec![Line::styled(" No matching sources", th.dim())];
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                format!(" {} {}", self.source_icon(project, ctx), project.name),
+                th.bold(),
+            ),
+            Span::styled(
+                format!(" · {} skills", project.keys.len()),
+                th.skill_count(),
+            ),
+        ])];
+        let mut field = |label: &str, value: String| {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {label:<8}"),
+                    ratatui::style::Style::default().fg(th.placeholder),
+                ),
+                Span::raw(value),
+            ]));
+        };
+        let repo = project
+            .alias
+            .as_ref()
+            .and_then(|a| ctx.snap.repositories.get(a));
+        let kind = if project.local {
+            "Local skills"
+        } else if let Some(repo) = repo {
+            match repo.kind {
+                skills::meta::SourceKind::Git => "Git repository",
+                skills::meta::SourceKind::Archive => "URL package",
+            }
+        } else {
+            "Unregistered source"
+        };
+        field("Type", kind.into());
+        let path = project
+            .alias
+            .as_ref()
+            .map(|a| ctx.ws.root.join("repos").join(a))
+            .unwrap_or_else(|| ctx.ws.root.clone());
+        field("Folder", skills::paths::contract_tilde(&path));
+        if let Some(repo) = repo {
+            field("URL", repo.url.clone());
+            if !repo.branch.is_empty() {
+                field("Branch", repo.branch.clone());
+            }
+        }
+        lines
     }
 }
 
 impl View for ReposView {
+    fn focus_root(&mut self) {
+        self.focus_skills = false;
+        self.filter.editing = false;
+    }
+
+    fn focus_from_above(&mut self) {
+        self.focus_skills = false;
+        self.filter.editing = true;
+    }
+
     fn refresh(&mut self, ctx: &Ctx) {
-        let panel = self.skill_search.take();
-        let selected_project = self
-            .project
-            .and_then(|i| self.projects.get(i))
-            .map(|p| (p.local, p.name.clone()));
-        let selected_skill = self
-            .nav
-            .selected()
-            .and_then(|i| self.members.get(i))
-            .cloned();
         let mut groups = std::collections::BTreeMap::<Option<String>, Project>::new();
-        self.error = None;
-        match Repository::list(&ctx.ws.root) {
-            Ok(repos) => {
-                for repo in repos {
-                    let source =
-                        crate::tui::icons::source(ctx.settings.ui.icons, &repo.source("", None));
-                    groups.insert(
-                        Some(repo.alias.clone()),
-                        Project {
-                            name: repo.alias,
-                            local: false,
-                            source,
-                            keys: vec![],
-                        },
-                    );
-                }
-            }
-            Err(error) => self.error = Some(format!("{error:#}")),
+        for repo in ctx.snap.repositories.values() {
+            let kind = match repo.kind {
+                skills::meta::SourceKind::Git => "Git repository",
+                skills::meta::SourceKind::Archive => "URL package",
+            };
+            groups.insert(
+                Some(repo.alias.clone()),
+                Project {
+                    alias: Some(repo.alias.clone()),
+                    name: repo.display_name(),
+                    local: false,
+                    source: format!("{kind} {} {}", repo.url, repo.alias),
+                    keys: vec![],
+                },
+            );
         }
         for record in &ctx.snap.skills {
-            if let Some(alias) = alias_of(&record.key) {
-                groups
-                    .entry(Some(alias.into()))
-                    .or_insert_with(|| Project {
-                        name: alias.into(),
-                        local: false,
-                        source: "Unregistered repository".into(),
-                        keys: vec![],
-                    })
-                    .keys
-                    .push(record.key.clone());
-            } else {
-                groups
-                    .entry(None)
-                    .or_insert_with(|| Project {
-                        name: "Local skills".into(),
-                        local: true,
-                        source: "Skills outside repository directories".into(),
-                        keys: vec![],
-                    })
-                    .keys
-                    .push(record.key.clone());
-            }
+            let alias = alias_of(&record.key).map(str::to_string);
+            groups
+                .entry(alias.clone())
+                .or_insert_with(|| Project {
+                    local: alias.is_none(),
+                    alias: alias.clone(),
+                    name: if alias.is_none() {
+                        "Local skills".into()
+                    } else {
+                        record
+                            .source_display_name()
+                            .unwrap_or("Unregistered source")
+                            .into()
+                    },
+                    source: if alias.is_none() {
+                        "Skills outside repository directories".into()
+                    } else {
+                        "Unregistered source".into()
+                    },
+                    keys: vec![],
+                })
+                .keys
+                .push(record.key.clone());
         }
         self.all_projects = groups.into_values().collect();
-        self.refilter();
-        self.skill_search = None;
-        self.project = None;
-        self.members.clear();
-        self.reading = false;
-        self.scroll = 0;
-        self.nav.clamp(self.projects.len());
-        if let Some(i) = self
-            .projects
-            .iter()
-            .position(|p| Some(&(p.local, p.name.clone())) == selected_project.as_ref())
-        {
-            self.nav.select(Some(i));
-            self.open();
-            if let Some(j) = self
-                .members
-                .iter()
-                .position(|key| Some(key) == selected_skill.as_ref())
-            {
-                self.nav.select(Some(j));
-            }
-        }
-        if self.project.is_some()
-            && let Some(mut view) = panel
-        {
-            view.update_panel(self.members.clone(), ctx);
-            self.skill_search = Some(view);
-        }
+        self.refilter(ctx);
+        self.sync_panel(ctx, true);
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if let Some(view) = self.skill_search.as_mut() {
-            if k.code == KeyCode::Left && view.panel_back() {
-                self.skill_search = None;
-                return vec![];
-            }
-            return view.handle_key(k, ctx);
-        }
-        if self.project.is_none() && self.filter.key(k) {
-            self.refilter();
+        if !self.focus_skills
+            && self.filter.editing
+            && k.code == KeyCode::Right
+            && self.filter.input.cursor_byte() == self.filter.input.value().len()
+            && let Some(view) = self.skill_search.as_mut()
+        {
+            self.filter.editing = false;
+            self.focus_skills = true;
+            view.focus_input();
             return vec![];
         }
-        if self.project.is_some() && matches!(k.code, KeyCode::Char('/' | 'm')) {
-            let mut view = super::search::SearchView::panel(
-                self.members.clone(),
-                "Repository skills".into(),
-                crate::tui::settings::LayoutScope::Repositories,
-                ctx,
-            );
-            if k.code == KeyCode::Char('m') {
-                view.focus_list();
-                view.handle_key(k, ctx);
+        if self.focus_skills
+            && let Some(view) = self.skill_search.as_mut()
+        {
+            if k.code == KeyCode::Left && view.input_at_left_edge() {
+                view.close_input_completion();
+                self.focus_skills = false;
+                self.filter.editing = true;
+                return vec![];
             }
-            self.skill_search = Some(view);
+            if k.code == KeyCode::Left && view.panel_back() {
+                self.focus_skills = false;
+                return vec![];
+            }
+            let mut actions = view.handle_key(k, ctx);
+            if actions.iter().any(|a| matches!(a, Action::BackToParent)) {
+                if k.code == KeyCode::Up {
+                    return actions;
+                }
+                self.focus_skills = false;
+                self.filter.editing = false;
+                actions.retain(|a| !matches!(a, Action::BackToParent));
+            }
+            return actions;
+        }
+        if !self.focus_skills && self.filter.editing && k.code == KeyCode::Up {
+            self.filter.editing = false;
+            return vec![Action::BackToParent];
+        }
+        if self.filter.key(k) {
+            self.refilter(ctx);
             return vec![];
         }
         match k.code {
-            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
-            KeyCode::PageDown => self.move_by(10),
-            KeyCode::PageUp => self.move_by(-10),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open(),
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-                return self.back();
+            KeyCode::Char('r') => {
+                if let Some(project) = self.selected()
+                    && let Some(alias) = project.alias.as_ref()
+                    && ctx.snap.repositories.contains_key(alias)
+                {
+                    return vec![Action::OpenModal(Box::new(
+                        crate::tui::modal::Modal::rename_source(alias, &project.name),
+                    ))];
+                }
             }
-            KeyCode::Char('q') => return vec![Action::SwitchTab(Tab::Search)],
+            KeyCode::Down | KeyCode::Char('j') => self.move_by(1, ctx),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.nav.selected().unwrap_or(0) == 0 {
+                    self.filter.editing = true;
+                } else {
+                    self.move_by(-1, ctx);
+                }
+            }
+            KeyCode::PageDown => self.move_by(10, ctx),
+            KeyCode::PageUp => self.move_by(-10, ctx),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                self.focus_skills = true;
+                if let Some(view) = self.skill_search.as_mut() {
+                    view.focus_list();
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                return vec![Action::BackToParent];
+            }
             _ => {}
         }
         vec![]
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if let Some(view) = self.skill_search.as_mut() {
-            return view.handle_mouse(m, ctx);
-        }
         let point = (m.column, m.row).into();
-        if m.kind == MouseEventKind::Down(MouseButton::Left) && self.filter.rect.contains(point) {
-            self.filter.editing = true;
-            return vec![];
+        if self.skills.contains(point) {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.focus_skills = true;
+                self.filter.editing = false;
+            }
+            if let Some(view) = self.skill_search.as_mut() {
+                return view.handle_mouse(m, ctx);
+            }
         }
         if let Some(delta) = wheel(&m, ctx) {
-            if self.nav.rows.contains(point) {
-                self.reading = false;
-                self.move_by(delta);
-            } else if self.right.contains(point) && self.project.is_some() {
-                self.reading = true;
-                self.move_by(delta);
+            if self.left.contains(point) {
+                self.move_by(delta, ctx);
+            } else if self.details.contains(point) {
+                self.scroll = (i32::from(self.scroll) + delta).clamp(0, u16::MAX as i32) as u16;
             }
-        } else if m.kind == MouseEventKind::Down(MouseButton::Left) {
-            if self.nav.rows.contains(point) {
-                self.reading = false;
-                if let Some((_, double)) = self.nav.click(m.row, self.len()) {
-                    self.scroll = 0;
-                    if double {
-                        self.open();
-                    }
-                }
-            } else if self.right.contains(point) && self.project.is_some() {
-                self.reading = true;
+        } else if m.kind == MouseEventKind::Down(MouseButton::Left) && self.left.contains(point) {
+            self.focus_skills = false;
+            self.filter.editing = self.filter.click_input(m.column, m.row);
+            if !self.filter.editing {
+                self.nav.click(m.column, m.row);
+                self.sync_panel(ctx, false);
             }
         }
         vec![]
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        if let Some(view) = self.skill_search.as_mut() {
-            view.draw(f, area, ctx);
-            return;
-        }
-        let area = if self.project.is_none() {
-            self.filter.draw(f, area, "Filter repositories", ctx)
-        } else {
-            area
-        };
-        let (left, right) = split_panes(area, 35, ctx);
-        self.right = right;
-        let path = self
-            .project
-            .or_else(|| self.nav.selected())
-            .and_then(|i| self.projects.get(i))
-            .map(|project| {
-                if project.local {
-                    ctx.ws.root.clone()
-                } else {
-                    ctx.ws.root.join("repos").join(&project.name)
-                }
-            })
-            .unwrap_or_else(|| ctx.ws.root.join("repos"));
-        let labels: Vec<String> = if self.project.is_some() {
-            self.members
-                .iter()
-                .map(|key| {
-                    ctx.snap
-                        .get(key)
-                        .map(|r| {
-                            if r.status.is_healthy() {
-                                crate::tui::components::skill::display_name(r).to_string()
-                            } else {
-                                format!(
-                                    "{}  [{}]",
-                                    crate::tui::components::skill::display_name(r),
-                                    r.status.label()
-                                )
-                            }
-                        })
-                        .unwrap_or_else(|| key.clone())
-                })
-                .collect()
-        } else {
-            self.projects
-                .iter()
-                .map(|p| format!("{} · {} skills", p.name, p.keys.len()))
-                .collect()
-        };
-        let title = if self.project.is_some() {
-            " skills "
-        } else {
-            " repositories "
-        };
-        let block = ctx
-            .settings
-            .theme
-            .block(format!("{title}({}) ", labels.len()), !self.reading);
-        self.nav.rows = block.inner(left);
-        let items: Vec<_> = labels
-            .into_iter()
-            .enumerate()
-            .map(|(i, label)| {
-                if self.project.is_none() {
-                    ListItem::new(Line::from(vec![
-                        Span::raw(format!("{} · ", self.projects[i].name)),
-                        Span::styled(
-                            format!("{} skills", self.projects[i].keys.len()),
-                            ctx.settings.theme.skill_count(),
-                        ),
-                    ]))
-                } else {
-                    ListItem::new(label)
-                }
-            })
-            .collect();
-        f.render_stateful_widget(
-            List::new(items)
-                .block(block)
-                .highlight_style(ctx.settings.theme.selected())
-                .highlight_symbol("▸ "),
+        self.sync_panel(ctx, false);
+        let th = &ctx.settings.theme;
+        let (left, right) = split_panes(area, 38, ctx);
+        self.left = left;
+        let inner = self.filter.draw(
+            f,
             left,
-            &mut self.nav.state,
+            "Filter sources",
+            &format!("sources ({})", self.projects.len()),
+            !self.focus_skills,
+            ctx,
         );
-        let block = ctx.settings.theme.block(
-            if self.project.is_some() {
-                " preview · read only "
-            } else {
-                " source details "
-            },
-            self.reading,
+        self.nav.layout(
+            inner,
+            1,
+            crate::tui::components::group::card_height(None),
+            0,
+            self.projects.len(),
         );
-        let inner = block.inner(right);
-        f.render_widget(block, right);
-        let mut lines = vec![
-            Line::styled(
-                skills::paths::contract_tilde(&path),
-                ctx.settings.theme.dim(),
-            ),
-            Line::raw(""),
-        ];
-        if let Some(error) = &self.error {
-            lines.push(Line::styled(error.clone(), ctx.settings.theme.err()));
+        for i in self.nav.visible() {
+            let Some(cell) = self.nav.cell(i) else {
+                continue;
+            };
+            let project = &self.projects[i];
+            let ci = frame(
+                f,
+                cell,
+                self.nav.selected() == Some(i),
+                !self.focus_skills && !self.filter.editing,
+                th,
+            );
+            let columns = ci.width as usize;
+            let count = fit(&format!("{} skills", project.keys.len()), columns);
+            let room = columns.saturating_sub(width(&count) + 1);
+            let icon = fit(&format!("{} ", self.source_icon(project, ctx)), room);
+            let name = fit(&project.name, room.saturating_sub(width(&icon)));
+            let gap = columns.saturating_sub(width(&icon) + width(&name) + width(&count));
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(icon, th.source()),
+                    Span::styled(name, th.bold()),
+                    Span::raw(" ".repeat(gap)),
+                    Span::styled(count, th.skill_count()),
+                ])),
+                ci,
+            );
         }
-        if let Some(i) = self.project {
-            lines.push(Line::raw(self.projects[i].source.clone()));
-            if let Some(record) = self
-                .nav
-                .selected()
-                .and_then(|j| self.members.get(j))
-                .and_then(|key| ctx.snap.get(key))
-            {
-                lines.extend(super::preview::preview_lines(
-                    record,
-                    ctx,
-                    &[],
-                    inner.width as usize,
-                ));
-            } else {
-                lines.push(Line::raw("No installed skills in this repository."));
-            }
-        } else {
-            if let Some(project) = self.nav.selected().and_then(|i| self.projects.get(i)) {
-                lines.insert(
-                    0,
-                    Line::styled(
-                        project.name.clone(),
-                        ctx.settings.theme.bold().fg(ctx.settings.theme.accent),
-                    ),
-                );
-                lines.push(Line::styled(
-                    format!("{} installed skills", project.keys.len()),
-                    ctx.settings.theme.skill_count(),
-                ));
-                lines.push(Line::raw(""));
-                lines.push(Line::raw(project.source.clone()));
-                lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    "Enter → browse skills",
-                    ctx.settings.theme.accent(),
-                ));
-            }
-            if self.projects.is_empty() {
-                lines.push(Line::raw(
-                    "No skills or repositories found. Install from Library first.",
-                ));
-            }
+        if self.projects.is_empty() {
+            f.render_widget(
+                Paragraph::new(" No matching sources").style(th.dim()),
+                inner,
+            );
         }
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        self.scroll = self.scroll.min(
-            paragraph
-                .line_count(inner.width)
-                .saturating_sub(inner.height as usize)
-                .min(u16::MAX as usize) as u16,
+        let paragraph = Paragraph::new(self.detail_lines(ctx)).wrap(Wrap { trim: false });
+        let needed = paragraph
+            .line_count(right.width.saturating_sub(2).max(1))
+            .saturating_add(2)
+            .min(u16::MAX as usize) as u16;
+        let height = needed.min(right.height / 3);
+        self.details = Rect::new(right.x, right.y, right.width, height);
+        self.skills = Rect::new(
+            right.x,
+            right.y + height,
+            right.width,
+            right.height.saturating_sub(height),
         );
-        f.render_widget(paragraph.scroll((self.scroll, 0)), inner);
+        if height > 0 {
+            let block = th.block(" source details ", false);
+            let inner = block.inner(self.details);
+            f.render_widget(block, self.details);
+            self.scroll = self.scroll.min(
+                paragraph
+                    .line_count(inner.width.max(1))
+                    .saturating_sub(inner.height as usize)
+                    .min(u16::MAX as usize) as u16,
+            );
+            f.render_widget(paragraph.scroll((self.scroll, 0)), inner);
+        }
+        if let Some(view) = self.skill_search.as_mut() {
+            view.set_panel_active(self.focus_skills);
+            view.draw(f, self.skills, ctx);
+        }
     }
 
     fn hints(&self) -> Hints {
         if self.filter.editing {
-            return &[("Enter/↓", "repositories"), ("Esc", "clear filter")];
+            return &[("Enter/↓", "sources"), ("Esc", "clear filter")];
         }
-        if let Some(view) = self.skill_search.as_ref() {
+        if self.focus_skills
+            && let Some(view) = self.skill_search.as_ref()
+        {
             return view.hints();
         }
         &[
-            ("↑↓", "navigate / scroll"),
-            ("Enter/→", "open"),
-            ("Esc/←", "back"),
-            ("Ctrl+r", "refresh"),
-            ("/", "filter current list"),
-            ("q", "library"),
+            ("↑↓", "sources"),
+            ("Enter/→", "skills"),
+            ("r", "rename source"),
+            ("/", "filter sources"),
+            ("Esc/q", "clear/back"),
         ]
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skills::repository::Repository;
+
+    #[test]
+    fn named_packages_use_shared_metadata_and_keep_storage_paths_when_renamed() {
+        let tmp = skills::ops::DownloadDir::new("named-package-display").unwrap();
+        let mut ws = skills::Workspace::open(tmp.path()).unwrap();
+        ws.config.agents.clear();
+        let repo = Repository {
+            alias: "stable-folder".into(),
+            name: Some("Merlin Skills".into()),
+            kind: skills::meta::SourceKind::Archive,
+            url: "https://example.test/latest/skills.tar".into(),
+            branch: String::new(),
+        };
+        repo.save(&ws).unwrap();
+        let key = "repos/stable-folder/review";
+        std::fs::create_dir_all(ws.root.join(key)).unwrap();
+        std::fs::write(
+            ws.root.join(key).join("SKILL.md"),
+            "---\nname: review\ndescription: test\n---\nBody",
+        )
+        .unwrap();
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(repo.source("review", None)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        settings.ui.icons = skills::config::Icons::Text;
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = ReposView::default();
+        view.refresh(&ctx);
+        assert_eq!(view.projects[0].name, "Merlin Skills");
+        assert!(view.projects[0].source.starts_with("URL package"));
+        let action = view.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE),
+            &ctx,
+        );
+        assert!(matches!(action.as_slice(), [Action::OpenModal(_)]));
+        let record = snap.get(key).unwrap();
+        let badge =
+            crate::tui::components::skill::repository_badge(record, settings.ui.icons).unwrap();
+        assert_eq!(badge, "archive Merlin Skills");
+        let preview = super::super::preview::preview_lines(record, &ctx, &[], 180);
+        assert!(
+            preview
+                .iter()
+                .any(|line| line.to_string().contains("source   archive Merlin Skills"))
+        );
+        assert!(preview.iter().any(|line| {
+            line.to_string()
+                .contains("https://example.test/latest/skills.tar")
+        }));
+        let mut completion = crate::tui::components::completion::Completion::default();
+        let mut input = crate::tui::widgets::Input::with_value("repo:Merl");
+        completion.update(&input, &ctx);
+        completion.accept(&mut input);
+        assert_eq!(input.value(), "repo:\"Merlin Skills\" ");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 20)).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Merlin Skills · 1 skills"));
+        assert!(screen.contains("repos/stable-folder"));
+        assert!(!screen.contains("repos/Merlin Skills"));
+        view.focus_skills = true;
+        Repository::rename(&ws, "stable-folder", "Training Tools").unwrap();
+        // A view refresh consistently uses the supplied snapshot, even if metadata changed afterward.
+        view.refresh(&ctx);
+        assert_eq!(view.projects[0].name, "Merlin Skills");
+        let snap = ws.scan().unwrap();
+        let ctx = Ctx { snap: &snap, ..ctx };
+        view.refresh(&ctx);
+        assert_eq!(view.nav.selected(), Some(0));
+        assert_eq!(view.projects[0].name, "Training Tools");
+        assert_eq!(view.selected().unwrap().keys, [key]);
+        assert_eq!(
+            crate::tui::components::skill::repository_badge(
+                snap.get(key).unwrap(),
+                settings.ui.icons
+            )
+            .as_deref(),
+            Some("archive Training Tools")
+        );
+    }
+
     #[test]
     fn navigate_preview_refresh_and_render_small_terminals() {
         let tmp = skills::ops::DownloadDir::new("repos-view-test").unwrap();
@@ -486,15 +604,21 @@ mod tests {
         let mut view = ReposView::default();
         view.refresh(&ctx);
         assert_eq!(view.projects.len(), 1);
-        view.open();
-        assert_eq!(view.members.len(), 1);
-
-        view.open();
-        assert!(view.reading);
-        assert!(view.back().is_empty());
-        assert!(!view.reading);
+        assert_eq!(view.selected().unwrap().keys.len(), 1);
+        assert!(
+            view.skill_search.is_some(),
+            "skills are available without Enter"
+        );
+        let enter = KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        view.handle_key(enter, &ctx);
+        assert!(view.focus_skills);
+        view.handle_key(
+            KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::NONE),
+            &ctx,
+        );
+        assert!(!view.focus_skills);
         view.refresh(&ctx);
-        assert_eq!(view.project, Some(0));
+        assert_eq!(view.nav.selected(), Some(0));
         for (w, h) in [(120, 30), (60, 20), (12, 5), (1, 1)] {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
@@ -507,7 +631,9 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect::<String>();
-                assert!(screen.contains("Hello world"));
+                assert!(screen.contains("Sample skill"));
+                assert!(view.filter.rect.right() <= view.left.right());
+                assert!(view.details.bottom() <= view.skills.y);
             }
         }
         std::fs::remove_dir_all(root.join("repos/demo")).unwrap();
@@ -522,11 +648,15 @@ mod tests {
             },
         };
         view.refresh(&ctx);
-        assert!(view.project.is_none());
+        assert!(view.selected().is_none());
 
         assert!(matches!(
-            view.back().as_slice(),
-            [Action::SwitchTab(Tab::Search)]
+            view.handle_key(
+                KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+                &ctx
+            )
+            .as_slice(),
+            [Action::BackToParent]
         ));
     }
     #[test]
@@ -535,6 +665,7 @@ mod tests {
         let ws = skills::Workspace::open(tmp.path()).unwrap();
         for alias in ["demo", "empty"] {
             Repository {
+                name: None,
                 kind: Default::default(),
                 alias: alias.into(),
                 url: "https://example.com/demo.git".into(),
@@ -581,10 +712,54 @@ mod tests {
         assert!(
             view.projects
                 .iter()
-                .any(|p| p.name == "empty" && p.keys.is_empty())
+                .any(|p| p.alias.as_deref() == Some("empty") && p.keys.is_empty())
         );
         let mut keys: Vec<_> = view.projects.iter().flat_map(|p| p.keys.clone()).collect();
         keys.sort();
         assert_eq!(keys, ["local-example", "repos/demo/example"]);
+
+        let key = |code| KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let panel = view.skill_search.as_mut().unwrap();
+        panel.handle_key(key(KeyCode::Char('m')), &ctx);
+        panel.handle_key(key(KeyCode::Char(' ')), &ctx);
+        panel.set_query("example", &ctx);
+        view.refresh(&ctx);
+        assert_eq!(view.skill_search.as_ref().unwrap().query(), "example");
+        assert_eq!(
+            view.skill_search.as_ref().unwrap().panel_keys(&ctx),
+            ["local-example"]
+        );
+
+        view.move_by(1, &ctx);
+        assert_eq!(view.selected().unwrap().alias.as_deref(), Some("demo"));
+        assert_eq!(view.skill_search.as_ref().unwrap().query(), "");
+        assert_eq!(
+            view.skill_search.as_ref().unwrap().panel_keys(&ctx),
+            ["repos/demo/example"]
+        );
+        view.move_by(1, &ctx);
+        assert!(
+            view.skill_search
+                .as_ref()
+                .unwrap()
+                .panel_keys(&ctx)
+                .is_empty()
+        );
+        assert!(
+            view.detail_lines(&ctx)
+                .iter()
+                .any(|line| line.to_string().contains("0 skills"))
+        );
+
+        view.filter.input = crate::tui::widgets::Input::with_value("absent-source");
+        view.refilter(&ctx);
+        assert!(view.selected().is_none());
+        assert!(
+            view.skill_search
+                .as_ref()
+                .unwrap()
+                .panel_keys(&ctx)
+                .is_empty()
+        );
     }
 }

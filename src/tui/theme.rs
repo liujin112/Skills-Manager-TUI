@@ -133,9 +133,6 @@ impl Theme {
     pub fn selected_unfocused(&self) -> Style {
         Style::default().bg(self.selection_bg).fg(self.selection_fg)
     }
-    pub fn tag(&self) -> Style {
-        Style::default().fg(self.tag)
-    }
     pub fn ok(&self) -> Style {
         Style::default().fg(self.ok)
     }

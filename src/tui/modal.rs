@@ -35,6 +35,7 @@ pub enum InputKind {
     PresetDescription { name: String },
     RenamePreset { old: String },
     RenameTag { old: String },
+    RenameRepository { alias: String },
     Install,
     Rename { skill: String },
     SetSource { skill: String },
@@ -273,6 +274,18 @@ impl Modal {
         }
     }
 
+    pub fn rename_source(alias: &str, current_name: &str) -> Self {
+        Self::Input {
+            title: " source name ".into(),
+            input: Input::with_value(current_name),
+            kind: InputKind::RenameRepository {
+                alias: alias.into(),
+            },
+            hint: "display name · Enter save · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
     /// Ask for a skill's new name. The field starts with the old one, since a
     /// rename is usually a small edit to it.
     pub fn rename(skill: &str) -> Self {
@@ -306,7 +319,7 @@ impl Modal {
             }
         }
         for p in ctx.ws.presets.list().unwrap_or_default() {
-            if p.skills.iter().any(|s| s == old) {
+            if p.members().iter().any(|s| s == old) {
                 lines.push(format!("preset     {}: {old} → {new}", p.name));
             }
         }
@@ -441,45 +454,41 @@ impl Modal {
         )
     }
 
-    /// Search cards with staged checkboxes for editing a preset's membership.
+    /// Edit the preset's fixed membership using the shared skill selector.
     pub fn preset_members(preset: &str, ctx: &Ctx) -> Self {
         Self::PresetSkills(Box::new(SearchView::preset_members(preset, ctx)))
     }
 
     pub fn repositories(ctx: &Ctx) -> Self {
-        match skills::repository::Repository::list(&ctx.ws.root) {
-            Ok(repositories) => Self::picker(
-                " repositories ".into(),
-                repositories
-                    .into_iter()
-                    .map(|r| {
-                        let count = ctx
-                            .snap
-                            .skills
-                            .iter()
-                            .filter(|s| {
-                                skills::repository::alias_of(&s.key) == Some(r.alias.as_str())
-                            })
-                            .count();
-                        let source = r.source("", None);
-                        PickItem {
-                            id: r.alias.clone(),
-                            label: format!(
-                                "{} {}",
-                                crate::tui::icons::source_icon(ctx.settings.ui.icons, &source),
-                                skills::repository::source_name(&r.url).unwrap_or(r.alias)
-                            ),
-                            sub: format!(
-                                "{} {count} skills · {}",
-                                crate::tui::icons::package(ctx.settings.ui.icons),
-                                crate::tui::icons::source(ctx.settings.ui.icons, &source)
-                            ),
-                        }
-                    })
-                    .collect(),
-            ),
-            Err(e) => Self::message("repositories", vec![format!("{e:#}")]),
-        }
+        Self::picker(
+            " sources ".into(),
+            ctx.snap
+                .repositories
+                .values()
+                .map(|r| {
+                    let count = ctx
+                        .snap
+                        .skills
+                        .iter()
+                        .filter(|s| skills::repository::alias_of(&s.key) == Some(r.alias.as_str()))
+                        .count();
+                    let source = r.source("", None);
+                    PickItem {
+                        id: r.alias.clone(),
+                        label: format!(
+                            "{} {}",
+                            crate::tui::icons::source_icon(ctx.settings.ui.icons, &source),
+                            r.display_name()
+                        ),
+                        sub: format!(
+                            "{} {count} skills · {}",
+                            crate::tui::icons::package(ctx.settings.ui.icons),
+                            crate::tui::icons::source(ctx.settings.ui.icons, &source)
+                        ),
+                    }
+                })
+                .collect(),
+        )
     }
 
     fn picker(title: String, items: Vec<PickItem>) -> Self {
@@ -552,8 +561,10 @@ impl Modal {
     }
 
     pub fn refresh(&mut self, ctx: &Ctx) {
-        if let Self::Repository(picker) = self {
-            picker.refresh(ctx);
+        match self {
+            Self::Repository(picker) => picker.refresh(ctx),
+            Self::PresetSkills(picker) => picker.refresh(ctx),
+            _ => {}
         }
     }
 
@@ -1493,6 +1504,16 @@ fn apply_links(actions: Vec<deploy::Action>, then: Option<Step>) -> Vec<Action> 
 
 fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
     match kind {
+        InputKind::RenameRepository { alias } => {
+            if let Err(error) = skills::repository::validate_name(&value) {
+                return vec![Action::Error(error.to_string())];
+            }
+            let alias = alias.clone();
+            vec![Action::Write(Box::new(move |ws| {
+                let repo = skills::repository::Repository::rename(ws, &alias, &value)?;
+                Ok(format!("Source renamed to {}", repo.display_name()))
+            }))]
+        }
         InputKind::Rename { skill } => {
             let name = value.trim();
             if name.is_empty() {
@@ -1725,46 +1746,63 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
 
 const HELP: &str = "Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
-  1-6               switch tabs outside text inputs
-  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
+  1-6               select a tab outside text inputs; focus stays on the tab strip
+  Tab / Shift-Tab   select next / previous tab (close editing dialogs first)
+  Enter / Down      enter the selected tab from the tab strip
+  Esc / q           return one level inside the current tab; at the tab strip, quit
+                    close overlay, end search input, cancel multi-select, clear filter, parent
+                    q remains ordinary text while editing
   /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit
 
 Library
   F2                settings
   type              fuzzy search over name, tags, description, note
-  tag:x agent:y     filters; also status:modified  source:repository  untagged
+  tag:x preset:y    filters; also agent:codex  status:modified  source:repository  untagged
   Enter             accept a suggestion / open results / preview
   arrows            navigate panels and lists (Esc goes back)
   i                 install a skill from a repo or a local path
-  t  n  d           tags / note in $EDITOR / deploy picker
+  t  n  d  p        tags / note in $EDITOR / deploy picker / add to preset
   r  s              rename the skill / set where it came from
   a  x              accept local changes / remove
   m                 enter multi-select (status marker also starts selection)
   Space  Ctrl-A     toggle skill / select current results in multi-select
   t  d  p           selected skills: tags / deploy / add to preset
-  Esc               cancel multi-select; hidden selections never participate
+  Esc               cancel multi-select; Preset actions include selections outside the filter
   u  U              check upstream / update from upstream (Git or archive sources)
 Tags / Presets
   C                 choose group colour (name or #rrggbb; none resets)
-  c / a             create a group / add skills
+  c                 create a group
+  a                 edit group members
   e / r / D         description / rename / delete group
   C / m             Tags: color / merge (left panel)
   /                 filter names on the left or skills on the right
   arrows            navigate lists and move between panels
   m                 multi-select skills in the current panel
-  Ctrl-A            select current skill results; hidden selections are excluded
+  Ctrl-A            select current skill results; earlier selections are retained
   t / d / p         batch tags / deploy / add to preset
   x                 remove selected skills from the current tag or preset
+  Tag composition   read-only coverage of the Preset's fixed members
   Enter / click     toggle or create a tag immediately; Esc closes the picker
   Tab               complete an existing tag in the picker
   Backspace         empty tag input: select last token; press again to remove
-  Esc               clear a local name filter; press again to go back
+  Esc / q           clear results filter, skills → group list → tab strip
+Staged selection dialogs
+  Enter / Space     toggle the current list item; activate the focused button
+  Tab / Shift-Tab   list → Apply → Cancel; reverse with Shift
+  Down at last item focus Apply; Up from buttons returns to the list
+  Left / Right      switch Apply / Cancel when a button has focus
+  o                 preview a skill in the member selector
+  Esc / q           cancel without applying; search input and preview return first
 Agents
-  /                 filter preset pills or skills, according to focus
-  arrows            agent → scope → presets → skills; ↑ returns to the group above
-  Enter / Space     install or uninstall the focused preset
-  Enter             preview the focused skill
-  i / x / m         install / uninstall / multi-uninstall skills
+  /                 filter skills
+  arrows            agents → scopes → deployment groups → search → filter badges → skills
+  Esc / q           clear skill filter, then groups → scope → agent → tab strip
+  Enter / click     toggle group deployment: partial/empty installs all, full uninstalls all; 0/0 ignored
+  +N presets/tags    expand hidden deployment groups; Esc closes without changes
+  Skill badges      Left/Right selects; Enter/Space toggles a filter, preserving text and other fields
+  Bold + underline  currently applied group filter in the skills panel
+  i / x             install / uninstall skills
+  m                 multi-uninstall skills
   v                 change skill layout
   [ / ]             previous / next agent
   a                 adopt an entry the agent has but the root does not
@@ -1778,17 +1816,11 @@ Mouse
 fn repository_query(alias: &str, ctx: &Ctx) -> String {
     let name = ctx
         .snap
-        .skills
-        .iter()
-        .filter(|r| skills::repository::alias_of(&r.key) == Some(alias))
-        .find_map(|r| {
-            r.source
-                .as_ref()
-                .and_then(skills::meta::Source::url)
-                .and_then(skills::repository::source_name)
-        })
+        .repositories
+        .get(alias)
+        .map(|repository| repository.display_name())
         .unwrap_or_else(|| alias.to_string());
-    format!("repo:{name}")
+    skills::search::source_query_token(&name)
 }
 
 #[cfg(test)]

@@ -217,6 +217,11 @@ pub enum MetaChange {
     /// merge drops the old entry in favour of the target's, and moving the
     /// target's entry "back" would steal it.
     TagEntry { from: String, to: String },
+    /// Restore a deleted definition even when it contained no skills.
+    TagExistence {
+        tag: crate::config::TagConfig,
+        present: bool,
+    },
     /// Creation/removal with a snapshot to protect subsequent external edits.
     PresetExistence {
         preset: crate::preset::Preset,
@@ -260,6 +265,10 @@ impl MetaChange {
                 removed: added,
             },
             MetaChange::TagEntry { from, to } => MetaChange::TagEntry { from: to, to: from },
+            MetaChange::TagExistence { tag, present } => MetaChange::TagExistence {
+                tag,
+                present: !present,
+            },
             MetaChange::Note {
                 skill,
                 before,
@@ -321,6 +330,11 @@ impl MetaChange {
             MetaChange::TagEntry { from, to } => {
                 format!("move the [[tags]] entry {from} to {to}")
             }
+            MetaChange::TagExistence { tag, present } => format!(
+                "{} tag {}",
+                if *present { "restore" } else { "remove" },
+                tag.name
+            ),
             MetaChange::Note { skill, after, .. } => match after {
                 Some(t) => format!("set the note on {skill} to \"{}\"", snippet(t)),
                 None => format!("clear the note on {skill}"),
@@ -386,6 +400,25 @@ impl MetaChange {
                         Fate::Blocked(format!("{to} now has a [[tags]] entry of its own"))
                     }
                 })
+            }
+            MetaChange::TagExistence { tag, present } => {
+                let config = Config::load(&ws.root)?;
+                Ok(
+                    match config.tags.iter().find(|current| current.name == tag.name) {
+                        None if *present => Fate::Ready,
+                        None => Fate::Done,
+                        Some(current) if same_tag_definition(current, tag) => {
+                            if *present {
+                                Fate::Done
+                            } else {
+                                Fate::Ready
+                            }
+                        }
+                        Some(_) => {
+                            Fate::Blocked(format!("tag {} changed since deletion", tag.name))
+                        }
+                    },
+                )
             }
             MetaChange::Note {
                 skill,
@@ -479,6 +512,20 @@ impl MetaChange {
                 Config::rename_tag_entry(&ws.root, from, to)?;
                 Ok(format!("[[tags]] entry {from} moved to {to}"))
             }
+            MetaChange::TagExistence { tag, present } => {
+                Config::edit_tags(&ws.root, |tags| {
+                    if *present {
+                        tags.push(tag.clone());
+                    } else {
+                        tags.retain(|current| current.name != tag.name);
+                    }
+                })?;
+                Ok(format!(
+                    "{} tag {}",
+                    if *present { "restored" } else { "removed" },
+                    tag.name
+                ))
+            }
             MetaChange::Note { skill, after, .. } => {
                 edit::note_set(ws, skill, after.as_deref())?;
                 Ok(format!(
@@ -567,6 +614,14 @@ fn current_tags(ws: &Workspace, skill: &str) -> Result<Option<Vec<String>>> {
     Ok((ws.skill_path(skill).is_dir() || !tags.is_empty()).then_some(tags))
 }
 
+fn same_tag_definition(left: &crate::config::TagConfig, right: &crate::config::TagConfig) -> bool {
+    left.name == right.name
+        && left.color == right.color
+        && left.description == right.description
+        && left.skills.iter().collect::<BTreeSet<_>>()
+            == right.skills.iter().collect::<BTreeSet<_>>()
+}
+
 /// The note a skill carries now. The outer `None` is "no such skill", the inner
 /// one "no note".
 fn current_note(ws: &Workspace, skill: &str) -> Result<Option<Option<String>>> {
@@ -621,6 +676,7 @@ pub fn tag_edit(
 ) -> Result<(String, Option<Intent>)> {
     let before = all_tags(ws)?;
     let entries_before = tag_entry_names(ws)?;
+    let definitions_before = Config::load(&ws.root)?.tags;
     let message = write(ws)?;
     let after = all_tags(ws)?;
     let entries_after = tag_entry_names(ws)?;
@@ -638,6 +694,15 @@ pub fn tag_edit(
             from: (*from).clone(),
             to: (*to).clone(),
         });
+    } else {
+        for tag in definitions_before {
+            if gone.contains(&&tag.name) {
+                changes.push(MetaChange::TagExistence {
+                    tag,
+                    present: false,
+                });
+            }
+        }
     }
     let empty = Vec::new();
     for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
@@ -752,8 +817,10 @@ pub fn preset_edit(
         .presets
         .load(name)?
         .with_context(|| format!("no such preset: {name}"))?;
+    p.skills = p.members();
     let before = p.skills.clone();
     change(&mut p.skills);
+    p.skills = p.members();
     ws.presets.save(&p)?;
     let added: Vec<String> = p
         .skills
@@ -911,6 +978,9 @@ impl WriteBack {
                 preset_rename(ws, from, to).map(|(message, _)| message)
             }
             WriteBack::Meta(changes) => {
+                if let Some(why) = tag_definition_conflict(ws, changes)? {
+                    return Ok(format!("{why}; related tag changes left as they are"));
+                }
                 let mut done = Vec::new();
                 for c in changes {
                     done.push(c.apply(ws)?);
@@ -1188,9 +1258,28 @@ fn links(actions: Vec<Action>, intent: &Intent) -> Result<Plan> {
     }
 }
 
+fn tag_definition_conflict(ws: &Workspace, changes: &[MetaChange]) -> Result<Option<String>> {
+    for change in changes {
+        if matches!(
+            change,
+            MetaChange::TagExistence { .. } | MetaChange::TagEntry { .. }
+        ) && let Fate::Blocked(why) = change.fate(ws)?
+        {
+            return Ok(Some(why));
+        }
+    }
+    Ok(None)
+}
+
 /// Keep only the changes that would still do something. One a hand edit has
-/// overtaken is dropped with its reason rather than written over.
+/// overtaken is dropped with its reason rather than written over. Tag definition
+/// changes are prerequisites: their membership changes move together.
 fn meta(ws: &Workspace, changes: &[MetaChange]) -> Result<Plan> {
+    if let Some(why) = tag_definition_conflict(ws, changes)? {
+        return Ok(Plan::Nothing(format!(
+            "{why}; related tag changes left as they are"
+        )));
+    }
     let mut ready = Vec::new();
     let mut blocked = Vec::new();
     for c in changes {
@@ -1209,7 +1298,19 @@ fn meta(ws: &Workspace, changes: &[MetaChange]) -> Result<Plan> {
     }
     Ok(Plan::Write {
         describe: describe_changes(&ready),
-        apply: WriteBack::Meta(ready),
+        // Retain even already-applied prerequisites to recheck after confirmation.
+        apply: WriteBack::Meta(
+            if changes.iter().any(|change| {
+                matches!(
+                    change,
+                    MetaChange::TagExistence { .. } | MetaChange::TagEntry { .. }
+                )
+            }) {
+                changes.to_vec()
+            } else {
+                ready
+            },
+        ),
     })
 }
 

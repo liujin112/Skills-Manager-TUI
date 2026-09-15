@@ -33,7 +33,7 @@ pub struct Matrix {
 
 impl Matrix {
     pub fn open(&mut self, ctx: &Ctx) {
-        self.presets = ctx.ws.presets.list().unwrap_or_default();
+        self.presets = ctx.snap.presets.by_name.values().cloned().collect();
         self.open = true;
         self.row = self.row.min(self.presets.len().saturating_sub(1));
         self.col = self.col.min(ctx.ws.config.agents.len().saturating_sub(1));
@@ -52,7 +52,7 @@ impl Matrix {
     }
 
     /// Throw the switch in one cell: on unless the preset is already fully on
-    /// there. Runs straight away and records itself, exactly like a pill.
+    /// there. Uses the same immediate deployment action as the Agents page.
     fn toggle(&self, ctx: &Ctx, row: usize, col: usize) -> Vec<Action> {
         let (Some(p), Some(a)) = (self.presets.get(row), ctx.ws.config.agents.get(col)) else {
             return vec![];

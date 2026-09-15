@@ -6,7 +6,7 @@
 //! presets pages use, so a skill reads the same wherever it turns up.
 
 use super::{View, wheel};
-use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::group::{self, tag_fill};
 use crate::tui::components::group_prompt::{Ask, Prompt};
 use crate::tui::components::layout::frame;
@@ -86,11 +86,27 @@ impl TagsView {
 
     fn refilter(&mut self, ctx: &Ctx) {
         let selected = self.selected_tag().map(str::to_owned);
-        self.rows = self
+        let documents = self
             .all_rows
             .iter()
-            .filter(|(tag, _)| self.filter.matches(tag))
-            .cloned()
+            .map(|(name, _)| skills::search::TextDocument {
+                name: name.clone(),
+                description: ctx
+                    .ws
+                    .config
+                    .tags
+                    .iter()
+                    .find(|t| &t.name == name)
+                    .and_then(|t| t.description.clone())
+                    .unwrap_or_default(),
+                body: String::new(),
+            })
+            .collect::<Vec<_>>();
+        self.rows = self
+            .filter
+            .rank(&documents, ctx)
+            .into_iter()
+            .map(|i| self.all_rows[i].clone())
             .collect();
         self.list
             .select(selected.and_then(|tag| self.rows.iter().position(|r| r.0 == tag)));
@@ -144,12 +160,14 @@ impl TagsView {
 
     fn search_members(&mut self, ctx: &Ctx) {
         self.skill_search = Some(super::search::SearchView::panel(
-            self.members.clone(),
-            format!("Tag: {}", self.selected_tag().unwrap_or("none")),
-            LayoutScope::Tags,
+            super::search::SkillPanelOptions {
+                keys: self.members.clone(),
+                title: format!("Tag: {}", self.selected_tag().unwrap_or("none")),
+                layout_scope: LayoutScope::Tags,
+                hidden_group: self.actionable_tag().map(|tag| (group::Kind::Tag, tag)),
+            },
             ctx,
         ));
-        self.skill_search.as_mut().unwrap().hide_tags = true;
         self.focus_grid = true;
     }
 
@@ -220,7 +238,12 @@ impl TagsView {
             .iter()
             .find(|t| t.name == tag)
             .and_then(|t| t.color.as_deref());
-        self.prompt = Some(Prompt::for_color(&tag, current, &ctx.settings.theme));
+        self.prompt = Some(Prompt::for_color(
+            group::Kind::Tag,
+            &tag,
+            current,
+            &ctx.settings.theme,
+        ));
         vec![]
     }
 
@@ -284,9 +307,7 @@ impl TagsView {
     fn draw_tags(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = &ctx.settings.theme;
         let focused = !self.focus_grid && self.prompt.is_none();
-        let block = th.block(" tags ", focused);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+        let inner = area;
         let content = Rect {
             width: inner.width.saturating_sub(1),
             ..inner
@@ -322,13 +343,13 @@ impl TagsView {
             } else {
                 frame(f, cell, on, focused && !self.filter.editing, th)
             };
-            let lines = group::group_card(
+            let lines = group::sidebar_card(
                 tag,
                 *count,
                 descriptions[i],
                 tag_fill(tag, ctx),
                 inner.width as usize,
-                th,
+                ctx,
             );
             f.render_widget(Paragraph::new(lines), inner);
         }
@@ -343,6 +364,16 @@ impl TagsView {
 }
 
 impl View for TagsView {
+    fn focus_from_above(&mut self) {
+        self.focus_grid = false;
+        self.filter.editing = true;
+    }
+
+    fn focus_root(&mut self) {
+        self.focus_grid = false;
+        self.filter.editing = false;
+    }
+
     fn status(&self, ctx: &Ctx) -> String {
         self.skill_search
             .as_ref()
@@ -364,7 +395,7 @@ impl View for TagsView {
             .count();
         self.rows.push((UNTAGGED.into(), untagged));
         self.all_rows = self.rows.clone();
-        self.rows.retain(|(tag, _)| self.filter.matches(tag));
+        self.refilter(ctx);
         self.list.select(
             selected
                 .as_ref()
@@ -385,11 +416,30 @@ impl View for TagsView {
         if self.prompt.is_some() {
             return self.prompt_key(k);
         }
+        if !self.focus_grid
+            && self.filter.editing
+            && k.code == KeyCode::Right
+            && self.filter.input.cursor_byte() == self.filter.input.value().len()
+        {
+            if let Some(view) = self.skill_search.as_mut() {
+                self.filter.editing = false;
+                self.focus_grid = true;
+                view.focus_input();
+            }
+            return vec![];
+        }
         if self.focus_grid
             && let Some(view) = self.skill_search.as_mut()
         {
+            if k.code == KeyCode::Left && view.input_at_left_edge() {
+                view.close_input_completion();
+                self.focus_grid = false;
+                self.filter.editing = true;
+                return vec![];
+            }
             if k.code == KeyCode::Left && view.panel_back() {
                 self.focus_grid = false;
+                self.filter.editing = false;
                 return vec![];
             }
             if view.panel_actions_ready() && k.modifiers.is_empty() {
@@ -401,7 +451,20 @@ impl View for TagsView {
                     return self.add_members(ctx);
                 }
             }
-            return view.handle_key(k, ctx);
+            let mut actions = view.handle_key(k, ctx);
+            if k.code == KeyCode::Up {
+                return actions;
+            }
+            if actions.iter().any(|a| matches!(a, Action::BackToParent)) {
+                self.focus_grid = false;
+                self.filter.editing = false;
+                actions.retain(|a| !matches!(a, Action::BackToParent));
+            }
+            return actions;
+        }
+        if !self.focus_grid && self.filter.editing && k.code == KeyCode::Up {
+            self.filter.editing = false;
+            return vec![Action::BackToParent];
         }
         if !self.focus_grid && self.filter.key(k) {
             self.refilter(ctx);
@@ -410,10 +473,8 @@ impl View for TagsView {
         let n = self.rows.len();
         let m = self.members.len();
         match k.code {
-            KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
-            // Esc means "back" everywhere else in the program, so here it goes
-            // back to the search page rather than out of the door.
-            KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
+            KeyCode::Char('q') => vec![Action::BackToParent],
+            KeyCode::Esc => vec![Action::BackToParent],
             KeyCode::Down | KeyCode::Char('j') => {
                 self.list.move_by(1, n);
                 self.sync_members(ctx.snap);
@@ -441,6 +502,9 @@ impl View for TagsView {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if m > 0 {
                     self.focus_grid = true;
+                    if let Some(view) = self.skill_search.as_mut() {
+                        view.focus_list();
+                    }
                 }
                 vec![]
             }
@@ -484,14 +548,16 @@ impl View for TagsView {
         let at = (m.column, m.row).into();
         let pressing = m.kind == MouseEventKind::Down(MouseButton::Left);
         let dragging = m.kind == MouseEventKind::Drag(MouseButton::Left);
-        if pressing && self.filter.rect.contains(at) {
+        if pressing && self.filter.click_input(m.column, m.row) {
             self.focus_grid = false;
             self.filter.editing = true;
             return vec![];
         }
         if self.right.contains(at) {
-            self.focus_grid = true;
-            self.filter.editing = false;
+            if pressing {
+                self.focus_grid = true;
+                self.filter.editing = false;
+            }
             return self.skill_search.as_mut().unwrap().handle_mouse(m, ctx);
         }
         if let Some(d) = wheel(&m, ctx) {
@@ -519,6 +585,9 @@ impl View for TagsView {
                 self.sync_members(ctx.snap);
                 if double && !self.members.is_empty() {
                     self.focus_grid = true;
+                    if let Some(view) = self.skill_search.as_mut() {
+                        view.focus_list();
+                    }
                 }
             }
         }
@@ -530,7 +599,9 @@ impl View for TagsView {
         let (left, right) = split_panes(area, 38, ctx);
         self.left = left;
         self.right = right;
-        let content = self.filter.draw(f, left, "Filter tags", ctx);
+        let content = self
+            .filter
+            .draw(f, left, "Filter tags", "tags", !self.focus_grid, ctx);
         self.draw_tags(f, content, ctx);
         if let Some(view) = self.skill_search.as_mut() {
             view.set_panel_active(self.focus_grid);
@@ -574,7 +645,7 @@ impl View for TagsView {
                 ("C", "colour"),
                 ("D", "delete tag"),
                 ("Enter/→", "skills"),
-                ("q", "library"),
+                ("Esc/q", "clear/back"),
             ],
         }
     }

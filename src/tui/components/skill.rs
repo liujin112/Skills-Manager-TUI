@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 
 use crate::tui::app::Ctx;
-use crate::tui::components::group::tag_pills;
+use crate::tui::components::group::{Kind, membership_badges};
 use crate::tui::text::highlight_spans;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{fit, pad, width};
@@ -26,16 +26,17 @@ pub fn display_name(r: &SkillRecord) -> &str {
 pub fn repository_badge(r: &SkillRecord, icons: skills::config::Icons) -> Option<String> {
     use skills::meta::Source;
     match &r.source {
-        Some(source @ (Source::Git { url, .. } | Source::Archive { url, .. })) => {
-            let name = skills::repository::source_name(url).unwrap_or_else(|| url.clone());
+        Some(source @ (Source::Git { .. } | Source::Archive { .. })) => {
+            let name = r.source_display_name().unwrap_or("Unregistered source");
             Some(format!(
                 "{} {name}",
                 crate::tui::icons::source_icon(icons, source)
             ))
         }
         Some(Source::Local { .. }) => Some(crate::tui::icons::local(icons).into()),
-        None => skills::repository::alias_of(&r.key)
-            .map(|alias| format!("{} {alias}", crate::tui::icons::package(icons))),
+        None => r
+            .source_display_name()
+            .map(|name| format!("{} {name}", crate::tui::icons::package(icons))),
     }
 }
 
@@ -92,6 +93,7 @@ pub struct SkillPresentation<'a> {
     description: Cow<'a, str>,
     source: String,
     tags: &'a [String],
+    presets: &'a [String],
     marker: &'static str,
     tone: Tone,
     warning: Option<&'a str>,
@@ -106,6 +108,8 @@ pub struct SkillRenderState<'a> {
     pub terms: &'a [String],
     pub context: Option<&'a str>,
     pub show_tags: bool,
+    /// The enclosing group is already named by its page or membership picker.
+    pub hidden_group: Option<(Kind, &'a str)>,
     pub show_match_details: bool,
 }
 
@@ -118,12 +122,23 @@ impl Default for SkillRenderState<'_> {
             terms: &[],
             context: None,
             show_tags: true,
+            hidden_group: None,
             show_match_details: false,
         }
     }
 }
 
 impl<'a> SkillPresentation<'a> {
+    /// A group's missing deployment keeps its Library identity and health details.
+    pub fn not_deployed(mut self) -> Self {
+        if self.warning.is_none() {
+            self.marker = "◌";
+            self.tone = Tone::Normal;
+            self.warning = Some("not deployed");
+        }
+        self
+    }
+
     pub fn managed(r: &'a SkillRecord, ctx: &Ctx) -> Self {
         let (marker, tone) = status_marker(&r.status);
         Self {
@@ -132,6 +147,7 @@ impl<'a> SkillPresentation<'a> {
             source: repository_badge(r, ctx.settings.ui.icons)
                 .unwrap_or_else(|| crate::tui::icons::local(ctx.settings.ui.icons).into()),
             tags: &r.tags,
+            presets: &r.presets,
             marker,
             tone,
             warning: (!r.status.is_healthy()).then(|| r.status.label()),
@@ -174,6 +190,7 @@ impl<'a> SkillPresentation<'a> {
             description,
             source: label.into(),
             tags: &[],
+            presets: &[],
             marker,
             tone,
             warning: matches!(tone, Tone::Warning | Tone::Error).then_some(label),
@@ -238,23 +255,82 @@ impl<'a> SkillPresentation<'a> {
         }
     }
 
-    /// Identity, two description lines, then source and right-aligned tags.
+    fn memberships(&self, kind: Kind, ctx: &Ctx, state: &SkillRenderState) -> Cow<'a, [String]> {
+        let names = match kind {
+            Kind::Tag if !state.show_tags || !ctx.settings.tags_enabled => &[][..],
+            Kind::Tag => self.tags,
+            Kind::Preset => self.presets,
+        };
+        match state.hidden_group {
+            Some((hidden_kind, hidden_name)) if hidden_kind == kind => Cow::Owned(
+                names
+                    .iter()
+                    .filter(|name| name.as_str() != hidden_name)
+                    .cloned()
+                    .collect(),
+            ),
+            _ => Cow::Borrowed(names),
+        }
+    }
+
+    /// Source stays left; visible Tag and Preset badges pack against the right edge.
+    fn metadata(&self, ctx: &Ctx, columns: usize, state: &SkillRenderState) -> Vec<Span<'static>> {
+        let source = self.source(state);
+        let tags = self.memberships(Kind::Tag, ctx, state);
+        let presets = self.memberships(Kind::Preset, ctx, state);
+        if tags.is_empty() && presets.is_empty() {
+            return vec![Span::styled(
+                fit(&source, columns),
+                ctx.settings.theme.source(),
+            )];
+        }
+        let full_tag = membership_badges(Kind::Tag, &tags, ctx, usize::MAX, 1);
+        let full_preset = membership_badges(Kind::Preset, &presets, ctx, usize::MAX, 1);
+        let full_tag_width = full_tag.iter().map(Span::width).sum::<usize>();
+        let full_preset_width = full_preset.iter().map(Span::width).sum::<usize>();
+        let full_gap = usize::from(full_tag_width > 0 && full_preset_width > 0);
+        let source_separator = usize::from(full_tag_width + full_preset_width > 0);
+        let full_width =
+            width(&source) + source_separator + full_tag_width + full_gap + full_preset_width;
+        let (source_width, tag, preset) = if full_width <= columns {
+            (width(&source), full_tag, full_preset)
+        } else {
+            let source_width = width(&source).min(columns / 3);
+            let available = columns.saturating_sub(source_width + 1);
+            let (tag_width, preset_width) = if tags.is_empty() {
+                (0, available)
+            } else if presets.is_empty() {
+                (available, 0)
+            } else {
+                let group_width = available.saturating_sub(1);
+                (group_width / 2, group_width - group_width / 2)
+            };
+            (
+                source_width,
+                membership_badges(Kind::Tag, &tags, ctx, tag_width, 1),
+                membership_badges(Kind::Preset, &presets, ctx, preset_width, 1),
+            )
+        };
+        let tag_used = tag.iter().map(Span::width).sum::<usize>();
+        let preset_used = preset.iter().map(Span::width).sum::<usize>();
+        let source = fit(&source, source_width);
+        let mut out = vec![Span::styled(source.clone(), ctx.settings.theme.source())];
+        let gap = usize::from(tag_used > 0 && preset_used > 0);
+        let used = width(&source) + tag_used + preset_used + gap;
+        let spare = columns.saturating_sub(used);
+        out.push(Span::raw(" ".repeat(spare)));
+        out.extend(tag);
+        if gap > 0 {
+            out.push(Span::raw(" "));
+        }
+        out.extend(preset);
+        out
+    }
+
+    /// Identity, two description lines, then the shared membership metadata.
     pub fn card(&self, ctx: &Ctx, columns: usize, state: &SkillRenderState) -> Vec<Line<'static>> {
         let th = &ctx.settings.theme;
         let summary = summary_lines(state.excerpt.unwrap_or(&self.description), columns);
-        let pills = tag_pills(
-            self.tags,
-            ctx,
-            if state.show_tags { columns / 2 } else { 0 },
-        );
-        let pills_width: usize = pills.iter().map(Span::width).sum();
-        let source_width = columns.saturating_sub(pills_width + usize::from(pills_width > 0));
-        let source = fit(&self.source(state), source_width);
-        let mut foot = vec![Span::styled(source.clone(), th.source())];
-        foot.push(Span::raw(
-            " ".repeat(columns.saturating_sub(width(&source) + pills_width)),
-        ));
-        foot.extend(pills);
         vec![
             Line::from(self.identity(columns, state, ctx)),
             Line::from(highlight_spans(
@@ -269,7 +345,7 @@ impl<'a> SkillPresentation<'a> {
                 th.description(),
                 th,
             )),
-            Line::from(foot),
+            Line::from(self.metadata(ctx, columns, state)),
         ]
     }
 
@@ -294,7 +370,7 @@ impl<'a> SkillPresentation<'a> {
             .collect()
     }
 
-    /// Dense identity row with the same marker, source and colored tag pills.
+    /// Dense identity row with the same marker and membership metadata.
     pub fn compact(
         &self,
         ctx: &Ctx,
@@ -304,13 +380,39 @@ impl<'a> SkillPresentation<'a> {
     ) -> Vec<Line<'static>> {
         let th = &ctx.settings.theme;
         let content_width = columns.saturating_sub(2 + ctx.settings.layout.marker_width);
-        let source_width = width(&self.source).min(content_width / 2);
-        let source_space = source_width + usize::from(source_width > 0);
+        let mut metadata_min = width(&self.source).min(10);
+        let mut groups = 0;
+        for kind in [Kind::Tag, Kind::Preset] {
+            let names = self.memberships(kind, ctx, state);
+            if names.is_empty() {
+                continue;
+            }
+            groups += 1;
+            let badge = membership_badges(kind, &names, ctx, usize::MAX, 1);
+            let count_width = if names.len() > 1 {
+                width(&format!(" +{}", names.len() - 1))
+            } else {
+                0
+            };
+            metadata_min += badge
+                .iter()
+                .map(Span::width)
+                .sum::<usize>()
+                .min(8 + count_width)
+                + 1;
+        }
+        let minimum_name = width(self.name).min(8).min(content_width);
+        metadata_min = if groups > 0 {
+            metadata_min.min(content_width.saturating_sub(minimum_name + 1))
+        } else {
+            metadata_min.min(content_width / 2)
+        };
         let name_width = ctx
             .settings
             .layout
             .compact_name_width
-            .min(content_width.saturating_sub(source_space));
+            .min(width(self.name))
+            .min(content_width.saturating_sub(metadata_min + usize::from(metadata_min > 0)));
         let marker = self.marker(state, ctx);
         let mut head = vec![
             Span::styled(
@@ -328,16 +430,10 @@ impl<'a> SkillPresentation<'a> {
             th.bold(),
             th,
         ));
-        if source_width > 0 {
-            head.push(Span::styled(
-                format!(" {}", pad(&self.source, source_width)),
-                th.source(),
-            ));
-        }
-        let tags_width = content_width.saturating_sub(name_width + source_space);
-        if state.show_tags && !self.tags.is_empty() && tags_width > 0 {
+        let metadata_width = content_width.saturating_sub(name_width);
+        if metadata_width > 0 {
             head.push(Span::raw(" "));
-            head.extend(tag_pills(self.tags, ctx, tags_width.saturating_sub(1)));
+            head.extend(self.metadata(ctx, metadata_width - 1, state));
         }
         let mut lines = vec![Line::from(head)];
         if state.show_match_details {
@@ -425,6 +521,116 @@ mod tests {
     use super::*;
     use crate::tui::settings::RuntimeSettings;
     use ratatui::style::Color;
+
+    #[test]
+    fn memberships_pack_right_in_every_density_and_hide_only_the_enclosing_group() {
+        let root = skills::ops::DownloadDir::new("skill-membership-alignment").unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = RuntimeSettings::new(&ws.config);
+        let tags = ["alpha".into(), "beta".into()];
+        let presets = ["alpha".into(), "gamma".into()];
+        for (icons, tag, preset, other_tag, other_preset) in [
+            (
+                skills::config::Icons::Text,
+                "( alpha )",
+                "/ alpha /",
+                "( beta )",
+                "/ gamma /",
+            ),
+            (
+                skills::config::Icons::Nerd,
+                " alpha ",
+                " alpha ",
+                " beta ",
+                " gamma ",
+            ),
+        ] {
+            settings.ui.icons = icons;
+            let ctx = Ctx {
+                ws: &ws,
+                snap: &snap,
+                settings: &settings,
+            };
+            for (tag_count, preset_count, hidden_group, suffix) in [
+                (1, 0, None, tag.to_owned()),
+                (0, 1, None, preset.to_owned()),
+                (1, 1, None, format!("{tag} {preset}")),
+                (2, 2, None, format!("{tag} +1 {preset} +1")),
+                (
+                    2,
+                    2,
+                    Some((Kind::Tag, "alpha")),
+                    format!("{other_tag} {preset} +1"),
+                ),
+                (
+                    2,
+                    2,
+                    Some((Kind::Preset, "alpha")),
+                    format!("{tag} +1 {other_preset}"),
+                ),
+                (1, 1, Some((Kind::Tag, "alpha")), preset.to_owned()),
+                (1, 1, Some((Kind::Preset, "alpha")), tag.to_owned()),
+            ] {
+                let mut skill = SkillPresentation::entry("sample", None, None);
+                skill.source = "local".into();
+                skill.tags = &tags[..tag_count];
+                skill.presets = &presets[..preset_count];
+                let state = SkillRenderState {
+                    hidden_group,
+                    ..Default::default()
+                };
+                for lines in [
+                    skill.card(&ctx, 80, &state),
+                    skill.list(&ctx, 80, false, &state),
+                    skill.compact(&ctx, 80, false, &state),
+                ] {
+                    let metadata = lines.last().unwrap();
+                    let text = metadata.to_string();
+                    assert_eq!(metadata.width(), 80, "{text:?}");
+                    assert!(
+                        text.ends_with(&suffix),
+                        "expected right-aligned {suffix:?}: {text:?}"
+                    );
+                    assert!(text.contains("local "), "{text:?}");
+                }
+                for columns in 0..100 {
+                    for lines in [
+                        skill.card(&ctx, columns, &state),
+                        skill.list(&ctx, columns, false, &state),
+                        skill.compact(&ctx, columns, false, &state),
+                    ] {
+                        assert!(
+                            lines.iter().all(|line| line.width() <= columns),
+                            "columns={columns}: {lines:?}"
+                        );
+                    }
+                }
+            }
+            let mut skill = SkillPresentation::entry("sample", None, None);
+            skill.source = "local".into();
+            skill.tags = &tags[..1];
+            assert_eq!(
+                Line::from(skill.metadata(
+                    &ctx,
+                    80,
+                    &SkillRenderState {
+                        hidden_group: Some((Kind::Tag, "alpha")),
+                        ..Default::default()
+                    }
+                ))
+                .to_string(),
+                "local"
+            );
+
+            skill.source = "󰏗 merlin-skills".into();
+            let metadata = Line::from(skill.metadata(&ctx, 41, &SkillRenderState::default()));
+            assert_eq!(metadata.width(), 41);
+            assert!(metadata.to_string().starts_with("󰏗 merlin-skills"));
+            assert!(metadata.to_string().ends_with(tag));
+            assert!(!metadata.to_string().contains('…'));
+        }
+    }
 
     #[test]
     fn all_densities_share_source_tag_and_description_styles() {

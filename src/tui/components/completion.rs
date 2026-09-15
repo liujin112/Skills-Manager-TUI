@@ -1,4 +1,4 @@
-//! Local query-filter completion. Repository names come from source URLs.
+//! Local query-filter completion from the current inventory and source metadata.
 use std::{collections::BTreeSet, ops::Range};
 
 use crate::tui::{
@@ -27,31 +27,86 @@ impl Completion {
     }
 
     pub fn update(&mut self, input: &Input, ctx: &Ctx) {
+        self.update_scoped(input, ctx, None);
+    }
+
+    pub fn update_scoped(&mut self, input: &Input, ctx: &Ctx, keys: Option<&BTreeSet<String>>) {
+        let records: Vec<_> = ctx
+            .snap
+            .skills
+            .iter()
+            .filter(|r| keys.is_none_or(|keys| keys.contains(&r.key)))
+            .collect();
+        self.update_records(input, ctx, &records, keys);
+    }
+
+    pub fn update_records(
+        &mut self,
+        input: &Input,
+        ctx: &Ctx,
+        records: &[&skills::reconcile::SkillRecord],
+        keys: Option<&BTreeSet<String>>,
+    ) {
         let range = token_range(input.value(), input.cursor_byte());
         let token = &input.value()[range.clone()];
         let values = match token.split_once(':') {
-            Some(("repo", _)) => ctx
-                .snap
-                .skills
+            Some(("repo", _)) => records
                 .iter()
-                .filter_map(|r| {
-                    r.source
-                        .as_ref()
-                        .and_then(skills::meta::Source::url)
-                        .and_then(skills::repository::source_name)
-                })
+                .filter_map(|r| r.source_display_name().map(str::to_owned))
                 .collect(),
-            Some(("tag", _)) => ctx
-                .snap
-                .skills
+            Some(("tag", _)) => records
                 .iter()
                 .flat_map(|r| r.tags.iter().cloned())
-                .chain(ctx.ws.config.tags.iter().map(|t| t.name.clone()))
+                .chain(
+                    ctx.ws
+                        .config
+                        .tags
+                        .iter()
+                        .filter(|t| {
+                            keys.is_none_or(|keys| t.skills.iter().any(|key| keys.contains(key)))
+                        })
+                        .map(|t| t.name.clone()),
+                )
                 .collect(),
-            Some(("agent", _)) => ctx.snap.agents.iter().map(|a| a.key.clone()).collect(),
+            Some(("agent", _)) => ctx
+                .snap
+                .agents
+                .iter()
+                .filter(|a| {
+                    keys.is_none()
+                        || records.iter().any(|r| {
+                            r.deploy.get(&a.key).is_some_and(|state| {
+                                !matches!(
+                                    state,
+                                    skills::reconcile::DeployState::NotDeployed
+                                        | skills::reconcile::DeployState::NoAgentDir
+                                )
+                            })
+                        })
+                })
+                .map(|a| a.key.clone())
+                .collect(),
+            Some(("preset", _)) => ctx
+                .snap
+                .presets
+                .by_name
+                .iter()
+                .filter(|(_, members)| {
+                    keys.is_none_or(|keys| members.skills.iter().any(|key| keys.contains(key)))
+                })
+                .map(|(name, _)| name.clone())
+                .collect(),
+            Some(("source", _)) if keys.is_some() => records
+                .iter()
+                .map(|r| r.source_kind().to_string())
+                .collect(),
             Some(("source", _)) => ["local", "repository"]
                 .into_iter()
                 .map(str::to_owned)
+                .collect(),
+            Some(("status", _)) if keys.is_some() => records
+                .iter()
+                .map(|r| r.status.label().trim_end_matches('?').to_string())
                 .collect(),
             Some(("status", _)) => [
                 "local",
@@ -87,11 +142,9 @@ impl Completion {
             choice.starts_with("repo:")
                 || (choice.starts_with("status:")
                     && (choice == "status:"
-                        || ctx
-                            .snap
-                            .skills
-                            .iter()
-                            .any(|r| choice == &format!("status:{}", r.status.label()))))
+                        || ctx.snap.skills.iter().any(|r| {
+                            choice == &format!("status:{}", r.status.label().trim_end_matches('?'))
+                        })))
         });
     }
 
@@ -199,18 +252,10 @@ impl Completion {
 }
 
 fn token_range(text: &str, cursor: usize) -> Range<usize> {
-    let start = text[..cursor]
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_whitespace())
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let end = text[cursor..]
-        .char_indices()
-        .find(|(_, c)| c.is_whitespace())
-        .map(|(i, _)| cursor + i)
-        .unwrap_or(text.len());
-    start..end
+    skills::search::query_token_ranges(text)
+        .into_iter()
+        .find(|range| range.start <= cursor && cursor <= range.end)
+        .unwrap_or(cursor..cursor)
 }
 
 fn candidates(token: &str, values: BTreeSet<String>) -> Vec<String> {
@@ -224,16 +269,21 @@ fn candidates(token: &str, values: BTreeSet<String>) -> Vec<String> {
             (
                 "",
                 token,
-                ["repo:", "tag:", "agent:", "status:"]
+                ["repo:", "tag:", "preset:", "agent:", "status:"]
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
             )
         };
+    let query = if prefix == "repo" {
+        skills::search::source_query_value(query)
+    } else {
+        query.to_owned()
+    };
     let mut ranked: Vec<_> = choices
         .into_iter()
-        .filter(|value| !value.chars().any(char::is_whitespace))
-        .filter_map(|value| score(query, &value).map(|score| (score, value)))
+        .filter(|value| prefix == "repo" || !value.chars().any(char::is_whitespace))
+        .filter_map(|value| score(&query, &value).map(|score| (score, value)))
         .collect();
     ranked.sort();
     ranked
@@ -241,6 +291,8 @@ fn candidates(token: &str, values: BTreeSet<String>) -> Vec<String> {
         .map(|(_, value)| {
             if prefix.is_empty() {
                 value
+            } else if prefix == "repo" {
+                skills::search::source_query_token(&value)
             } else {
                 format!("{prefix}:{value}")
             }
@@ -301,6 +353,30 @@ mod tests {
         }
         assert!(candidates("repo:unknown", values).is_empty());
         assert_eq!(candidates("rep", BTreeSet::new()), vec!["repo:"]);
+    }
+
+    #[test]
+    fn source_name_completion_quotes_spaces_and_replaces_the_whole_value() {
+        let values = ["Merlin Skills".into(), "Other Package".into()]
+            .into_iter()
+            .collect();
+        assert_eq!(candidates("repo:merl", values), ["repo:\"Merlin Skills\""]);
+        let mut input = Input::with_value("tag:work repo:\"Merlin Sk\"");
+        let range = token_range(input.value(), input.cursor_byte());
+        assert_eq!(&input.value()[range.clone()], "repo:\"Merlin Sk\"");
+        let mut popup = Completion {
+            token: range,
+            choices: vec!["repo:\"Merlin Skills\"".into()],
+            ..Default::default()
+        };
+        popup.accept(&mut input);
+        assert_eq!(input.value(), "tag:work repo:\"Merlin Skills\" ");
+        let partial = "repo:\"Merlin Sk";
+        assert_eq!(token_range(partial, partial.len()), 0..partial.len());
+        assert_eq!(
+            candidates(partial, ["Merlin Skills".into()].into_iter().collect()),
+            ["repo:\"Merlin Skills\""]
+        );
     }
     #[test]
     fn token_replacement_preserves_other_filters_and_unicode() {

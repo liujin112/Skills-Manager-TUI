@@ -15,7 +15,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::Workspace;
@@ -33,8 +33,14 @@ pub enum Tab {
     Tags,
     Presets,
     Agents,
-    Health,
     Repos,
+    Health,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppFocus {
+    Tabs,
+    Page,
 }
 
 impl Tab {
@@ -43,8 +49,8 @@ impl Tab {
         Tab::Tags,
         Tab::Presets,
         Tab::Agents,
-        Tab::Health,
         Tab::Repos,
+        Tab::Health,
     ];
     pub fn visible(tags_enabled: bool) -> Vec<Tab> {
         Self::ALL
@@ -84,6 +90,7 @@ pub enum Action {
         checked: Option<String>,
         agent: String,
     },
+    BackToParent,
     Quit,
     SelectSkills {
         keys: Vec<String>,
@@ -195,6 +202,7 @@ pub struct App {
     root_stamp: Option<skills::reconcile::watch::Stamp>,
     tx: Sender<Msg>,
     external: Option<External>,
+    focus: AppFocus,
     quit: bool,
     quit_prompt: Option<QuitPrompt>,
     tab_rects: Vec<(Rect, Tab)>,
@@ -337,12 +345,23 @@ impl App {
             root_stamp,
             tx,
             external: None,
+            focus: AppFocus::Page,
             quit: false,
             quit_prompt: None,
             tab_rects: Vec::new(),
             body: Rect::default(),
         };
         app.on_snapshot();
+        if let Some(report) = &app.ws.preset_migration {
+            app.toast(
+                format!(
+                    "Converted {} presets to fixed members · backup: {}",
+                    report.migrated_names.len(),
+                    report.backup_dir.display()
+                ),
+                Level::Info,
+            );
+        }
         Ok(app)
     }
 
@@ -586,10 +605,8 @@ impl App {
                             }
                         )),
                         Action::Search {
-                            query: format!(
-                                "repo:{}",
-                                skills::repository::source_name(&selection.fetched.repository.url)
-                                    .unwrap_or_else(|| selection.fetched.repository.alias.clone())
+                            query: skills::search::source_query_token(
+                                &selection.fetched.repository.display_name(),
                             ),
                             focus_list: true,
                         },
@@ -695,6 +712,10 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
+        if self.focus == AppFocus::Tabs && self.modal.is_none() {
+            return vec![];
+        }
+
         if self.quit_prompt.is_some()
             || (self.batch_running
                 && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_))))
@@ -715,14 +736,14 @@ impl App {
             Tab::Presets => self.presets.paste(text, &ctx),
             Tab::Health => self.health.paste(text, &ctx),
             Tab::Repos => self.repos.paste(text, &ctx),
-            Tab::Agents => self.agents.paste(text),
+            Tab::Agents => self.agents.paste(text, &ctx),
         }
     }
 
     fn on_key(&mut self, k: KeyEvent) -> Vec<Action> {
         if let Some(prompt) = self.quit_prompt.as_mut() {
             match k.code {
-                KeyCode::Esc => self.quit_prompt = None,
+                KeyCode::Esc | KeyCode::Char('q') => self.quit_prompt = None,
                 KeyCode::Left | KeyCode::Right => {
                     prompt.quit_selected = !prompt.quit_selected;
                 }
@@ -749,6 +770,48 @@ impl App {
         };
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
+        }
+        if self.focus == AppFocus::Tabs {
+            let tabs = Tab::visible(self.settings.tags_enabled);
+            let index = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => return vec![Action::Quit],
+                KeyCode::Enter | KeyCode::Down => {
+                    self.enter_page();
+                    if k.code == KeyCode::Down {
+                        match self.tab {
+                            Tab::Search => self.search.focus_input(),
+                            Tab::Tags => self.tags.focus_from_above(),
+                            Tab::Presets => self.presets.focus_from_above(),
+                            Tab::Repos => self.repos.focus_from_above(),
+                            Tab::Health => self.health.focus_input(),
+                            _ => {}
+                        }
+                    }
+                    return vec![];
+                }
+                KeyCode::Left | KeyCode::BackTab => {
+                    return vec![Action::SwitchTab(
+                        tabs[(index + tabs.len() - 1) % tabs.len()],
+                    )];
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    return vec![Action::SwitchTab(tabs[(index + 1) % tabs.len()])];
+                }
+                KeyCode::Char(c @ '1'..='6') => {
+                    return tabs
+                        .get((c as u8 - b'1') as usize)
+                        .map(|t| vec![Action::SwitchTab(*t)])
+                        .unwrap_or_default();
+                }
+                KeyCode::F(1) | KeyCode::Char('?') => {
+                    return vec![Action::OpenModal(Box::new(Modal::help()))];
+                }
+                _ => return vec![],
+            }
+        }
+        if self.tab == Tab::Agents && self.agents.group_popup_open() {
+            return self.agents.handle_key(k, &ctx);
         }
         if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
             if self.tab == Tab::Tags && self.tags.dialog_open() {
@@ -854,16 +917,27 @@ impl App {
         if let Some(modal) = self.modal.as_mut() {
             return modal.handle_mouse(m, &ctx);
         }
+        if self.tab == Tab::Agents && self.agents.group_popup_open() {
+            return self.agents.handle_mouse(m, &ctx);
+        }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind
             && let Some((_, tab)) = self
                 .tab_rects
                 .iter()
                 .find(|(r, _)| r.contains((m.column, m.row).into()))
         {
-            return vec![Action::SwitchTab(*tab)];
+            let tab = *tab;
+            self.switch_tab(tab);
+            self.focus = AppFocus::Page;
+            return vec![];
         }
         if !self.body.contains((m.column, m.row).into()) {
             return Vec::new();
+        }
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            self.focus = AppFocus::Page;
+        } else if self.focus == AppFocus::Tabs {
+            return vec![];
         }
         match self.tab {
             Tab::Search => self.search.handle_mouse(m, &ctx),
@@ -979,15 +1053,15 @@ impl App {
                     }
                 }
             }
+            Action::BackToParent => self.focus = AppFocus::Tabs,
             Action::SwitchTab(t) => {
                 self.switch_tab(t);
-                if t == Tab::Search {
-                    self.search.focus_input();
-                }
+                self.focus = AppFocus::Tabs;
             }
             Action::SelectPreset(name) => self.presets.select(&name),
             Action::SelectTag(name) => self.tags.select(&name, &self.snap),
             Action::Search { query, focus_list } => {
+                self.focus = AppFocus::Page;
                 self.switch_tab(Tab::Search);
                 let ctx = Ctx {
                     ws: &self.ws,
@@ -1115,6 +1189,19 @@ impl App {
                 self.rescan();
             }
         }
+    }
+
+    fn enter_page(&mut self) {
+        self.focus = AppFocus::Page;
+        let view: &mut dyn View = match self.tab {
+            Tab::Search => &mut self.search,
+            Tab::Tags => &mut self.tags,
+            Tab::Presets => &mut self.presets,
+            Tab::Agents => &mut self.agents,
+            Tab::Repos => &mut self.repos,
+            Tab::Health => &mut self.health,
+        };
+        view.focus_root();
     }
 
     /// Make `t` the active tab. The view is told only when the tab actually
@@ -1250,9 +1337,10 @@ impl App {
         let label = match &task {
             Task::Scan | Task::PollRoot => None,
             Task::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
-            Task::InstallRepository(selection) => {
-                Some(format!("Install {}", selection.fetched.repository.alias))
-            }
+            Task::InstallRepository(selection) => Some(format!(
+                "Install {}",
+                selection.fetched.repository.display_name()
+            )),
             Task::Install { reference, .. } => Some(format!("Install {reference}")),
             Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
             Task::Prepare(key) => Some(format!("Prepare update: {key}")),
@@ -1309,6 +1397,25 @@ impl App {
             Tab::Health => self.health.draw(f, rows[1], &ctx),
             Tab::Repos => self.repos.draw(f, rows[1], &ctx),
         }
+        if self.focus == AppFocus::Tabs {
+            let th = &self.settings.theme;
+            for y in rows[1].y..rows[1].bottom() {
+                for x in rows[1].x..rows[1].right() {
+                    let cell = &mut f.buffer_mut()[(x, y)];
+                    if cell.fg == th.border_focus {
+                        cell.fg = th.border;
+                    }
+                    if cell.bg == th.selection_bg {
+                        cell.bg = ratatui::style::Color::Reset;
+                    }
+                    cell.modifier.remove(Modifier::BOLD);
+                    cell.modifier.insert(Modifier::DIM);
+                }
+            }
+            if let Some((rect, _)) = self.tab_rects.iter().find(|(_, t)| *t == self.tab) {
+                f.set_cursor_position((rect.x, rect.y));
+            }
+        }
         self.draw_footer(f, rows[2]);
         if let Some(m) = self.modal.as_mut() {
             m.draw(f, area, &ctx);
@@ -1360,7 +1467,11 @@ impl App {
                 format!(" {} {} ", i + 1, t.title())
             };
             let style = if *t == self.tab {
-                th.selected()
+                if self.focus == AppFocus::Tabs {
+                    th.selected().add_modifier(Modifier::BOLD)
+                } else {
+                    th.bold()
+                }
             } else {
                 th.dim()
             };
@@ -1421,6 +1532,8 @@ impl App {
             &[("…", "saving changes")][..]
         } else if let Some(m) = &self.modal {
             m.hints()
+        } else if self.focus == AppFocus::Tabs {
+            &[("←→/Tab", "tabs"), ("Enter/↓", "enter"), ("Esc/q", "quit")][..]
         } else {
             match self.tab {
                 Tab::Search => self.search.hints(),
@@ -1934,33 +2047,30 @@ mod matrix_key_tests {
             1,
             "12/30 complete · querying printer…".into(),
         ));
-        for tab in [
-            Tab::Tags,
-            Tab::Presets,
-            Tab::Agents,
-            Tab::Health,
-            Tab::Repos,
-        ] {
+        for tab in Tab::ALL {
             app.switch_tab(tab);
-            app.handle(Msg::Key(KeyEvent::new(
-                KeyCode::Char('q'),
-                KeyModifiers::NONE,
-            )));
-            assert_eq!(app.tab, Tab::Search);
-            assert!(!app.quit);
-            assert!(app.quit_prompt.is_none());
-            assert_eq!(app.tasks_running, 1);
-        }
-        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        if app.quit_prompt.is_none() {
+            app.enter_page();
+            for _ in 0..8 {
+                if app.focus == AppFocus::Tabs {
+                    break;
+                }
+                app.handle(Msg::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::NONE,
+                )));
+                assert_eq!(app.tab, tab);
+                assert!(!app.quit);
+                assert!(app.quit_prompt.is_none());
+            }
+            assert_eq!(app.focus, AppFocus::Tabs);
             app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+            assert!(
+                app.quit_prompt.is_some(),
+                "tab strip uses the running-work quit guard"
+            );
+            app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+            assert!(!app.quit);
         }
-        assert!(
-            app.quit_prompt.is_some(),
-            "empty Search Esc must use the quit guard"
-        );
-        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(!app.quit);
         app.modal = Some(Modal::set_source("printer", None));
         app.handle(Msg::Paste("https://example.com/team/tools".into()));
         app.batch_running = true;
@@ -2134,6 +2244,7 @@ mod matrix_key_tests {
             let fetched = skills::repository::FetchedRepository {
                 repository: skills::repository::Repository {
                     kind: Default::default(),
+                    name: None,
                     alias: reference.into(),
                     url: format!("https://example.com/sample/{reference}"),
                     branch: "main".into(),
@@ -2164,6 +2275,7 @@ mod matrix_key_tests {
             panic!("expected first result")
         };
         assert_eq!(picker.selection.fetched.repository.alias, "first");
+        app.handle(key(KeyCode::Enter)); // Leave candidate search input.
         app.handle(key(KeyCode::Esc));
         let Some(Modal::Repository(picker)) = &app.modal else {
             panic!("expected second result")
@@ -2171,6 +2283,7 @@ mod matrix_key_tests {
         assert_eq!(picker.selection.fetched.repository.alias, "second");
         assert!(!root.join(".downloads/first").exists());
         assert!(root.join(".downloads/second").exists());
+        app.handle(key(KeyCode::Enter)); // Leave candidate search input.
         app.handle(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert!(app.pending_task_ui.is_empty());
@@ -2260,7 +2373,7 @@ mod matrix_key_tests {
         assert!(app.on_key(key(KeyCode::Char('M'))).is_empty());
         assert!(matches!(
             app.on_key(key(KeyCode::Tab)).as_slice(),
-            [Action::SwitchTab(Tab::Health)]
+            [Action::SwitchTab(Tab::Repos)]
         ));
         assert!(matches!(
             app.on_key(key(KeyCode::BackTab)).as_slice(),
@@ -2273,7 +2386,7 @@ mod matrix_key_tests {
         assert!(app.on_key(key(KeyCode::Esc)).is_empty());
         assert!(matches!(
             app.on_key(key(KeyCode::Tab)).as_slice(),
-            [Action::SwitchTab(Tab::Health)]
+            [Action::SwitchTab(Tab::Repos)]
         ));
         assert!(matches!(
             app.on_key(key(KeyCode::BackTab)).as_slice(),
@@ -2414,5 +2527,259 @@ mod panel_navigation_tests {
         assert!(app.on_key(key(KeyCode::Tab)).is_empty());
         assert!(app.modal.is_some());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod escape_hierarchy_tests {
+    use super::*;
+
+    #[test]
+    fn mouse_tab_selection_keeps_the_page_active() {
+        let (_root, mut app) = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        for tab in [Tab::Agents, Tab::Agents, Tab::Search] {
+            app.focus = AppFocus::Tabs;
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let rect = app.tab_rects.iter().find(|(_, t)| *t == tab).unwrap().0;
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(app.tab, tab);
+            assert_eq!(app.focus, AppFocus::Page);
+        }
+    }
+
+    fn app() -> (skills::ops::DownloadDir, App) {
+        let root = skills::ops::DownloadDir::new("escape-hierarchy").unwrap();
+        Config {
+            agents: vec![],
+            tags: vec![skills::config::TagConfig {
+                name: "sample".into(),
+                skills: vec!["sample".into()],
+                color: None,
+                description: None,
+            }],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("sample")).unwrap();
+        std::fs::write(
+            root.path().join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: sample\n---\nBody",
+        )
+        .unwrap();
+        let ws = Workspace::open(root.path()).unwrap();
+        ws.presets
+            .save(&skills::preset::Preset {
+                name: "sample".into(),
+                skills: vec!["sample".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        (root, App::new(ws, tx).unwrap())
+    }
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn library_down_from_tabs_enters_search_before_results() {
+        let (_root, mut app) = app();
+        app.apply(Action::SwitchTab(Tab::Search));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, AppFocus::Page);
+        assert!(app.search.input_focused());
+        key(&mut app, KeyCode::Down);
+        assert!(!app.search.input_focused());
+        key(&mut app, KeyCode::Up);
+        assert!(app.search.input_focused());
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, AppFocus::Tabs);
+        assert_eq!(app.tab, Tab::Search);
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn split_pages_follow_spatial_search_and_result_navigation() {
+        let (_root, mut app) = app();
+        let input = |app: &App| match app.tab {
+            Tab::Tags => app.tags.input_focused(),
+            Tab::Presets => app.presets.input_focused(),
+            Tab::Repos => app.repos.input_focused(),
+            _ => false,
+        };
+        for tab in [Tab::Tags, Tab::Presets, Tab::Repos] {
+            app.apply(Action::SwitchTab(tab));
+            key(&mut app, KeyCode::Down);
+            assert!(input(&app), "top left search {tab:?}");
+            key(&mut app, KeyCode::Right);
+            assert!(input(&app), "right search {tab:?}");
+            key(&mut app, KeyCode::Down);
+            assert!(!input(&app), "right results {tab:?}");
+            key(&mut app, KeyCode::Up);
+            assert!(input(&app), "right search from cards {tab:?}");
+            key(&mut app, KeyCode::Left);
+            assert!(input(&app), "left search {tab:?}");
+            key(&mut app, KeyCode::Down);
+            assert!(!input(&app), "left results {tab:?}");
+            key(&mut app, KeyCode::Right);
+            assert!(!input(&app), "right results from left results {tab:?}");
+            key(&mut app, KeyCode::Up);
+            key(&mut app, KeyCode::Up);
+            assert_eq!(app.focus, AppFocus::Tabs, "up through right search {tab:?}");
+            assert_eq!(app.tab, tab);
+            assert!(!app.quit);
+        }
+    }
+
+    #[test]
+    fn health_down_enters_filter_before_results() {
+        let (_root, mut app) = app();
+        app.apply(Action::SwitchTab(Tab::Health));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.focus, AppFocus::Page);
+        assert!(app.health.input_focused());
+        key(&mut app, KeyCode::Down);
+        assert!(!app.health.input_focused());
+        key(&mut app, KeyCode::Up);
+        assert!(app.health.input_focused());
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.focus, AppFocus::Tabs);
+    }
+
+    #[test]
+    fn up_reaches_tabs_from_all_roots_and_nested_skill_panels() {
+        let (_root, mut app) = app();
+        for tab in Tab::ALL {
+            app.apply(Action::SwitchTab(tab));
+            key(&mut app, KeyCode::Enter);
+            key(&mut app, KeyCode::Home);
+            for _ in 0..3 {
+                if app.focus == AppFocus::Tabs {
+                    break;
+                }
+                key(&mut app, KeyCode::Up);
+            }
+            assert_eq!(app.focus, AppFocus::Tabs, "root {tab:?}");
+            assert_eq!(app.tab, tab);
+            assert!(!app.quit);
+        }
+        for tab in [Tab::Tags, Tab::Presets, Tab::Repos] {
+            app.apply(Action::SwitchTab(tab));
+            key(&mut app, KeyCode::Enter);
+            key(&mut app, KeyCode::Enter);
+            for _ in 0..5 {
+                if app.focus == AppFocus::Tabs {
+                    break;
+                }
+                key(&mut app, KeyCode::Up);
+            }
+            assert_eq!(app.focus, AppFocus::Tabs, "nested {tab:?}");
+            assert_eq!(app.tab, tab);
+        }
+    }
+
+    #[test]
+    fn tab_strip_is_a_distinct_level_and_all_roots_return_without_switching() {
+        let (_root, mut app) = app();
+        assert_eq!(app.focus, AppFocus::Page);
+        assert!(app.search.input_focused());
+        for tab in Tab::ALL {
+            app.apply(Action::SwitchTab(tab));
+            assert_eq!(app.focus, AppFocus::Tabs);
+            key(&mut app, KeyCode::Enter);
+            assert_eq!(app.focus, AppFocus::Page);
+            key(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus, AppFocus::Tabs, "{tab:?}");
+            assert_eq!(app.tab, tab);
+            assert!(!app.quit);
+        }
+        app.settings.tags_enabled = false;
+        app.apply(Action::SwitchTab(Tab::Search));
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.tab, Tab::Presets);
+        assert_eq!(app.focus, AppFocus::Tabs);
+        key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.tab, Tab::Health);
+        key(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn child_panels_clear_search_then_return_to_left_then_tabs() {
+        let (_root, mut app) = app();
+        for tab in [Tab::Tags, Tab::Presets, Tab::Repos] {
+            app.apply(Action::SwitchTab(tab));
+            key(&mut app, KeyCode::Enter); // page root
+            key(&mut app, KeyCode::Enter); // child skill panel
+            key(&mut app, KeyCode::Char('/'));
+            app.handle(Msg::Paste("sample".into()));
+            key(&mut app, KeyCode::Esc); // clear input
+            assert_eq!(app.focus, AppFocus::Page);
+            key(&mut app, KeyCode::Esc); // input -> results
+            key(&mut app, KeyCode::Esc); // results -> left
+            assert_eq!(app.focus, AppFocus::Page, "{tab:?}");
+            key(&mut app, KeyCode::Esc); // left -> tabs
+            assert_eq!(app.focus, AppFocus::Tabs, "{tab:?}");
+            assert_eq!(app.tab, tab);
+        }
+    }
+
+    #[test]
+    fn library_back_closes_preview_then_multi_then_filter_and_keeps_q_as_text() {
+        let (_root, mut app) = app();
+        key(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.search.query(), "q");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.search.input_focused());
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.search.input_focused());
+        key(&mut app, KeyCode::Char('/'));
+        app.handle(Msg::Paste("sample".into()));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('m'));
+        key(&mut app, KeyCode::Enter); // preview
+        key(&mut app, KeyCode::Esc); // close preview, keep multi and query
+        assert_eq!(app.search.query(), "sample");
+        key(&mut app, KeyCode::Esc); // cancel multi
+        assert_eq!(app.search.query(), "sample");
+        key(&mut app, KeyCode::Char('q')); // clear query
+        assert!(app.search.query().is_empty());
+        assert_eq!(app.focus, AppFocus::Page);
+        key(&mut app, KeyCode::Esc); // tabs
+        assert_eq!(app.focus, AppFocus::Tabs);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("enter") && text.contains("quit"));
+        let point = (app.body.x + 2, app.body.y + 2);
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: point.0,
+            row: point.1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.focus, AppFocus::Tabs);
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: point.0,
+            row: point.1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.focus, AppFocus::Page);
     }
 }

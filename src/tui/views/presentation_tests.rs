@@ -25,15 +25,15 @@ fn pills_share_coverage_spacing_focus_and_width_for_every_cap_style() {
             ((1, 28), " ◐ lark 1/28 "),
             ((28, 28), " ✓ lark 28/28 "),
         ] {
-            let pill = Pill {
+            let pill = TagLabel {
                 coverage: Some(coverage),
-                ..Pill::new("lark", theme.tag)
+                ..TagLabel::new("lark", theme.tag)
             };
             let spans = pill.render(&ctx, 100);
             assert_eq!(spans[1].content, text);
             assert_eq!(spans[0].content, caps.glyphs().0);
             assert_eq!(spans[2].content, caps.glyphs().1);
-            let selected = Pill {
+            let selected = TagLabel {
                 selected: true,
                 focused: true,
                 ..pill
@@ -62,12 +62,182 @@ fn pills_share_coverage_spacing_focus_and_width_for_every_cap_style() {
 use crate::tui::{
     app::Ctx,
     components::{
-        group::Pill,
+        group::TagLabel,
         skill::{SkillPresentation, SkillRenderState, display_name, summary_lines},
     },
     theme::Theme,
 };
-use ratatui::{style::Modifier, text::Span};
+use ratatui::{
+    style::{Color, Modifier},
+    text::Span,
+};
+
+#[test]
+fn group_badges_share_focus_and_colour_with_distinct_text_and_nerd_outlines() {
+    use crate::tui::components::group::{Badge, Kind};
+    let root = skills::ops::DownloadDir::new("badge-outline").unwrap();
+    let ws = skills::Workspace::open(root.path()).unwrap();
+    let snap = ws.scan().unwrap();
+    for icons in [skills::config::Icons::Nerd, skills::config::Icons::Text] {
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        settings.ui.icons = icons;
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let tag = Badge::for_kind(Kind::Tag, "tools", settings.theme.tag).render(&ctx, 30);
+        let preset = Badge::for_kind(Kind::Preset, "tools", settings.theme.tag).render(&ctx, 30);
+        assert_eq!(tag[1], preset[1]);
+        assert_ne!(tag[0].content, preset[0].content);
+        assert_ne!(tag[2].content, preset[2].content);
+        if icons == skills::config::Icons::Text {
+            assert_eq!(
+                tag.iter().map(|s| s.content.as_ref()).collect::<String>(),
+                "( tools )"
+            );
+            assert_eq!(
+                preset
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                "/ tools /"
+            );
+        }
+        for kind in [Kind::Tag, Kind::Preset] {
+            let badge = Badge {
+                selected: true,
+                focused: true,
+                ..Badge::for_kind(kind, "中文 👩‍💻 tools", settings.theme.tag)
+            };
+            for width in 0..30 {
+                let spans = badge.render(&ctx, width);
+                assert!(spans.iter().map(Span::width).sum::<usize>() <= width);
+                if let Some(body) = spans.get(1) {
+                    assert!(
+                        body.style
+                            .add_modifier
+                            .contains(Modifier::BOLD | Modifier::UNDERLINED)
+                    );
+                    assert_eq!(body.style.bg, tag[1].style.bg);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_membership_metadata_is_shared_sorted_and_independent_of_tag_visibility() {
+    use skills::preset::{Preset, PresetStore};
+    let root = skills::ops::DownloadDir::new("membership-presentation").unwrap();
+    let keys = ["repos/one--tools/review", "repos/two--tools/review"];
+    for key in keys {
+        std::fs::create_dir_all(root.path().join(key)).unwrap();
+        std::fs::write(
+            root.path().join(key).join("SKILL.md"),
+            "---\nname: review\ndescription: Review code\n---\nReview",
+        )
+        .unwrap();
+    }
+    let mut ws = skills::Workspace::open(root.path()).unwrap();
+    ws.config.tags = ["zeta", "alpha"]
+        .into_iter()
+        .map(|name| skills::config::TagConfig {
+            name: name.into(),
+            color: Some("#b87e54".into()),
+            description: None,
+            skills: vec![keys[0].into()],
+        })
+        .collect();
+    for name in ["Zed", "Pack"] {
+        PresetStore::new(root.path())
+            .save(&Preset {
+                name: name.into(),
+                color: Some("#8c7ba3".into()),
+                skills: vec![keys[0].into()],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let snap = ws.scan().unwrap();
+    let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+    settings.ui.icons = skills::config::Icons::Text;
+    let ctx = Ctx {
+        ws: &ws,
+        snap: &snap,
+        settings: &settings,
+    };
+    let record = snap.get(keys[0]).unwrap();
+    assert_eq!(record.presets, ["Pack", "Zed"]);
+    assert!(snap.get(keys[1]).unwrap().presets.is_empty());
+    let skill = SkillPresentation::managed(record, &ctx);
+    let state = SkillRenderState::default();
+    assert_eq!(skill.card(&ctx, 100, &state).len(), 4);
+    for lines in [
+        skill.card(&ctx, 100, &state),
+        skill.list(&ctx, 100, true, &state),
+        skill.compact(&ctx, 120, true, &state),
+    ] {
+        let text = lines.iter().map(ToString::to_string).collect::<String>();
+        assert!(text.contains("( alpha ) +1"), "{text}");
+        assert!(text.contains("/ Pack / +1"), "{text}");
+        assert!(!text.contains("zeta") && !text.contains("Zed"));
+        let spans = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans
+                .iter()
+                .find(|s| s.content.contains("alpha"))
+                .unwrap()
+                .style
+                .bg,
+            Some(Color::Rgb(184, 126, 84))
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .find(|s| s.content.contains("Pack"))
+                .unwrap()
+                .style
+                .bg,
+            Some(Color::Rgb(140, 123, 163))
+        );
+    }
+    for columns in 0..100 {
+        for lines in [
+            skill.card(&ctx, columns, &state),
+            skill.list(&ctx, columns, false, &state),
+            skill.compact(&ctx, columns, false, &state),
+        ] {
+            assert!(
+                lines.iter().all(|line| line.width() <= columns),
+                "width={columns}: {lines:?}"
+            );
+        }
+    }
+    let preview = super::preview::preview_lines(record, &ctx, &[], 20);
+    let text = preview.iter().map(ToString::to_string).collect::<String>();
+    for name in ["alpha", "zeta", "Pack", "Zed"] {
+        assert!(text.contains(name), "{text}");
+    }
+    let mut settings = settings.clone();
+    settings.tags_enabled = false;
+    let ctx = Ctx {
+        settings: &settings,
+        ..ctx
+    };
+    for lines in [
+        skill.card(&ctx, 100, &state),
+        skill.compact(&ctx, 120, false, &state),
+        super::preview::preview_lines(record, &ctx, &[], 20),
+    ] {
+        let text = lines.iter().map(ToString::to_string).collect::<String>();
+        assert!(!text.contains("alpha") && !text.contains("zeta"));
+        assert!(text.contains("Pack"), "{text}");
+    }
+}
 
 #[test]
 fn summaries_wrap_readable_markdown_and_keep_graphemes_intact() {

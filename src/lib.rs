@@ -31,6 +31,7 @@ pub struct Workspace {
     pub config: config::Config,
     pub meta: meta::MetaStore,
     pub presets: preset::PresetStore,
+    pub preset_migration: Option<preset::MigrationReport>,
 }
 
 impl Workspace {
@@ -39,9 +40,12 @@ impl Workspace {
         // particular, macOS /var and /private/var can name the same directory.
         let root = paths::resolve_root(Some(root))?;
         let config = config::Config::load(&root)?;
+        let presets = preset::PresetStore::new(&root);
+        let preset_migration = presets.migrate_legacy_tags(&config)?;
         Ok(Self {
             meta: meta::MetaStore::new(&root),
-            presets: preset::PresetStore::new(&root),
+            presets,
+            preset_migration,
             root,
             project: None,
             inventory_project: None,
@@ -65,6 +69,7 @@ impl Workspace {
         let mut ws = Self {
             meta: meta::MetaStore::new(&root),
             presets: preset::PresetStore::new(&root),
+            preset_migration: None,
             root,
             project: Some(project),
             inventory_project: None,
@@ -72,6 +77,7 @@ impl Workspace {
             config: config::Config::local_default(),
         };
         ws.config = ws.load_config()?;
+        ws.preset_migration = ws.presets.migrate_legacy_tags(&ws.config)?;
         Ok(ws)
     }
 

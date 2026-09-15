@@ -60,11 +60,14 @@ pub enum Command {
     Migrate { old: String, new: String },
     /// Install skills from a Git repository, archive URL, or local path
     #[command(
-        long_about = "Install skills from a Git repository, archive URL, or local path.\n\nArchive URLs use curl to download and follow HTTP(S) redirects. ZIP, TAR, TAR.GZ, TAR.BZ2, and TAR.XZ are detected from the downloaded content. Paths inside the archive are preserved, including any top-level directory: use --list to discover paths, then --select or --subpath to choose skills. Naming, deployment, and update options are shared with Git sources."
+        long_about = "Install skills from a Git repository, archive URL, or local path.\n\nArchive URLs use curl to download and follow HTTP(S) redirects. ZIP, TAR, TAR.GZ, TAR.BZ2, and TAR.XZ are detected from the downloaded content. Paths inside the archive are preserved, including any top-level directory: use --list to discover paths, then --select or --subpath to choose skills.\n\nUse --source-name NAME to name a URL package before installing. Git sources default to owner/repo. Source names are independent of --repo-alias (storage directory) and --name (one skill's local name)."
     )]
     Install(InstallArgs),
-    /// List registered repositories and their installed skills
-    Repos,
+    /// List or rename Git repositories and URL packages
+    Repos {
+        #[command(subcommand)]
+        command: Option<ReposCommand>,
+    },
     /// Bring an existing skill directory under management
     Adopt {
         path: PathBuf,
@@ -104,13 +107,13 @@ pub enum Command {
     },
     /// Agent directories
     Agents(AgentsArgs),
-    /// Presets: named groups of skills
+    /// Preset packages with fixed skill members
     Preset(PresetArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
-    /// Free text; supports tag:, agent:, status:, source: prefixes
+    /// Free text; supports tag:, preset:, repo:, agent:, status:, source: prefixes
     pub query: Vec<String>,
     #[arg(long, short = 't')]
     pub tag: Vec<String>,
@@ -184,9 +187,12 @@ pub enum NoteCommand {
 
 #[derive(Args, Debug)]
 pub struct InstallArgs {
-    /// Local repository alias; defaults to a name derived from the source URL
+    /// Internal storage directory alias; independent of the display name
     #[arg(long)]
     pub repo_alias: Option<String>,
+    /// Display name; required for new URL packages, defaults to owner/repo for Git
+    #[arg(long, value_name = "NAME")]
+    pub source_name: Option<String>,
     /// List discovered skill paths without installing
     #[arg(long)]
     pub list: bool,
@@ -201,6 +207,7 @@ pub struct InstallArgs {
     pub local_names: Vec<String>,
     /// Path, owner/repo[/subpath], GitHub tree URL, Git URL, or archive URL
     pub reference: String,
+    /// Local name for a single selected skill; does not name the source package
     #[arg(long)]
     pub name: Option<String>,
     /// Git branch or tag (not applicable to archive URLs)
@@ -211,6 +218,12 @@ pub struct InstallArgs {
     /// Deploy to these agents right after installing
     #[arg(long = "deploy", value_name = "AGENT")]
     pub deploy_to: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReposCommand {
+    /// Change a source's display name without moving directories or skill links
+    Rename { alias: String, name: String },
 }
 
 #[derive(Args, Debug)]
@@ -342,19 +355,28 @@ pub enum PresetCommand {
         agents: Vec<String>,
         #[arg(long = "skill", value_name = "SKILL")]
         skills: Vec<String>,
+        /// Add a snapshot of each tag's current members
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     Delete {
         name: String,
         #[arg(long, short)]
         yes: bool,
     },
+    /// Add skills, optionally selecting each tag's current members
     Add {
         name: String,
         skills: Vec<String>,
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
+    /// Remove skills, optionally selecting each tag's current members
     Remove {
         name: String,
         skills: Vec<String>,
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     Deploy {
         name: String,
@@ -446,6 +468,13 @@ pub fn run(cli: Cli) -> Result<()> {
         )
     );
     let ws = cli.workspace(create)?;
+    if let Some(report) = &ws.preset_migration {
+        eprintln!(
+            "Migrated {} presets to fixed members; original files: {}",
+            report.migrated_names.len(),
+            report.backup_dir.display()
+        );
+    }
     let command = cli
         .command
         .expect("dispatcher only calls run with a subcommand");
@@ -547,11 +576,24 @@ pub fn run(cli: Cli) -> Result<()> {
                 cmd_check(&ctx, skill, all)
             }
         }
-        Command::Repos => {
+        Command::Repos {
+            command: Some(ReposCommand::Rename { alias, name }),
+        } => {
+            let repo = skills::repository::Repository::rename(&ctx.ws, &alias, &name)?;
+            ctx.out(&repo, || {
+                println!("{}: {}", repo.alias, repo.display_name())
+            })
+        }
+        Command::Repos { command: None } => {
             let repositories = skills::repository::Repository::list(&ctx.ws.root)?;
             ctx.out(&repositories, || {
                 for repo in &repositories {
-                    println!("{}  {}", repo.alias, repo.source("", None).summary());
+                    println!(
+                        "{} [{}]  {}",
+                        repo.display_name(),
+                        repo.alias,
+                        repo.source("", None).summary()
+                    );
                 }
             })
         }
@@ -591,8 +633,10 @@ struct ListRow<'a> {
     name: Option<&'a str>,
     status: &'static str,
     tags: &'a [String],
+    presets: &'a [String],
     deployed: Vec<&'a str>,
     source: Option<&'static str>,
+    source_name: Option<&'a str>,
     description: Option<&'a str>,
     score: f32,
     matched: Vec<skills::search::Field>,
@@ -625,8 +669,10 @@ fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
                 name: r.name.as_deref(),
                 status: r.status.label(),
                 tags: &r.tags,
+                presets: &r.presets,
                 deployed: r.deployed_to(),
                 source: r.source.as_ref().map(|s| s.kind()),
+                source_name: r.source_display_name(),
                 description: r.description.as_deref(),
                 score: h.score,
                 matched: h.fields.clone(),
@@ -720,6 +766,9 @@ fn cmd_show(ctx: &Ctx, key: &str) -> Result<()> {
                 .map(|s| s.summary())
                 .unwrap_or_else(|| "-".into())
         );
+        if let Some(name) = r.source_display_name() {
+            println!("source name: {name}");
+        }
         let dep: Vec<String> = r
             .deploy
             .iter()
@@ -957,9 +1006,30 @@ pub fn edit_in_editor(initial: &str) -> Result<Option<String>> {
 fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
     let r = install::parse_ref(&a.reference, a.branch.as_deref(), a.subpath.as_deref())?;
     if r.is_remote() {
-        let fetched =
+        if let Some(name) = &a.source_name {
+            skills::repository::validate_name(name)?;
+        } else if !a.list && matches!(&r, install::InstallRef::Archive { .. }) {
+            let named = skills::repository::Repository::list(&ctx.ws.root)?
+                .iter()
+                .any(|repo| {
+                    repo.kind == skills::meta::SourceKind::Archive
+                        && Some(repo.url.as_str()) == r.url()
+                        && repo
+                            .name
+                            .as_ref()
+                            .is_some_and(|name| !name.trim().is_empty())
+                });
+            anyhow::ensure!(
+                named,
+                "URL packages need a display name: use --source-name NAME (or --list to inspect the archive first)"
+            );
+        }
+        let mut fetched =
             skills::repository::FetchedRepository::fetch(&ctx.ws, &r, a.repo_alias.as_deref())?;
         let result = (|| {
+            if let Some(name) = &a.source_name {
+                fetched.repository.set_name(name)?;
+            }
             let paths: Vec<String> = if a.all {
                 fetched
                     .choices
@@ -991,7 +1061,7 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
             };
             if a.list || paths.is_empty() {
                 return ctx.out(&serde_json::json!({"repository": fetched.repository, "choices": fetched.choices, "invalid": fetched.invalid, "installed": []}), || {
-                    println!("{} — select paths with --select PATH or --all", fetched.repository.alias);
+                    println!("{} — select paths with --select PATH or --all", fetched.repository.display_name());
                     for path in &fetched.choices {
                         let display = if path.is_empty() { "." } else { path };
                         if let Some(error) = fetched.invalid.get(path) { println!("{display} [invalid: {error}]"); }
@@ -1048,6 +1118,10 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
         fetched.cleanup();
         return result;
     }
+    anyhow::ensure!(
+        a.source_name.is_none(),
+        "--source-name applies to Git repositories and URL packages, not local skills"
+    );
     let key = install::install(&ctx.ws, &r, a.name.as_deref())?;
     let mut actions = Vec::new();
     if !a.deploy_to.is_empty() {
@@ -1464,7 +1538,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                     println!(
                         "{:<20} {:>3} skills  agents: {}",
                         p.name,
-                        p.skills.len(),
+                        p.members().len(),
                         if p.agents.is_empty() {
                             "all".into()
                         } else {
@@ -1487,6 +1561,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
             description,
             agents,
             skills,
+            tags,
         } => {
             if store.load(&name)?.is_some() {
                 bail!("preset {name} already exists");
@@ -1497,13 +1572,16 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                     .agent(a)
                     .with_context(|| format!("unknown agent: {a}"))?;
             }
-            let p = Preset {
+            let mut skills = skills;
+            skills.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
+            let mut p = Preset {
                 name: name.clone(),
                 description,
                 skills,
                 agents,
                 color: None,
             };
+            p.skills = p.members();
             store.save(&p)?;
             ctx.out(&p, || println!("created preset {name}"))
         }
@@ -1516,23 +1594,25 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                 println!("deleted preset {name}")
             })
         }
-        PresetCommand::Add { name, skills } => {
+        PresetCommand::Add { name, skills, tags } => {
             let mut p = store
                 .load(&name)?
                 .with_context(|| format!("no such preset: {name}"))?;
-            for s in skills {
-                if !p.skills.contains(&s) {
-                    p.skills.push(s);
-                }
-            }
+            p.skills
+                .extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
+            p.skills.extend(skills);
+            p.skills = p.members();
             store.save(&p)?;
             ctx.out(&p, || println!("{name}: {}", p.skills.join(", ")))
         }
-        PresetCommand::Remove { name, skills } => {
+        PresetCommand::Remove { name, skills, tags } => {
             let mut p = store
                 .load(&name)?
                 .with_context(|| format!("no such preset: {name}"))?;
-            p.skills.retain(|s| !skills.contains(s));
+            let mut selected = skills;
+            selected.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
+            p.skills.retain(|s| !selected.contains(s));
+            p.skills = p.members();
             store.save(&p)?;
             ctx.out(&p, || println!("{name}: {}", p.skills.join(", ")))
         }
@@ -1582,24 +1662,11 @@ fn preset_links(ctx: &Ctx, name: &str, agents: &[String], dry_run: bool, on: boo
         ctx.ws.config.agent_keys()
     };
     let snap = ctx.ws.scan()?;
-    // Members that are absent are reported as skips instead of aborting the whole preset.
-    let (present, absent): (Vec<String>, Vec<String>) = p
-        .skills
-        .iter()
-        .cloned()
-        .partition(|s| snap.get(s).is_some());
-    let mut actions = if on {
-        deploy::plan_deploy(&ctx.ws, &snap, &present, &targets)?
+    let actions = if on {
+        deploy::plan_preset_activate(&ctx.ws, &snap, &p, &targets)?
     } else {
-        deploy::plan_undeploy(&ctx.ws, &snap, &present, &targets)?
+        deploy::plan_preset_deactivate(&ctx.ws, &snap, &p, &targets)?
     };
-    for s in absent {
-        actions.push(Action::Skip {
-            agent: "*".into(),
-            skill: s,
-            reason: "not in skills root".into(),
-        });
-    }
     run_actions(ctx, &actions, dry_run)
 }
 
