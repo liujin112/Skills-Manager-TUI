@@ -23,7 +23,9 @@ pub fn query_token_ranges(input: &str) -> Vec<Range<usize>> {
         if first.is_whitespace() {
             continue;
         }
-        let quoted_source = input[start..].starts_with("repo:\"");
+        let quoted_source = ["repo:\"", "tag:\"", "preset:\""]
+            .iter()
+            .any(|prefix| input[start..].starts_with(prefix));
         let mut quoted = false;
         let mut escaped = false;
         let mut end = start + first.len_utf8();
@@ -95,11 +97,11 @@ impl Query {
                 if v.is_empty() {
                     q.untagged = true;
                 } else {
-                    q.tags.push(v.to_lowercase());
+                    q.tags.push(source_query_value(v).to_lowercase());
                 }
             } else if let Some(v) = tok.strip_prefix("preset:") {
                 if !v.is_empty() {
-                    q.presets.push(v.to_lowercase());
+                    q.presets.push(source_query_value(v).to_lowercase());
                 }
             } else if let Some(v) = tok.strip_prefix("agent:") {
                 if !v.is_empty() {

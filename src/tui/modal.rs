@@ -1794,12 +1794,14 @@ Staged selection dialogs
   o                 preview a skill in the member selector
   Esc / q           cancel without applying; search input and preview return first
 Agents
-  /                 filter presets or skills, according to focus
-  arrows            navigate agents, scopes and skills
-  Esc / q           skills → scope → agent → tab strip
-  Enter             browse the focused Preset / Tag, or preview the focused skill
-  i / x             apply / uninstall the focused Preset, or install / uninstall skills
-  Tag badges        browse members and inspect coverage; do not deploy a group
+  /                 filter skills
+  arrows            agents → scopes → deployment groups → search → filter badges → skills
+  Esc / q           clear skill filter, then groups → scope → agent → tab strip
+  Enter / click     toggle group deployment: partial/empty installs all, full uninstalls all; 0/0 ignored
+  +N presets/tags    expand hidden deployment groups; Esc closes without changes
+  Skill badges      Left/Right selects; Enter/Space toggles a filter, preserving text and other fields
+  Bold + underline  currently applied group filter in the skills panel
+  i / x             install / uninstall skills
   m                 multi-uninstall skills
   v                 change skill layout
   [ / ]             previous / next agent

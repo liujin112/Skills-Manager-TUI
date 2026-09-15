@@ -481,6 +481,7 @@ fn agent_skill_filter_survives_refresh_without_filtering_coverage() {
     view.discover(&ws.root).unwrap();
     view.refresh(&ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);
+    view.handle_key(key(KeyCode::Enter), &ctx);
     view.handle_key(key(KeyCode::Char('/')), &ctx);
     assert!(view.editing());
     view.paste("bndl", &ctx);
@@ -497,8 +498,14 @@ fn agent_skill_filter_survives_refresh_without_filtering_coverage() {
         .map(|c| c.symbol())
         .collect();
     assert!(text.contains("skills") && text.contains("bndl"));
-    assert!(!text.contains("bundle"), "uninstalled preset is absent");
-    assert!(!text.contains("unrelated"), "empty preset is absent");
+    assert!(
+        text.contains("bundle"),
+        "uninstalled preset is offered for deployment"
+    );
+    assert!(
+        text.contains("unrelated"),
+        "empty preset is offered with zero count"
+    );
     assert_eq!(ws.presets.list().unwrap().len(), 2);
     std::fs::remove_dir_all(&ws.root).unwrap();
 }

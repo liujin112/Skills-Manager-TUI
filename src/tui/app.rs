@@ -810,6 +810,9 @@ impl App {
                 _ => return vec![],
             }
         }
+        if self.tab == Tab::Agents && self.agents.group_popup_open() {
+            return self.agents.handle_key(k, &ctx);
+        }
         if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
             if self.tab == Tab::Tags && self.tags.dialog_open() {
                 return vec![];
@@ -913,6 +916,9 @@ impl App {
         };
         if let Some(modal) = self.modal.as_mut() {
             return modal.handle_mouse(m, &ctx);
+        }
+        if self.tab == Tab::Agents && self.agents.group_popup_open() {
+            return self.agents.handle_mouse(m, &ctx);
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind
             && let Some((_, tab)) = self

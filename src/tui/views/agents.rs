@@ -27,9 +27,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use skills::config::UiLayout;
-use skills::ops::deploy::{
-    self, PresetStatus, plan_preset_activate, plan_preset_deactivate, preset_status,
-};
+use skills::ops::deploy::{self, PresetStatus, preset_status};
 use skills::preset::{Preset, TagCoverage, tag_coverages};
 
 use skills::reconcile::{AgentDirMode, EntryState};
@@ -42,8 +40,8 @@ mod groups;
 enum Focus {
     Agents,
     Scopes,
-    Presets,
-    Tags,
+    Groups,
+    Filters,
     Entries,
 }
 
@@ -104,8 +102,9 @@ pub struct AgentsView {
     focus: FocusState,
     group_rects: [Rect; 3],
     presets: Vec<(Preset, PresetStatus)>,
-    preset_cursor: usize,
     preset_offset: usize,
+    filter_cursor: usize,
+    quick: groups::QuickGroups,
     entries: CardGrid,
     /// One per entry row, in the grid's order.
     caps: Vec<Caps>,
@@ -114,7 +113,6 @@ pub struct AgentsView {
     scope_rects: Vec<(Rect, String)>,
     preset_rects: Vec<(usize, Rect)>,
     tags: Vec<TagCoverage>,
-    tag_cursor: usize,
     tag_rects: Vec<(usize, Rect)>,
     search_panel: SearchPanel,
     content_filter_rect: Rect,
@@ -240,7 +238,7 @@ struct FocusState(Focus);
 
 impl Default for FocusState {
     fn default() -> Self {
-        FocusState(Focus::Presets)
+        FocusState(Focus::Agents)
     }
 }
 
@@ -317,6 +315,10 @@ impl AgentsView {
         Ok(())
     }
 
+    pub fn group_popup_open(&self) -> bool {
+        self.quick.popup.is_some()
+    }
+
     pub fn editing(&self) -> bool {
         self.filter_editing
     }
@@ -353,12 +355,12 @@ impl AgentsView {
         self.destination =
             (self.destination as i32 + delta).rem_euclid(self.destinations.len() as i32) as usize;
         self.entries = CardGrid::default();
-        self.preset_cursor = 0;
         self.preset_offset = 0;
         self.filter_editing = false;
         self.search_panel.input.clear();
         self.preview.close();
         self.matrix.close();
+        self.quick.reset_for_scope();
         self.refresh_scope(ctx);
     }
 
@@ -436,6 +438,10 @@ impl AgentsView {
 
     fn set_focus(&mut self, f: Focus) {
         self.focus = FocusState(f);
+        if f != Focus::Entries {
+            self.filter_editing = false;
+            self.search_panel.completion.close();
+        }
     }
 
     /// Entry rows for the current scope, grouped into ours and theirs.
@@ -553,18 +559,6 @@ impl AgentsView {
         );
     }
 
-    fn selected_preset(&self) -> Option<&(Preset, PresetStatus)> {
-        self.presets.get(self.preset_cursor)
-    }
-
-    fn before_entries(&self) -> Focus {
-        if self.presets.is_empty() {
-            Focus::Tags
-        } else {
-            Focus::Presets
-        }
-    }
-
     fn selected_caps(&self) -> Caps {
         self.entries
             .selected()
@@ -615,61 +609,6 @@ impl AgentsView {
         }
     }
 
-    fn activate(&self, ctx: &Ctx, on: bool) -> Vec<Action> {
-        if self.focus() != Focus::Presets {
-            return vec![];
-        }
-        let Some((preset, _)) = self.selected_preset() else {
-            return vec![Action::Error("no preset selected".into())];
-        };
-        self.deploy_group(ctx, preset, on)
-    }
-
-    fn deploy_group(&self, ctx: &Ctx, preset: &Preset, on: bool) -> Vec<Action> {
-        if !self.destinations.is_empty() {
-            let Some(agent) = ctx.ws.config.agent(&self.scope).cloned() else {
-                return vec![];
-            };
-            let project = self.project();
-            let keys = preset.members();
-            return vec![Action::BatchMeta(
-                Box::new({
-                    let keys = keys.clone();
-                    move |ws| {
-                        skills::ops::targets::set_deployed(
-                            ws,
-                            &agent,
-                            project.as_deref(),
-                            &keys,
-                            on,
-                        )
-                    }
-                }),
-                keys,
-            )];
-        }
-        let scope = self.scope_agents();
-        let plan = if on {
-            plan_preset_activate(ctx.ws, ctx.snap, preset, &scope)
-        } else {
-            plan_preset_deactivate(ctx.ws, ctx.snap, preset, &scope)
-        };
-        match plan {
-            // Apply the explicit toggle immediately; successful link changes
-            // produce a notification and a session undo entry.
-            Ok(actions) => vec![Action::ApplyLinks {
-                title: format!(
-                    "{} {} · {}",
-                    if on { "deploy" } else { "undeploy" },
-                    preset.name,
-                    self.scope
-                ),
-                actions,
-            }],
-            Err(e) => vec![Action::Error(format!("{e:#}"))],
-        }
-    }
-
     fn move_scope(&mut self, delta: i32, ctx: &Ctx) {
         let keys = ctx.ws.config.agent_keys();
         if keys.is_empty() {
@@ -683,18 +622,15 @@ impl AgentsView {
 }
 
 impl AgentsView {
-    /// Re-enter on the group selector with the target's complete inventory visible.
+    /// Re-enter on the agent selector with the complete scope inventory visible.
     fn enter_current(&mut self) {
-        self.set_focus(Focus::Presets);
+        self.filter_editing = false;
+        self.set_focus(Focus::Agents);
         self.preview.close();
         self.matrix.close();
     }
 
     fn refresh_current(&mut self, ctx: &Ctx) {
-        let selected_preset = self
-            .presets
-            .get(self.preset_cursor)
-            .map(|(p, _)| p.name.clone());
         // A scope pinned to an agent that is gone from the config, or never set,
         // falls back to the first one there is.
         if ctx.ws.config.agent(&self.scope).is_none() {
@@ -722,12 +658,6 @@ impl AgentsView {
                 (p, st)
             })
             .collect();
-        if let Some(index) =
-            selected_preset.and_then(|name| self.presets.iter().position(|(p, _)| p.name == name))
-        {
-            self.preset_cursor = index;
-        }
-        self.preset_cursor = self.preset_cursor.min(self.presets.len().saturating_sub(1));
         self.tags = if ctx.settings.tags_enabled {
             let deployed = ctx
                 .snap
@@ -742,10 +672,6 @@ impl AgentsView {
         } else {
             vec![]
         };
-        self.tag_cursor = self.tag_cursor.min(self.tags.len().saturating_sub(1));
-        if self.focus() == Focus::Tags && self.tags.is_empty() {
-            self.set_focus(Focus::Presets);
-        }
         let rows = self.rows(ctx);
         self.caps = rows.iter().map(|r| Caps::of(r.state)).collect();
         self.entries.clamp(rows.len());
@@ -816,15 +742,26 @@ impl AgentsView {
         if let Some(acts) = self.matrix.handle_key(k, ctx) {
             return acts;
         }
-        if !self.destinations.is_empty() {
+        if let Some(actions) = self.filter_key(k) {
+            return actions;
+        }
+        if let Some(actions) = self.quick_key(k, ctx) {
+            return actions;
+        }
+        {
             if self.filter_editing {
                 let event = self.search_panel.key(k);
                 match event {
                     SearchEvent::Up => {
                         self.filter_editing = false;
-                        self.set_focus(self.before_entries());
+                        self.set_focus(if self.quick_visible() {
+                            Focus::Groups
+                        } else {
+                            Focus::Scopes
+                        });
                     }
-                    SearchEvent::Escape | SearchEvent::Results => {
+                    SearchEvent::Results => self.focus_skill_filters(),
+                    SearchEvent::Escape => {
                         self.filter_editing = false;
                         self.set_focus(Focus::Entries);
                     }
@@ -901,7 +838,7 @@ impl AgentsView {
             }
         }
         match k.code {
-            KeyCode::Char('M') if self.focus() == Focus::Presets => {
+            KeyCode::Char('M') if matches!(self.focus(), Focus::Agents | Focus::Scopes) => {
                 self.matrix.open(ctx);
                 return vec![];
             }
@@ -911,13 +848,15 @@ impl AgentsView {
                         self.search_panel.input.clear();
                         self.entries.clamp(self.rows(ctx).len());
                     }
-                    Focus::Entries | Focus::Presets | Focus::Tags => {
-                        self.set_focus(if self.destinations.is_empty() {
-                            Focus::Agents
-                        } else {
-                            Focus::Scopes
-                        })
-                    }
+                    Focus::Entries => self.set_focus(if self.destinations.is_empty() {
+                        Focus::Agents
+                    } else if self.quick_visible() {
+                        Focus::Groups
+                    } else {
+                        Focus::Scopes
+                    }),
+                    Focus::Filters => self.focus_skill_search(),
+                    Focus::Groups => self.set_focus(Focus::Scopes),
                     Focus::Scopes => self.set_focus(Focus::Agents),
                     Focus::Agents => return vec![Action::BackToParent],
                 }
@@ -966,7 +905,7 @@ impl AgentsView {
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
                     self.set_focus(if self.destinations.is_empty() {
-                        Focus::Presets
+                        Focus::Entries
                     } else {
                         Focus::Scopes
                     });
@@ -974,75 +913,7 @@ impl AgentsView {
                 }
                 _ => vec![],
             },
-            Focus::Scopes => vec![],
-            Focus::Presets => match k.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.set_focus(if self.destinations.is_empty() {
-                        Focus::Agents
-                    } else {
-                        Focus::Scopes
-                    });
-                    vec![]
-                }
-                KeyCode::Left | KeyCode::Char('h') => {
-                    self.preset_cursor = self.preset_cursor.saturating_sub(1);
-                    vec![]
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    if self.preset_cursor + 1 < self.presets.len() {
-                        self.preset_cursor += 1;
-                    } else if !self.tags.is_empty() {
-                        self.tag_cursor = 0;
-                        self.set_focus(Focus::Tags);
-                    }
-                    vec![]
-                }
-                KeyCode::Enter => {
-                    self.set_focus(Focus::Entries);
-                    vec![]
-                }
-                KeyCode::Char('i') => self.activate(ctx, true),
-                KeyCode::Char('x') | KeyCode::Backspace => self.activate(ctx, false),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.set_focus(Focus::Entries);
-                    let rows = self.rows(ctx);
-                    self.entries.clamp(rows.len());
-                    vec![]
-                }
-                _ => vec![],
-            },
-            Focus::Tags => match k.code {
-                KeyCode::Left | KeyCode::Char('h') => {
-                    if self.tag_cursor > 0 {
-                        self.tag_cursor -= 1;
-                    } else if !self.presets.is_empty() {
-                        self.preset_cursor = self.presets.len() - 1;
-                        self.set_focus(Focus::Presets);
-                    }
-                    vec![]
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    self.tag_cursor = (self.tag_cursor + 1).min(self.tags.len().saturating_sub(1));
-                    vec![]
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.set_focus(if self.destinations.is_empty() {
-                        Focus::Agents
-                    } else {
-                        Focus::Scopes
-                    });
-                    vec![]
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.set_focus(Focus::Entries);
-                    vec![]
-                }
-                KeyCode::Enter => {
-                    self.set_focus(Focus::Entries);
-                    vec![]
-                }
-                _ => vec![],
-            },
+            Focus::Scopes | Focus::Groups | Focus::Filters => vec![],
             Focus::Entries => {
                 let rows = self.rows(ctx);
                 let n = rows.len();
@@ -1058,10 +929,10 @@ impl AgentsView {
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         if self.entries.selected().unwrap_or(0) < self.entries.cols() {
-                            if self.destinations.is_empty() {
-                                self.set_focus(Focus::Agents);
+                            if self.has_visible_groups() {
+                                self.focus_skill_filters();
                             } else {
-                                self.filter_editing = true;
+                                self.focus_skill_search();
                             }
                         } else {
                             self.entries.move_rows(-1, n);
@@ -1119,6 +990,9 @@ impl AgentsView {
         if let Some(acts) = self.matrix.handle_mouse(m, ctx) {
             return acts;
         }
+        if let Some(actions) = self.group_mouse(m, ctx) {
+            return actions;
+        }
         if self.filter_editing {
             let (consumed, accepted) = self.search_panel.mouse_completion(m);
             if accepted {
@@ -1138,9 +1012,13 @@ impl AgentsView {
             return vec![];
         }
         let at = (m.column, m.row).into();
+        if self.group_rects[2].contains(at) {
+            return vec![];
+        }
         if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
+                self.filter_editing = false;
                 // A wheel notch is a row of cards, however many are on it.
                 self.entries.move_rows(d.signum(), self.rows(ctx).len());
             }
@@ -1158,6 +1036,7 @@ impl AgentsView {
                 let span = self.entries_track.height.max(1) as usize;
                 let r = (m.row.saturating_sub(self.entries_track.y)) as usize * n / span;
                 self.set_focus(Focus::Entries);
+                self.filter_editing = false;
                 self.entries.select_row(r.min(n - 1));
             }
             return vec![];
@@ -1173,21 +1052,9 @@ impl AgentsView {
                 self.set_focus(Focus::Agents);
                 return vec![];
             }
-            if let Some((i, _)) = self.preset_rects.iter().find(|(_, r)| r.contains(at)) {
-                self.preset_cursor = *i;
-                self.set_focus(Focus::Presets);
-                return vec![];
-            }
-            if let Some((i, _)) = self.tag_rects.iter().find(|(_, r)| r.contains(at)) {
-                self.tag_cursor = *i;
-                self.set_focus(Focus::Tags);
-                return vec![];
-            }
-            if self.group_rects[2].contains(at) {
-                return vec![];
-            }
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
+                self.filter_editing = false;
                 if let Some((index, double)) = self.entries.click(m.column, m.row) {
                     if self.entries.cell(index).is_some_and(|cell| {
                         let marker_y = cell.y + u16::from(self.entry_layout == UiLayout::Grid);
@@ -1230,6 +1097,10 @@ impl AgentsView {
                 } else {
                     0
                 }),
+                Constraint::Length(
+                    self.quick_height(ctx, area.width)
+                        .min(area.height.saturating_sub(18)),
+                ),
                 Constraint::Min(5),
             ])
             .split(area);
@@ -1249,7 +1120,8 @@ impl AgentsView {
             interiors[i] = block.inner(groups[i]);
             f.render_widget(block, groups[i]);
         }
-        let rows = [interiors[0], interiors[1], groups[2]];
+        self.draw_quick(f, groups[2], ctx);
+        let rows = [interiors[0], interiors[1], groups[3]];
 
         self.scope_rects.clear();
         let mut x = rows[0].x + 1;
@@ -1605,10 +1477,7 @@ impl AgentsView {
                 results_title: title,
                 hint: ("/ filter skills…", "   tag:x  preset:y  repo:owner/repo"),
                 input_active: self.filter_editing,
-                results_active: matches!(
-                    self.focus(),
-                    Focus::Entries | Focus::Presets | Focus::Tags
-                ),
+                results_active: matches!(self.focus(), Focus::Entries),
                 header_height: u16::from(self.has_visible_groups()),
             },
             th,
@@ -1751,9 +1620,26 @@ impl AgentsView {
         }
         self.preview.draw(f, area, ctx);
         self.matrix.draw(f, area, ctx);
+        self.draw_group_popup(f, area, ctx);
     }
 
     fn hints_current(&self) -> Hints {
+        if self.focus() == Focus::Filters {
+            return &[
+                ("←→", "filter badge"),
+                ("Enter/Space", "toggle filter"),
+                ("↑", "search"),
+                ("↓", "skills"),
+                ("Esc/q", "search"),
+            ];
+        }
+        if self.focus() == Focus::Groups || self.quick.popup.is_some() {
+            return &[
+                ("↑↓←→", "group"),
+                ("Enter", "install/uninstall / expand"),
+                ("Esc/q", "back"),
+            ];
+        }
         if let Some(hints) = self.matrix.hints() {
             return hints;
         }
@@ -1768,15 +1654,10 @@ impl AgentsView {
             ];
         }
         if !self.destinations.is_empty() && self.filter_editing {
-            return &[("↑", "groups"), ("Enter/↓", "results"), ("Esc", "results")];
-        }
-        if self.focus() == Focus::Tags {
             return &[
-                ("←→", "group"),
-                ("Enter", "skills"),
-                ("↑", "scopes"),
-                ("↓", "skills"),
-                ("Esc/q", "back"),
+                ("↑", "groups / scope"),
+                ("Enter/↓", "results"),
+                ("Esc", "results"),
             ];
         }
         if self.focus() == Focus::Agents && !self.can_convert {
@@ -1791,21 +1672,8 @@ impl AgentsView {
             return &[
                 ("/", "filter skills"),
                 ("i", "install"),
-                ("↑", "search"),
+                ("↑", "scope"),
                 ("v", "layout"),
-                ("[ ]", "agent"),
-                ("Esc/q", "back"),
-            ];
-        }
-        if !self.destinations.is_empty() && self.focus() == Focus::Presets {
-            return &[
-                ("Enter", "skills"),
-                ("i", "deploy preset"),
-                ("x", "uninstall preset"),
-                ("←→", "group"),
-                ("↑", "scopes"),
-                ("↓", "skills"),
-                ("M", "matrix"),
                 ("[ ]", "agent"),
                 ("Esc/q", "back"),
             ];
@@ -1813,7 +1681,7 @@ impl AgentsView {
         if !self.destinations.is_empty() && self.focus() == Focus::Entries {
             return match self.selected_caps() {
                 Caps { linked: true, .. } => &[
-                    ("↑↓←→", "skill · ↑ first row: search"),
+                    ("↑↓←→", "skill · ↑ first row: filters/search"),
                     ("/", "filter skills"),
                     ("i", "install"),
                     ("x", "uninstall"),
@@ -1824,7 +1692,7 @@ impl AgentsView {
                     ("Esc/q", "back"),
                 ],
                 Caps { clean: true, .. } => &[
-                    ("↑↓←→", "skill · ↑ first row: search"),
+                    ("↑↓←→", "skill · ↑ first row: filters/search"),
                     ("/", "filter skills"),
                     ("i", "install"),
                     ("x", "remove broken link"),
@@ -1834,7 +1702,7 @@ impl AgentsView {
                     ("Esc/q", "back"),
                 ],
                 Caps { relink: true, .. } => &[
-                    ("↑↓←→", "skill · ↑ first row: search"),
+                    ("↑↓←→", "skill · ↑ first row: filters/search"),
                     ("/", "filter skills"),
                     ("i", "install"),
                     ("r", "relink"),
@@ -1844,7 +1712,7 @@ impl AgentsView {
                     ("Esc/q", "back"),
                 ],
                 Caps { adopt: true, .. } => &[
-                    ("↑↓←→", "skill · ↑ first row: search"),
+                    ("↑↓←→", "skill · ↑ first row: filters/search"),
                     ("/", "filter skills"),
                     ("i", "install"),
                     ("a", "adopt"),
@@ -1854,7 +1722,7 @@ impl AgentsView {
                     ("Esc/q", "back"),
                 ],
                 _ => &[
-                    ("↑↓←→", "skill · ↑ first row: search"),
+                    ("↑↓←→", "skill · ↑ first row: filters/search"),
                     ("/", "filter skills"),
                     ("i", "install"),
                     ("Enter", "preview"),
@@ -1865,22 +1733,12 @@ impl AgentsView {
             };
         }
         match self.focus() {
+            Focus::Groups | Focus::Filters => &[],
             Focus::Scopes => &[
                 ("←→", "scope"),
                 ("↑", "agents"),
-                ("↓/Enter", "groups"),
+                ("↓/Enter", "groups / skills"),
                 ("[ ]", "agent"),
-                ("Esc/q", "back"),
-            ],
-            Focus::Presets => &[
-                ("Enter", "skills"),
-                ("i", "deploy preset"),
-                ("x", "undeploy"),
-                ("M", "matrix"),
-                ("←→", "pick group"),
-                ("↓", "entries"),
-                ("[ ]", "agent"),
-                ("↑", "agents"),
                 ("Esc/q", "back"),
             ],
             // A repair key is shown only on a row it applies to, so the footer
@@ -1888,7 +1746,7 @@ impl AgentsView {
             Focus::Entries => match self.selected_caps() {
                 Caps { clean: true, .. } => &[
                     ("j/k", "move"),
-                    ("↑", "first row: search"),
+                    ("↑", "first row: filters/search"),
                     ("Enter", "preview"),
                     ("x", "clean"),
                     ("[ ]", "agent"),
@@ -1896,7 +1754,7 @@ impl AgentsView {
                 ],
                 Caps { relink: true, .. } => &[
                     ("j/k", "move"),
-                    ("↑", "first row: search"),
+                    ("↑", "first row: filters/search"),
                     ("Enter", "preview"),
                     ("r", "relink"),
                     ("[ ]", "agent"),
@@ -1904,7 +1762,7 @@ impl AgentsView {
                 ],
                 Caps { linked: true, .. } => &[
                     ("j/k", "move"),
-                    ("↑", "first row: search"),
+                    ("↑", "first row: filters/search"),
                     ("Enter", "preview"),
                     ("m", "multi-select"),
                     ("[ ]", "agent"),
@@ -1913,20 +1771,19 @@ impl AgentsView {
                 Caps { adopt: true, .. } => &[
                     ("a", "adopt"),
                     ("j/k", "move"),
-                    ("↑", "first row: search"),
+                    ("↑", "first row: filters/search"),
                     ("Enter", "preview"),
                     ("[ ]", "agent"),
                     ("v", "layout"),
                 ],
                 _ => &[
                     ("↑↓←→", "skill"),
-                    ("↑", "first row: search"),
+                    ("↑", "first row: filters/search"),
                     ("Enter", "preview"),
                     ("v", "layout"),
                     ("Esc/q", "back"),
                 ],
             },
-            Focus::Tags => &[],
             Focus::Agents => &[
                 ("←→", "pick agent"),
                 ("↓/Enter", "scopes"),
@@ -2101,7 +1958,22 @@ impl View for AgentsView {
         self.refresh_scope(ctx);
     }
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.focus() == Focus::Scopes && !self.destinations.is_empty() {
+        if self.quick.popup.is_some() {
+            let data = self.scoped.clone();
+            let scoped = data.as_ref().map(|d| Ctx {
+                ws: &d.0,
+                snap: &d.1,
+                settings: ctx.settings,
+            });
+            return self
+                .quick_key(k, scoped.as_ref().unwrap_or(ctx))
+                .unwrap_or_default();
+        }
+        if !self.preview.is_open()
+            && self.matrix.hints().is_none()
+            && self.focus() == Focus::Scopes
+            && !self.destinations.is_empty()
+        {
             match k.code {
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.move_destination(-1, ctx);
@@ -2116,7 +1988,12 @@ impl View for AgentsView {
                     return vec![];
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
-                    self.set_focus(Focus::Presets);
+                    self.set_focus(if self.quick_visible() {
+                        Focus::Groups
+                    } else {
+                        Focus::Entries
+                    });
+                    self.filter_editing = false;
                     return vec![];
                 }
                 _ => {}
@@ -2154,6 +2031,17 @@ impl View for AgentsView {
         self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
     }
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.quick.popup.is_some() {
+            let data = self.scoped.clone();
+            let scoped = data.as_ref().map(|d| Ctx {
+                ws: &d.0,
+                snap: &d.1,
+                settings: ctx.settings,
+            });
+            return self
+                .group_mouse(m, scoped.as_ref().unwrap_or(ctx))
+                .unwrap_or_default();
+        }
         if !self.preview.is_open() && self.matrix.hints().is_none() && self.filter_editing {
             let (consumed, accepted) = self.search_panel.mouse_completion(m);
             if consumed {
@@ -2180,9 +2068,10 @@ impl View for AgentsView {
             if let Some(index) = self
                 .group_rects
                 .iter()
+                .take(2)
                 .position(|rect| rect.contains((m.column, m.row).into()))
             {
-                self.set_focus([Focus::Agents, Focus::Scopes, Focus::Presets][index]);
+                self.set_focus([Focus::Agents, Focus::Scopes][index]);
                 self.filter_editing = false;
                 self.search_panel.completion.close();
             }
@@ -2606,6 +2495,11 @@ mod overflow_tests {
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
             assert!(text.contains("installed-group"));
+            let header = view.group_rects[2];
+            let text: String = (header.y..header.bottom())
+                .flat_map(|y| (header.x..header.right()).map(move |x| (x, y)))
+                .map(|p| buffer[p].symbol())
+                .collect();
             assert!(!text.contains("empty-group"));
             assert!(!text.contains("uninstalled-group"));
             let full = view.entries.visible();
@@ -2624,7 +2518,7 @@ mod overflow_tests {
     }
 
     #[test]
-    fn selected_package_is_visible_and_click_keeps_scope_inventory() {
+    fn coverage_clicks_filter_without_deploying_or_focusing_on_hover() {
         let root = std::env::temp_dir().join(format!("skills-pills-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let mut ws = Workspace::open(&root).unwrap();
@@ -2662,34 +2556,41 @@ mod overflow_tests {
 
         for (w, h) in [(100, 30), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-            for i in (0..24).chain((0..24).rev()) {
-                view.preset_cursor = i;
-                terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-                assert!(view.preset_rects.iter().any(|(index, _)| *index == i));
-                for (_, rect) in &view.preset_rects {
-                    assert!(rect.right() <= w);
-                    assert!(rect.bottom() <= h);
+            terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            let rects = view.preset_rects.clone();
+            assert!(!rects.is_empty());
+            for (_, rect) in rects {
+                assert!(rect.right() <= w && rect.bottom() <= h);
+                for focus in [Focus::Agents, Focus::Scopes, Focus::Entries] {
+                    view.set_focus(focus);
+                    for kind in [
+                        MouseEventKind::Down(MouseButton::Left),
+                        MouseEventKind::Moved,
+                        MouseEventKind::ScrollDown,
+                    ] {
+                        view.set_focus(focus);
+                        let actions = view.handle_mouse(
+                            MouseEvent {
+                                kind,
+                                column: rect.x,
+                                row: rect.y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &ctx,
+                        );
+                        assert!(actions.is_empty());
+                        assert_eq!(
+                            view.focus(),
+                            if kind == MouseEventKind::Down(MouseButton::Left) {
+                                Focus::Filters
+                            } else {
+                                focus
+                            },
+                            "coverage clicks filter, hover and wheel preserve focus"
+                        );
+                        assert!(view.rows(&ctx).is_empty());
+                    }
                 }
-                let (_, rect) = view
-                    .preset_rects
-                    .iter()
-                    .find(|(index, _)| *index == i)
-                    .unwrap();
-                let actions = view.handle_mouse(
-                    MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
-                        column: rect.x,
-                        row: rect.y,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &ctx,
-                );
-                assert_eq!(view.preset_cursor, i);
-                assert!(actions.is_empty(), "selecting a package must not deploy it");
-                assert!(
-                    view.rows(&ctx).is_empty(),
-                    "groups do not replace the scope inventory"
-                );
             }
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -2828,7 +2729,7 @@ mod deployment_scope_tests {
     }
 
     #[test]
-    fn unified_groups_keep_scope_inventory_and_preset_deploy_ignores_search_filter() {
+    fn coverage_keeps_scope_inventory_and_search_independent() {
         let tmp = skills::ops::DownloadDir::new("agent-tag-packages").unwrap();
         let root = tmp.path().join("library");
         let target = tmp.path().join("target");
@@ -2906,13 +2807,7 @@ mod deployment_scope_tests {
             view.preset_rects[0].1.x < view.tag_rects[0].1.x,
             "presets render before tags in the unified group row"
         );
-        view.set_focus(Focus::Presets);
-        view.handle_key_current(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &ctx);
-        assert_eq!(
-            view.focus(),
-            Focus::Tags,
-            "right crosses from presets to tags"
-        );
+        view.set_focus(Focus::Entries);
         let rect = view.tag_rects[0].1;
         let actions = view.handle_mouse_current(
             MouseEvent {
@@ -2924,44 +2819,86 @@ mod deployment_scope_tests {
             &ctx,
         );
         assert!(actions.is_empty());
-        assert_eq!(view.focus(), Focus::Tags);
-        let rows = view.rows(&ctx);
+        assert_eq!(view.focus(), Focus::Filters);
+        assert_eq!(view.search_panel.input.value(), "tag:tools");
         assert_eq!(
-            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            ["one", "solo"]
+            view.rows(&ctx)
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["one"]
         );
-        assert!(!target.join("two").exists());
-        view.search_panel.input.paste("one").unwrap();
-        view.set_focus(Focus::Tags);
-        for code in [KeyCode::Char('i'), KeyCode::Char('x'), KeyCode::Char(' ')] {
-            assert!(
-                view.handle_key_current(KeyEvent::new(code, KeyModifiers::NONE), &ctx)
-                    .is_empty()
-            );
+        terminal
+            .draw(|f| view.draw_current(f, f.area(), &ctx))
+            .unwrap();
+        let rect = view.tag_rects[0].1;
+        assert!(
+            !terminal.backend().buffer()[(rect.x + 1, rect.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            terminal.backend().buffer()[(rect.x + 1, rect.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+        view.handle_mouse_current(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        assert!(view.search_panel.input.is_empty());
+        assert_eq!(view.rows(&ctx).len(), 2);
+        let buffer = terminal.backend().buffer();
+        for x in [rect.x, rect.right() - 1] {
+            assert!(!buffer[(x, rect.y)].modifier.intersects(
+                ratatui::style::Modifier::BOLD
+                    | ratatui::style::Modifier::UNDERLINED
+                    | ratatui::style::Modifier::REVERSED
+            ));
         }
-        assert!(!target.join("two").exists());
-        // Applying the Preset includes members hidden by the skill search.
-        view.set_focus(Focus::Presets);
-        let actions = view.activate(&ctx, true);
-        let [Action::ApplyLinks { actions, .. }] = actions.as_slice() else {
-            panic!("group deployment plan");
-        };
-        deploy::apply(actions).unwrap();
-        let snap = ws.scan().unwrap();
-        let ctx = Ctx { snap: &snap, ..ctx };
-        view.refresh_current(&ctx);
-        assert_eq!(
-            (view.presets[0].1.installed, view.presets[0].1.total),
-            (2, 2)
+        view.set_focus(Focus::Groups);
+        view.handle_key_current(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctx);
+        assert!(view.filter_editing);
+        view.handle_key_current(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctx);
+        assert_eq!(view.focus(), Focus::Filters);
+        view.filter_cursor = 0;
+        view.handle_key_current(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
+        assert_eq!(view.search_panel.input.value(), "preset:work");
+        view.handle_key_current(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &ctx);
+        view.handle_key_current(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
+        assert_eq!(view.search_panel.input.value(), "tag:tools");
+        view.handle_key_current(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
+        assert!(view.search_panel.input.is_empty());
+        view.handle_key_current(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctx);
+        assert_eq!(view.focus(), Focus::Entries);
+        view.handle_key_current(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctx);
+        assert_eq!(view.focus(), Focus::Filters);
+        view.handle_key_current(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctx);
+        assert!(view.filter_editing);
+        view.handle_key_current(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctx);
+        assert_eq!(view.focus(), Focus::Groups);
+        // Deployment uses all members even with an unrelated skill query.
+        view.search_panel.input.set("solo");
+        let actions = view.toggle_group(
+            &groups::GroupKey {
+                preset: false,
+                name: "tools".into(),
+            },
+            &ctx,
         );
-        assert_eq!((view.tags[0].included, view.tags[0].total), (2, 2));
-        let actions = view.activate(&ctx, false);
-        let [Action::ApplyLinks { actions, .. }] = actions.as_slice() else {
-            panic!("group removal plan");
+        let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+            panic!("group install")
         };
-        deploy::apply(actions).unwrap();
-        assert!(!target.join("one").exists() && !target.join("two").exists());
-        assert!(target.join("solo").is_symlink());
+        assert_eq!(keys, ["one", "two"]);
+        assert!(!target.join("two").exists());
+        write(&ws).unwrap();
+        assert!(target.join("two").is_symlink());
+        assert!(target.join("one").is_symlink());
     }
 
     #[test]
@@ -3334,7 +3271,7 @@ mod deployment_scope_tests {
             "compact controls leave room for skills"
         );
         assert!(skills_area.contains((search_area.x, search_area.y).into()));
-        for focus in [Focus::Agents, Focus::Scopes, Focus::Presets, Focus::Entries] {
+        for focus in [Focus::Agents, Focus::Scopes, Focus::Entries, Focus::Entries] {
             view.set_focus(focus);
             term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
             assert_eq!(
@@ -3343,7 +3280,7 @@ mod deployment_scope_tests {
             );
             assert_eq!(view.left, skills_area, "focus must not shift the layout");
         }
-        view.set_focus(Focus::Presets);
+        view.set_focus(Focus::Entries);
         assert!(
             view.handle_mouse(
                 MouseEvent {
@@ -3359,8 +3296,41 @@ mod deployment_scope_tests {
         assert_eq!(view.focus(), Focus::Entries);
         assert!(view.filter_editing);
         view.filter_editing = false;
-        let selection = (view.scope.clone(), view.destination, view.preset_cursor);
-        for (index, expected) in [Focus::Agents, Focus::Scopes, Focus::Presets]
+        view.set_focus(Focus::Scopes);
+        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &ctx);
+        view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &ctx);
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &ctx);
+        assert_eq!(
+            view.focus(),
+            Focus::Groups,
+            "scope change then Down before redraw must not skip groups"
+        );
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        view.set_focus(Focus::Agents);
+        for (code, focus, editing) in [
+            (KeyCode::Down, Focus::Scopes, false),
+            (KeyCode::Down, Focus::Groups, false),
+            (KeyCode::Down, Focus::Entries, true),
+            (KeyCode::Down, Focus::Entries, false),
+            (KeyCode::Up, Focus::Entries, true),
+            (KeyCode::Up, Focus::Groups, false),
+            (KeyCode::Up, Focus::Scopes, false),
+            (KeyCode::Up, Focus::Agents, false),
+        ] {
+            assert!(
+                view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &ctx)
+                    .is_empty()
+            );
+            assert_eq!(view.focus(), focus);
+            assert_eq!(view.filter_editing, editing);
+        }
+        assert!(matches!(
+            view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &ctx)
+                .as_slice(),
+            [Action::BackToParent]
+        ));
+        let selection = (view.scope.clone(), view.destination);
+        for (index, expected) in [Focus::Agents, Focus::Scopes, Focus::Entries]
             .into_iter()
             .enumerate()
         {
@@ -3390,10 +3360,7 @@ mod deployment_scope_tests {
                 );
                 assert_eq!(view.focus(), expected);
                 assert!(!view.filter_editing);
-                assert_eq!(
-                    (view.scope.clone(), view.destination, view.preset_cursor),
-                    selection
-                );
+                assert_eq!((view.scope.clone(), view.destination), selection);
             }
         }
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
@@ -3460,38 +3427,71 @@ mod deployment_scope_tests {
         assert!(!base.join("global/claude/sample").exists());
         assert!(root.join("sample/SKILL.md").exists());
         view.move_destination(1, &ctx);
-        view.set_focus(Focus::Presets);
+        view.set_focus(Focus::Entries);
         view.refresh(&ctx);
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        let actions = view.handle_key(key(KeyCode::Char('i')), &ctx);
-        let write = actions
-            .into_iter()
-            .find_map(|a| {
-                if let Action::BatchMeta(write, _) = a {
-                    Some(write)
-                } else {
-                    None
-                }
-            })
-            .expect("explicit preset deployment uses the selected target");
+        let scoped = view.scoped.clone().unwrap();
+        let scoped_ctx = Ctx {
+            ws: &scoped.0,
+            snap: &scoped.1,
+            settings: ctx.settings,
+        };
+        view.search_panel.input.set("no match");
+        let actions = view.toggle_group(
+            &groups::GroupKey {
+                preset: true,
+                name: "quality".into(),
+            },
+            &scoped_ctx,
+        );
+        let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+            panic!("preset install")
+        };
+        assert_eq!(keys, ["sample"]);
+        view.move_destination(-1, &ctx);
+        write(&ws).unwrap();
+        assert!(
+            !project.join(".claude/skills/sample").exists(),
+            "full preset toggles off in original scope"
+        );
+        assert!(!base.join("global/claude/sample").exists());
+        view.move_destination(1, &ctx);
+        view.set_focus(Focus::Entries);
+        view.refresh(&ctx);
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let scoped = view.scoped.clone().unwrap();
+        let scoped_ctx = Ctx {
+            ws: &scoped.0,
+            snap: &scoped.1,
+            settings: ctx.settings,
+        };
+        let actions = view.toggle_group(
+            &groups::GroupKey {
+                preset: true,
+                name: "quality".into(),
+            },
+            &scoped_ctx,
+        );
+        let Action::BatchMeta(write, _) = actions.into_iter().next().unwrap() else {
+            panic!("reinstall preset")
+        };
         write(&ws).unwrap();
         view.refresh(&ctx);
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         let actions = view.handle_key(key(KeyCode::Char('x')), &ctx);
-        let write = actions
-            .into_iter()
-            .find_map(|a| {
-                if let Action::BatchMeta(write, _) = a {
-                    Some(write)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
+        let Action::OpenModal(modal) = actions.into_iter().next().unwrap() else {
+            panic!("uninstall confirmation")
+        };
+        let Modal::ConfirmWrite {
+            write: Some(write), ..
+        } = *modal
+        else {
+            panic!("scoped uninstall")
+        };
         write(&ws).unwrap();
         assert!(
             !project.join(".claude/skills/sample").exists(),
-            "removing a preset removes its current members regardless of how they were deployed"
+            "removing a skill affects only the selected scope"
         );
         assert!(root.join("sample/SKILL.md").exists());
         std::fs::remove_dir_all(base).unwrap();
