@@ -4,6 +4,7 @@ use super::completion::Completion;
 use super::preview::{Overlay, preview_lines};
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::group::Kind;
 use crate::tui::components::layout::split_panes;
 use crate::tui::components::layout::{cols_for, skill_frame};
 use crate::tui::components::skill::{SkillPresentation, SkillRenderState};
@@ -56,8 +57,10 @@ pub struct SearchView {
     scope_agent: Option<String>,
     panel: Option<(BTreeSet<String>, String)>,
     panel_active: bool,
-    pub(super) hide_tags: bool,
+    pub(super) hidden_group: Option<(Kind, String)>,
     preset: Option<String>,
+    /// The starting membership lets saves preserve unrelated concurrent edits.
+    preset_original: BTreeSet<String>,
     tag: Option<String>,
     target: Option<(
         skills::config::AgentConfig,
@@ -96,8 +99,9 @@ impl Default for SearchView {
             scope_agent: None,
             panel: None,
             panel_active: true,
-            hide_tags: false,
+            hidden_group: None,
             preset: None,
+            preset_original: BTreeSet::new(),
             tag: None,
             target: None,
             area: Rect::default(),
@@ -152,13 +156,27 @@ impl SearchView {
         if self.is_picker() {
             let bar = rows[2];
             let mut x = bar.x;
-            let selected = self.visible_checked(ctx).len();
+            let visible = self.visible_checked(ctx).len();
+            let selected = if self.preset.is_some() {
+                self.checked.len()
+            } else {
+                visible
+            };
             let status = if self.multi {
-                let hidden = self.checked.len().saturating_sub(selected);
+                let hidden = self.checked.len().saturating_sub(visible);
                 format!(
-                    " Multi-select · {selected} selected{} ",
+                    " {} · {selected} selected{} ",
+                    if self.preset.is_some() {
+                        "Members"
+                    } else {
+                        "Multi-select"
+                    },
                     if hidden > 0 {
-                        format!(" · {hidden} hidden (excluded)")
+                        if self.preset.is_some() {
+                            format!(" · {hidden} outside filter")
+                        } else {
+                            format!(" · {hidden} hidden (excluded)")
+                        }
                     } else {
                         String::new()
                     }
@@ -230,14 +248,6 @@ impl SearchView {
         }
     }
 
-    pub fn panel_at_top(&self) -> bool {
-        self.panel_actions_ready()
-            && self
-                .grid
-                .selected()
-                .is_none_or(|index| index < self.grid.cols())
-    }
-
     fn is_picker(&self) -> bool {
         self.preset.is_some() || self.tag.is_some() || self.target.is_some()
     }
@@ -266,7 +276,11 @@ impl SearchView {
 
     pub fn panel_keys(&self, ctx: &Ctx) -> Vec<String> {
         if self.multi {
-            self.visible_checked(ctx)
+            if self.layout_scope == LayoutScope::Presets {
+                self.checked.iter().cloned().collect()
+            } else {
+                self.visible_checked(ctx)
+            }
         } else {
             self.selected(ctx)
                 .map(|r| vec![r.key.clone()])
@@ -304,7 +318,7 @@ impl SearchView {
             return &[
                 ("/", "filter skills"),
                 ("m", "multi-select"),
-                ("a", "add skills"),
+                ("a", "edit members"),
                 ("x", "remove from preset"),
                 ("Enter", "preview"),
                 ("←", "presets"),
@@ -343,7 +357,12 @@ impl SearchView {
                 skills::paths::contract_tilde(&agent.skills_path())
             ),
             None => self.tag.as_ref().map_or_else(
-                || " Preset skills ".into(),
+                || {
+                    format!(
+                        " Preset: {} · members ",
+                        self.preset.as_deref().unwrap_or_default()
+                    )
+                },
                 |tag| format!(" Tag: {tag} · skills "),
             ),
         }
@@ -371,10 +390,12 @@ impl SearchView {
         let mut view = Self::default();
         view.refresh(ctx);
         view.preset = Some(preset.into());
+        view.hidden_group = Some((Kind::Preset, preset.into()));
         view.run_search(ctx, false);
         view.multi = true;
         if let Ok(Some(p)) = ctx.ws.presets.load(preset) {
-            view.checked = p.skills.iter().cloned().collect();
+            view.checked = p.members().into_iter().collect();
+            view.preset_original = view.checked.clone();
         }
         view
     }
@@ -383,7 +404,7 @@ impl SearchView {
         let mut view = Self {
             tag: Some(tag.into()),
             multi: true,
-            hide_tags: true,
+            hidden_group: Some((Kind::Tag, tag.into())),
             ..Self::default()
         };
         view.refresh(ctx);
@@ -450,18 +471,22 @@ impl SearchView {
         let Some(preset) = self.preset.clone() else {
             return vec![];
         };
-        let visible: BTreeSet<String> = self
-            .hits
-            .iter()
-            .map(|hit| ctx.snap.skills[hit.index].key.clone())
+        let added: Vec<_> = self
+            .checked
+            .difference(&self.preset_original)
+            .cloned()
             .collect();
-        let desired = self.visible_checked(ctx);
-        let keys = visible.iter().cloned().collect();
+        let removed: BTreeSet<_> = self
+            .preset_original
+            .difference(&self.checked)
+            .cloned()
+            .collect();
+        let keys = self.checked.union(&self.preset_original).cloned().collect();
         vec![Action::BatchMeta(
             Box::new(move |ws| {
                 skills::history::preset_edit(ws, &preset, |members| {
-                    members.retain(|key| !visible.contains(key));
-                    for key in &desired {
+                    members.retain(|key| !removed.contains(key));
+                    for key in &added {
                         if !members.contains(key) {
                             members.push(key.clone());
                         }
@@ -530,7 +555,11 @@ impl SearchView {
     }
 
     fn batch_action(&self, operation: char, ctx: &Ctx) -> Vec<Action> {
-        let keys = self.visible_checked(ctx);
+        let keys = if operation == 'p' {
+            self.checked.iter().cloned().collect()
+        } else {
+            self.visible_checked(ctx)
+        };
         if keys.is_empty() {
             return vec![Action::Error(
                 "No selected skills in the current filter".into(),
@@ -549,7 +578,7 @@ impl SearchView {
     }
 
     fn render_state<'a>(
-        &self,
+        &'a self,
         r: &SkillRecord,
         hit: &'a Hit,
         context: &'a str,
@@ -565,7 +594,11 @@ impl SearchView {
                 .map(|e| e.text.as_str()),
             terms: &hit.terms,
             context: searching.then_some(context),
-            show_tags: !self.hide_tags,
+            show_tags: true,
+            hidden_group: self
+                .hidden_group
+                .as_ref()
+                .map(|(kind, name)| (*kind, name.as_str())),
             show_match_details: searching,
         }
     }
@@ -632,14 +665,17 @@ impl SearchView {
         self.grid
             .selected()
             .and_then(|i| self.hits.get(i))
-            .map(|h| &ctx.snap.skills[h.index])
+            .and_then(|h| ctx.snap.get(&h.key))
     }
 
     /// Re-run the query. `keep` preserves the selected skill (after a rescan);
     /// typing always jumps back to the best match.
     fn run_search(&mut self, ctx: &Ctx, keep: bool) {
         let key = if keep {
-            self.selected(ctx).map(|r| r.key.clone())
+            self.grid
+                .selected()
+                .and_then(|i| self.hits.get(i))
+                .map(|h| h.key.clone())
         } else {
             None
         };
@@ -917,9 +953,9 @@ impl SearchView {
             ..inner
         };
         let usage = if ctx.settings.tags_enabled {
-            "   repo:owner/repo  tag:x  agent:y  source:local  untagged"
+            "   repo:owner/repo  tag:x  preset:y  agent:z  source:local  untagged"
         } else {
-            "   repo:owner/repo  agent:y  source:local"
+            "   repo:owner/repo  preset:y  agent:z  source:local"
         };
         self.input.render_hint(
             f,
@@ -1169,10 +1205,10 @@ impl View for SearchView {
         if !self.multi {
             return String::new();
         }
-        let selected = self.visible_checked(ctx).len();
-        let hidden = self.checked.len().saturating_sub(selected);
+        let selected = self.checked.len();
+        let hidden = selected.saturating_sub(self.visible_checked(ctx).len());
         if hidden > 0 {
-            format!(" {selected} selected · {hidden} hidden ")
+            format!(" {selected} selected · {hidden} outside filter ")
         } else {
             format!(" {selected} selected ")
         }
@@ -1184,7 +1220,10 @@ impl View for SearchView {
         );
         self.searcher.index(&ctx.snap.skills);
         self.run_search(ctx, true);
-        self.checked.retain(|key| ctx.snap.get(key).is_some());
+        // Missing fixed members remain selected until the user removes them.
+        if self.preset.is_none() {
+            self.checked.retain(|key| ctx.snap.get(key).is_some());
+        }
         self.updates.retain(|key, remote| {
             ctx.snap.get(key).is_some_and(|r| {
                 r.source.as_ref().is_some_and(|source| {
@@ -1373,6 +1412,14 @@ impl View for SearchView {
                         self.batch_action('d', ctx)
                     } else {
                         self.act_deploy(ctx)
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if let Some(record) = self.selected(ctx) {
+                        acts = vec![Action::OpenModal(Box::new(Modal::batch_presets(
+                            vec![record.key.clone()],
+                            ctx,
+                        )))];
                     }
                 }
                 KeyCode::Char('r') => acts = self.act_rename(ctx),
@@ -1628,7 +1675,7 @@ impl View for SearchView {
                 ("Ctrl+A", "select all results"),
                 ("t", "tags"),
                 ("d", "deploy"),
-                ("p", "preset"),
+                ("p", "preset (all selected)"),
                 ("/", "filter"),
                 ("Enter", "preview"),
                 ("Esc", "cancel selection"),
@@ -1654,6 +1701,7 @@ impl View for SearchView {
                 ("t", "tags"),
                 ("n", "note"),
                 ("d", "deploy"),
+                ("p", "add to preset"),
                 ("r", "rename"),
                 ("s", "source"),
                 ("a", "accept repo changes"),
@@ -1679,6 +1727,125 @@ impl View for SearchView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_picker_refreshes_indices_without_dropping_pending_members() {
+        let root = skills::ops::DownloadDir::new("preset-picker-refresh").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        for name in ["alpha", "beta"] {
+            std::fs::create_dir_all(root.path().join(name)).unwrap();
+            std::fs::write(
+                root.path().join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\nBody"),
+            )
+            .unwrap();
+        }
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = SearchView::preset_members("daily", &ctx);
+        picker.checked.insert("alpha".into());
+        picker.set_query("beta", &ctx);
+        picker.focus_list();
+        let mut modal = Modal::PresetSkills(Box::new(picker));
+        std::fs::remove_dir_all(root.path().join("alpha")).unwrap();
+        let newer = ws.scan().unwrap();
+        let ctx = Ctx {
+            snap: &newer,
+            ..ctx
+        };
+        modal.refresh(&ctx);
+        modal.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &ctx);
+        let Modal::PresetSkills(picker) = modal else {
+            unreachable!()
+        };
+        assert_eq!(picker.selected(&ctx).unwrap().key, "beta");
+        assert_eq!(
+            picker.checked,
+            BTreeSet::from(["alpha".into(), "beta".into()])
+        );
+    }
+
+    #[test]
+    fn preset_editor_applies_cross_filter_changes_and_preserves_concurrent_additions() {
+        let root = skills::ops::DownloadDir::new("preset-fixed-picker").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            std::fs::create_dir_all(root.path().join(name)).unwrap();
+            std::fs::write(
+                root.path().join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\nBody"),
+            )
+            .unwrap();
+        }
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        ws.presets
+            .save(&skills::preset::Preset {
+                name: "daily".into(),
+                skills: vec!["alpha".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = SearchView::preset_members("daily", &ctx);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for name in ["alpha", "beta", "gamma"] {
+            picker.set_query(name, &ctx);
+            picker.focus_list();
+            picker.handle_key(key(KeyCode::Char(' ')), &ctx);
+        }
+        picker.set_query("beta", &ctx);
+        picker.focus_list();
+        assert_eq!(picker.visible_checked(&ctx), ["beta"]);
+        assert!(picker.status(&ctx).contains("2 selected"));
+        let mut newer = ws.presets.load("daily").unwrap().unwrap();
+        newer.skills.push("delta".into());
+        ws.presets.save(&newer).unwrap();
+        let Action::BatchMeta(write, keys) =
+            picker.handle_key(key(KeyCode::Char('a')), &ctx).remove(0)
+        else {
+            panic!("expected complete member edit");
+        };
+        assert_eq!(keys, ["alpha", "beta", "gamma"]);
+        let (_, intent) = write(&ws).unwrap();
+        assert!(intent.is_some());
+        assert_eq!(
+            ws.presets.load("daily").unwrap().unwrap().members(),
+            ["beta", "delta", "gamma"]
+        );
+
+        let mut panel = SearchView::panel(
+            vec!["alpha".into(), "beta".into()],
+            "Preset: daily".into(),
+            LayoutScope::Presets,
+            &ctx,
+        );
+        panel.multi = true;
+        panel.checked.extend(["alpha".into(), "beta".into()]);
+        panel.set_query("beta", &ctx);
+        assert_eq!(panel.panel_keys(&ctx), ["alpha", "beta"]);
+    }
 
     #[test]
     fn shared_panels_read_scoped_layouts_and_emit_session_updates() {

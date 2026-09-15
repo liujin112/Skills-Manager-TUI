@@ -54,6 +54,20 @@ pub fn package(mode: Icons) -> &'static str {
     }
 }
 
+pub fn preset_caps(mode: Icons) -> (&'static str, &'static str) {
+    match mode {
+        Icons::Nerd => ("", ""),
+        Icons::Text => ("/", "/"),
+    }
+}
+
+pub fn tag_caps(mode: Icons, caps: skills::config::PillCaps) -> (&'static str, &'static str) {
+    match mode {
+        Icons::Nerd => caps.glyphs(),
+        Icons::Text => ("(", ")"),
+    }
+}
+
 pub fn local(mode: Icons) -> &'static str {
     match mode {
         Icons::Nerd => "󰉋 local",

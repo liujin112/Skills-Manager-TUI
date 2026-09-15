@@ -102,6 +102,34 @@ fn library_tag_and_preset_pages_share_skill_styles_and_group_colours() {
                 has_styled_text(&buffer, "local", Some(settings.theme.source), None, false),
                 "{name} {layout:?} must use the shared source style"
             );
+            let metadata = buffer
+                .content
+                .chunks(buffer.area.width as usize)
+                .filter(|row| row.iter().any(|cell| cell.fg == settings.theme.source))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .find(|row| row.contains("local"))
+                .unwrap();
+            // The sidebar/header already identifies the enclosing group. Its
+            // badge disappears from skill metadata, while the other kind stays.
+            match name {
+                "Tags" => {
+                    assert!(!metadata.contains("team"), "{layout:?}: {metadata}");
+                    assert!(metadata.contains("bundle"), "{layout:?}: {metadata}");
+                }
+                "Presets" => {
+                    assert!(!metadata.contains("bundle"), "{layout:?}: {metadata}");
+                    assert!(metadata.contains("team"), "{layout:?}: {metadata}");
+                }
+                _ => {}
+            }
+            if name == "Library" && layout == UiLayout::Compact {
+                for cap in ["(", "/"] {
+                    assert!(
+                        has_styled_text(&buffer, cap, Some(tint), None, false),
+                        "compact metadata must retain distinct Tag/Preset outlines"
+                    );
+                }
+            }
             if layout != UiLayout::Compact {
                 assert!(
                     has_styled_text(
@@ -358,7 +386,6 @@ fn filtered_preset_removal_preserves_other_members_and_central_skills() {
     view.paste("bndl", &ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);
     view.handle_key(key(KeyCode::Right), &ctx);
-    view.handle_key(key(KeyCode::Right), &ctx); // Select team after other.
     view.handle_key(key(KeyCode::Char('/')), &ctx);
     view.paste("alpha", &ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);
@@ -414,8 +441,13 @@ fn health_filter_with_no_matches_never_claims_the_library_is_healthy() {
 }
 
 #[test]
-fn agent_preset_filter_keeps_its_scope_after_refresh() {
-    let ws = fixture("agent-filter");
+fn agent_skill_filter_survives_refresh_without_filtering_coverage() {
+    let mut ws = fixture("agent-filter");
+    ws.config.agents = vec![skills::config::AgentConfig {
+        key: "fixture".into(),
+        name: "Fixture".into(),
+        skills_dir: ws.root.join("deployed").to_string_lossy().into_owned(),
+    }];
     ws.presets
         .save(&Preset {
             name: "unrelated".into(),
@@ -434,7 +466,9 @@ fn agent_preset_filter_keeps_its_scope_after_refresh() {
         },
     };
     let mut view = super::agents::AgentsView::default();
+    view.discover(&ws.root).unwrap();
     view.refresh(&ctx);
+    view.handle_key(key(KeyCode::Enter), &ctx);
     view.handle_key(key(KeyCode::Char('/')), &ctx);
     assert!(view.editing());
     view.paste("bndl");
@@ -450,9 +484,12 @@ fn agent_preset_filter_keeps_its_scope_after_refresh() {
         .iter()
         .map(|c| c.symbol())
         .collect();
-    assert!(text.contains("Presets") && text.contains("[bndl]"));
-    assert!(text.contains("bundle"));
-    assert!(!text.contains("unrelated"));
+    assert!(text.contains("skills") && text.contains("bndl"));
+    assert!(
+        text.contains("bundle"),
+        "coverage is independent of skill search"
+    );
+    assert!(text.contains("unrelated"), "coverage includes empty groups");
     assert_eq!(ws.presets.list().unwrap().len(), 2);
     std::fs::remove_dir_all(&ws.root).unwrap();
 }
@@ -499,16 +536,15 @@ fn member_search_stays_visible_and_presets_place_it_above_tags() {
     presets.refresh(&ctx);
     let rows = render(&mut presets, 30);
     assert!(rows[1].contains("search skills…"));
-    assert!(rows[4].contains("team 2/2"));
-    presets.handle_key(key(KeyCode::Right), &ctx); // Tag stripe.
-    presets.handle_key(key(KeyCode::Up), &ctx); // Search above stripe.
+    assert!(rows[4].contains("team") && rows[4].contains("2/2"));
+    assert!(!rows[4].contains("[ ]") && !rows[4].contains("[✓]"));
+    presets.handle_key(key(KeyCode::Right), &ctx); // Skills, skipping read-only tags.
+    presets.handle_key(key(KeyCode::Up), &ctx); // Search above the composition row.
     assert!(presets.input_focused());
     presets.paste("alpha", &ctx);
-    presets.handle_key(key(KeyCode::Down), &ctx); // Back to stripe.
+    presets.handle_key(key(KeyCode::Down), &ctx); // Directly back to skills.
     assert!(!presets.input_focused());
-    presets.handle_key(key(KeyCode::Down), &ctx); // Skill list.
-    presets.handle_key(key(KeyCode::Up), &ctx); // Stripe again.
-    presets.handle_key(key(KeyCode::Up), &ctx); // Search again.
+    presets.handle_key(key(KeyCode::Up), &ctx); // Directly back to search.
     assert!(presets.input_focused());
     assert!(render(&mut presets, 30)[1].contains("alpha"));
     presets.handle_key(key(KeyCode::Esc), &ctx);

@@ -1,4 +1,4 @@
-//! Local query-filter completion. Repository names come from source URLs.
+//! Local query-filter completion from the current inventory and source metadata.
 use std::{collections::BTreeSet, ops::Range};
 
 use crate::tui::{
@@ -34,12 +34,7 @@ impl Completion {
                 .snap
                 .skills
                 .iter()
-                .filter_map(|r| {
-                    r.source
-                        .as_ref()
-                        .and_then(skills::meta::Source::url)
-                        .and_then(skills::repository::source_name)
-                })
+                .filter_map(|r| r.source_display_name().map(str::to_owned))
                 .collect(),
             Some(("tag", _)) => ctx
                 .snap
@@ -49,6 +44,7 @@ impl Completion {
                 .chain(ctx.ws.config.tags.iter().map(|t| t.name.clone()))
                 .collect(),
             Some(("agent", _)) => ctx.snap.agents.iter().map(|a| a.key.clone()).collect(),
+            Some(("preset", _)) => ctx.snap.presets.by_name.keys().cloned().collect(),
             Some(("source", _)) => ["local", "repository"]
                 .into_iter()
                 .map(str::to_owned)
@@ -199,18 +195,10 @@ impl Completion {
 }
 
 fn token_range(text: &str, cursor: usize) -> Range<usize> {
-    let start = text[..cursor]
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_whitespace())
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    let end = text[cursor..]
-        .char_indices()
-        .find(|(_, c)| c.is_whitespace())
-        .map(|(i, _)| cursor + i)
-        .unwrap_or(text.len());
-    start..end
+    skills::search::query_token_ranges(text)
+        .into_iter()
+        .find(|range| range.start <= cursor && cursor <= range.end)
+        .unwrap_or(cursor..cursor)
 }
 
 fn candidates(token: &str, values: BTreeSet<String>) -> Vec<String> {
@@ -224,16 +212,21 @@ fn candidates(token: &str, values: BTreeSet<String>) -> Vec<String> {
             (
                 "",
                 token,
-                ["repo:", "tag:", "agent:", "status:"]
+                ["repo:", "tag:", "preset:", "agent:", "status:"]
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
             )
         };
+    let query = if prefix == "repo" {
+        skills::search::source_query_value(query)
+    } else {
+        query.to_owned()
+    };
     let mut ranked: Vec<_> = choices
         .into_iter()
-        .filter(|value| !value.chars().any(char::is_whitespace))
-        .filter_map(|value| score(query, &value).map(|score| (score, value)))
+        .filter(|value| prefix == "repo" || !value.chars().any(char::is_whitespace))
+        .filter_map(|value| score(&query, &value).map(|score| (score, value)))
         .collect();
     ranked.sort();
     ranked
@@ -241,6 +234,8 @@ fn candidates(token: &str, values: BTreeSet<String>) -> Vec<String> {
         .map(|(_, value)| {
             if prefix.is_empty() {
                 value
+            } else if prefix == "repo" {
+                skills::search::source_query_token(&value)
             } else {
                 format!("{prefix}:{value}")
             }
@@ -301,6 +296,30 @@ mod tests {
         }
         assert!(candidates("repo:unknown", values).is_empty());
         assert_eq!(candidates("rep", BTreeSet::new()), vec!["repo:"]);
+    }
+
+    #[test]
+    fn source_name_completion_quotes_spaces_and_replaces_the_whole_value() {
+        let values = ["Merlin Skills".into(), "Other Package".into()]
+            .into_iter()
+            .collect();
+        assert_eq!(candidates("repo:merl", values), ["repo:\"Merlin Skills\""]);
+        let mut input = Input::with_value("tag:work repo:\"Merlin Sk\"");
+        let range = token_range(input.value(), input.cursor_byte());
+        assert_eq!(&input.value()[range.clone()], "repo:\"Merlin Sk\"");
+        let mut popup = Completion {
+            token: range,
+            choices: vec!["repo:\"Merlin Skills\"".into()],
+            ..Default::default()
+        };
+        popup.accept(&mut input);
+        assert_eq!(input.value(), "tag:work repo:\"Merlin Skills\" ");
+        let partial = "repo:\"Merlin Sk";
+        assert_eq!(token_range(partial, partial.len()), 0..partial.len());
+        assert_eq!(
+            candidates(partial, ["Merlin Skills".into()].into_iter().collect()),
+            ["repo:\"Merlin Skills\""]
+        );
     }
     #[test]
     fn token_replacement_preserves_other_filters_and_unicode() {

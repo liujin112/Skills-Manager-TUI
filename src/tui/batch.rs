@@ -131,25 +131,22 @@ impl Batch {
         Self::new(Kind::Deploy, keys, rows)
     }
     pub fn presets(keys: Vec<String>, ctx: &Ctx) -> Self {
-        match ctx.ws.presets.list() {
-            Ok(presets) => {
-                let rows = presets
-                    .into_iter()
-                    .map(|p| Row {
-                        count: keys.iter().filter(|k| p.skills.contains(k)).count(),
-                        label: p.name.clone(),
-                        id: p.name,
-                        desired: None,
-                    })
-                    .collect();
-                Self::new(Kind::Presets, keys, rows)
-            }
-            Err(e) => {
-                let mut b = Self::new(Kind::Presets, keys, vec![]);
-                b.error = Some(format!("{e:#}"));
-                b
-            }
-        }
+        let rows = ctx
+            .snap
+            .presets
+            .by_name
+            .values()
+            .map(|preset| Row {
+                count: keys
+                    .iter()
+                    .filter(|key| preset.skills.contains(key))
+                    .count(),
+                label: preset.name.clone(),
+                id: preset.name.clone(),
+                desired: None,
+            })
+            .collect();
+        Self::new(Kind::Presets, keys, rows)
     }
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
@@ -479,11 +476,7 @@ impl Batch {
                             }
                         }
                         Ok((
-                            format!(
-                                "Added {} skills to {} presets",
-                                targets.len(),
-                                originals.len()
-                            ),
+                            format!("Added missing skills to {} presets", originals.len()),
                             (!intents.is_empty()).then_some(history::Intent::Meta(intents)),
                         ))
                     }),
@@ -689,7 +682,7 @@ impl Batch {
                 rect.y = inner.y + rect.y - first_chip_row + u16::from(overflow);
                 f.render_widget(
                     Paragraph::new(Line::from(
-                        crate::tui::components::group::Pill::new(
+                        crate::tui::components::group::TagLabel::new(
                             body.trim(),
                             crate::tui::components::group::tag_fill(&name, ctx),
                         )
@@ -762,7 +755,7 @@ impl Batch {
                         );
                         let mut spans = vec![Span::raw(" ")];
                         spans.extend(
-                            crate::tui::components::group::Pill::new(&label, fill)
+                            crate::tui::components::group::TagLabel::new(&label, fill)
                                 .render(ctx, usize::MAX),
                         );
                         spans.extend([
@@ -911,7 +904,7 @@ impl Batch {
                         Err(e) => e.to_string(),
                     }
                 } else {
-                    "Selected presets receive all selected skills.".into()
+                    "Add selected skills to each chosen Preset's fixed member list.".into()
                 }
             })
         };
@@ -1285,11 +1278,17 @@ mod tests {
     fn adding_to_several_presets_preserves_members_and_groups_history() {
         let fixture = Fixture::new();
         let ws = Workspace::open(&fixture.0).unwrap();
+        edit::tag_add(&ws, "alpha", &["dev".into()]).unwrap();
+        let ws = Workspace::open(&fixture.0).unwrap();
         for name in ["one", "two"] {
             ws.presets
                 .save(&skills::preset::Preset {
                     name: name.into(),
-                    skills: vec!["other".into()],
+                    skills: if name == "one" {
+                        vec!["other".into(), "alpha".into()]
+                    } else {
+                        vec!["other".into()]
+                    },
                     ..Default::default()
                 })
                 .unwrap();
@@ -1306,6 +1305,8 @@ mod tests {
             },
         };
         let mut batch = Batch::presets(vec!["alpha".into(), "beta".into()], &ctx);
+        assert_eq!(batch.rows[0].count, 1);
+        assert_eq!(batch.rows[1].count, 0);
         for row in &mut batch.rows {
             row.desired = Some(true);
         }
@@ -1314,15 +1315,16 @@ mod tests {
         };
         let (_, intent) = write(&ws).unwrap();
         for name in ["one", "two"] {
-            assert_eq!(
-                ws.presets.load(name).unwrap().unwrap().skills,
-                vec!["alpha", "beta", "other"]
-            );
+            let preset = ws.presets.load(name).unwrap().unwrap();
+            assert_eq!(preset.members(), vec!["alpha", "beta", "other"]);
         }
         let Some(history::Intent::Meta(changes)) = intent else {
             panic!("expected metadata intent")
         };
         assert_eq!(changes.len(), 2);
+        edit::tag_remove(&ws, "alpha", &["dev".into()]).unwrap();
+        let preset = ws.presets.load("one").unwrap().unwrap();
+        assert_eq!(preset.members(), vec!["alpha", "beta", "other"]);
     }
     #[test]
     fn deployment_plans_omit_satisfied_targets_without_writing() {

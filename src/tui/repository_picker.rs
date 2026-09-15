@@ -12,6 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{List, ListItem, Paragraph},
 };
+use skills::meta::SourceKind;
 use skills::reconcile::{SkillRecord, SkillStatus, Snapshot};
 use skills::repository::{FetchedRepository, overlaps, related};
 use skills::search::{Query, Searcher};
@@ -26,14 +27,15 @@ pub struct InstallSelection {
 
 pub struct RepositoryPicker {
     pub selection: InstallSelection,
+    source_name: Input,
     alias: Input,
     search: Input,
-    name: Input,
-    focus: u8, // alias, search, list, selected local name
+    local_name: Input,
+    focus: u8, // storage folder, search, list, selected skill name, source name
     list: ListNav,
     shown: Vec<String>,
     rect: Rect,
-    fields: [Rect; 3],
+    fields: [Rect; 4],
     candidates: Snapshot,
     searcher: Searcher,
     matching: BTreeSet<String>,
@@ -71,6 +73,17 @@ impl RepositoryPicker {
     }
     pub fn restore(selection: InstallSelection) -> Self {
         let alias = Input::with_value(&selection.fetched.repository.alias);
+        let repository = &selection.fetched.repository;
+        let needs_name = repository.kind == SourceKind::Archive
+            && repository
+                .name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty());
+        let source_name = Input::with_value(&if needs_name {
+            String::new()
+        } else {
+            repository.display_name()
+        });
         let candidates = candidate_snapshot(&selection.fetched);
         let mut this = Self {
             candidates,
@@ -80,14 +93,15 @@ impl RepositoryPicker {
             completion: Completion::default(),
             preview: Overlay::default(),
             selection,
+            source_name,
             alias,
             search: Input::default(),
-            name: Input::default(),
-            focus: 1,
+            local_name: Input::default(),
+            focus: if needs_name { 4 } else { 1 },
             list: ListNav::default(),
             shown: vec![],
             rect: Rect::default(),
-            fields: [Rect::default(); 3],
+            fields: [Rect::default(); 4],
         };
         this.refilter();
         this
@@ -265,6 +279,77 @@ impl RepositoryPicker {
         }
         vec![]
     }
+    fn save_source_name(&mut self, ctx: &Ctx) -> Vec<Action> {
+        if let Err(error) = self
+            .selection
+            .fetched
+            .repository
+            .set_name(self.source_name.value())
+        {
+            self.focus = 4;
+            return vec![Action::Error(format!("{error:#}"))];
+        }
+        self.candidates = candidate_snapshot(&self.selection.fetched);
+        self.refilter();
+        self.update_completion(ctx);
+        vec![]
+    }
+    fn save_focused_field(&mut self, ctx: &Ctx) -> Vec<Action> {
+        match self.focus {
+            0 => {
+                let value = self.alias.value().trim();
+                if !skills::util::valid_skill_key(value) {
+                    return vec![Action::Error("invalid storage folder".into())];
+                }
+                self.selection.fetched.repository.alias = value.into();
+            }
+            3 => {
+                if let Some(path) = self.selected() {
+                    let value = self.local_name.value().trim();
+                    if !skills::util::valid_skill_key(value) {
+                        return vec![Action::Error("invalid local skill name".into())];
+                    }
+                    self.selection.names.insert(path, value.into());
+                }
+            }
+            4 => return self.save_source_name(ctx),
+            _ => {}
+        }
+        vec![]
+    }
+    fn focus_local_name(&mut self, ctx: &Ctx) -> bool {
+        if let Some(path) = self.selected()
+            && self.selection.fetched.choices.contains(&path)
+        {
+            self.local_name = Input::with_value(&self.resolved_name(&path, ctx));
+            self.focus = 3;
+            true
+        } else {
+            false
+        }
+    }
+    fn next_focus(&mut self, backwards: bool, ctx: &Ctx) -> Vec<Action> {
+        let actions = self.save_focused_field(ctx);
+        if !actions.is_empty() {
+            return actions;
+        }
+        let order = [4, 0, 1, 2, 3];
+        let at = order
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or(0);
+        let next = if backwards {
+            (at + 4) % 5
+        } else {
+            (at + 1) % 5
+        };
+        self.focus = order[next];
+        if self.focus == 3 && !self.focus_local_name(ctx) {
+            self.focus = if backwards { 2 } else { 4 };
+        }
+        self.completion.close();
+        vec![]
+    }
     pub fn hints(&self) -> Hints {
         if let Some(hints) = self.preview.hints() {
             return hints;
@@ -282,15 +367,16 @@ impl RepositoryPicker {
                 ("Space", "select"),
                 ("v", "preview"),
                 ("Enter", "install"),
-                ("a", "repo alias"),
-                ("e", "local name"),
+                ("n", "source name"),
+                ("a", "storage folder"),
+                ("e", "skill name"),
                 ("/", "filter"),
                 ("Esc", "cancel"),
             ],
             _ => &[
                 ("type", "edit"),
                 ("Enter/↓", "list"),
-                ("↓", "results"),
+                ("Tab/⇧Tab", "fields"),
                 ("Esc", "cancel"),
             ],
         }
@@ -303,7 +389,8 @@ impl RepositoryPicker {
         let input = match self.focus {
             0 => &mut self.alias,
             1 => &mut self.search,
-            3 => &mut self.name,
+            3 => &mut self.local_name,
+            4 => &mut self.source_name,
             _ => return vec![],
         };
         match input.paste(text) {
@@ -349,22 +436,14 @@ impl RepositoryPicker {
             self.selection.fetched.cleanup();
             return vec![Action::CloseModal];
         }
+        if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            return self.next_focus(k.code == KeyCode::BackTab, ctx);
+        }
         if self.focus != 2 {
             if matches!(k.code, KeyCode::Enter | KeyCode::Down) {
-                if self.focus == 0 {
-                    let value = self.alias.value().trim();
-                    if !skills::util::valid_skill_key(value) {
-                        return vec![Action::Error("invalid repository alias".into())];
-                    }
-                    self.selection.fetched.repository.alias = value.into();
-                } else if self.focus == 3
-                    && let Some(path) = self.selected()
-                {
-                    let value = self.name.value().trim();
-                    if !skills::util::valid_skill_key(value) {
-                        return vec![Action::Error("invalid local name".into())];
-                    }
-                    self.selection.names.insert(path, value.into());
+                let actions = self.save_focused_field(ctx);
+                if !actions.is_empty() {
+                    return actions;
                 }
                 self.focus = 2;
                 self.completion.close();
@@ -381,7 +460,10 @@ impl RepositoryPicker {
                     }
                 }
                 3 => {
-                    self.name.handle_key(k);
+                    self.local_name.handle_key(k);
+                }
+                4 => {
+                    self.source_name.handle_key(k);
                 }
                 _ => {}
             }
@@ -406,13 +488,9 @@ impl RepositoryPicker {
                 .move_by(-(self.list.rows.height as i32), self.shown.len()),
             KeyCode::Char('/') => self.focus = 1,
             KeyCode::Char('a') => self.focus = 0,
+            KeyCode::Char('n') => self.focus = 4,
             KeyCode::Char('e') => {
-                if let Some(path) = self.selected()
-                    && self.selection.fetched.choices.contains(&path)
-                {
-                    self.name = Input::with_value(&self.resolved_name(&path, ctx));
-                    self.focus = 3;
-                }
+                self.focus_local_name(ctx);
             }
             KeyCode::Char(' ') => {
                 if let Some(path) = self.selected() {
@@ -422,9 +500,14 @@ impl RepositoryPicker {
             KeyCode::Enter => {
                 let alias = self.alias.value().trim();
                 if !skills::util::valid_skill_key(alias) {
-                    return vec![Action::Error("invalid repository alias".into())];
+                    self.focus = 0;
+                    return vec![Action::Error("invalid storage folder".into())];
                 }
                 self.selection.fetched.repository.alias = alias.into();
+                let actions = self.save_source_name(ctx);
+                if !actions.is_empty() {
+                    return actions;
+                }
                 let mut selection = self.selection.clone();
                 selection.paths.retain(|p| self.matches_filter(p));
                 if selection.paths.is_empty() {
@@ -475,15 +558,25 @@ impl RepositoryPicker {
                 if !self.rect.contains(at) {
                     return self.key(KeyEvent::new(KeyCode::Esc, m.modifiers), ctx);
                 }
-                if self.focus == 3 && !self.fields[2].contains(at) {
-                    let actions = self.key(KeyEvent::new(KeyCode::Enter, m.modifiers), ctx);
+                let focused_field = match self.focus {
+                    0 => Some(0),
+                    1 => Some(1),
+                    3 => Some(2),
+                    4 => Some(3),
+                    _ => None,
+                };
+                if focused_field.is_some_and(|i| !self.fields[i].contains(at)) {
+                    let actions = self.save_focused_field(ctx);
                     if !actions.is_empty() {
                         return actions;
                     }
                 }
                 if self.fields[2].contains(at) {
-                    self.focus = 2;
-                    return self.key(KeyEvent::new(KeyCode::Char('e'), m.modifiers), ctx);
+                    if self.focus != 3 {
+                        self.focus_local_name(ctx);
+                    }
+                    self.local_name.click(m.column);
+                    return vec![];
                 }
                 if self.fields[0].contains(at) {
                     self.focus = 0;
@@ -491,6 +584,9 @@ impl RepositoryPicker {
                 } else if self.fields[1].contains(at) {
                     self.focus = 1;
                     self.search.click(m.column);
+                } else if self.fields[3].contains(at) {
+                    self.focus = 4;
+                    self.source_name.click(m.column);
                 } else if self.list.rows.contains(at)
                     && let Some((i, _)) = self.list.click(m.row, self.shown.len())
                 {
@@ -533,26 +629,52 @@ impl RepositoryPicker {
         );
         let inner = block.inner(r);
         f.render_widget(block, r);
+        self.fields = [Rect::default(); 4];
+        self.list.rows = Rect::default();
         if inner.height < 6 {
             return;
         }
-        for (i, label) in [(0, "repo alias"), (1, "filter"), (2, "local name")] {
+        let archive = self.selection.fetched.repository.kind == SourceKind::Archive;
+        let compact = inner.width < 56;
+        let source_label = match (archive, compact) {
+            (true, false) => "Package name (required)",
+            (true, true) => "Package name *",
+            (false, _) => "Source name",
+        };
+        let label_width = if compact { 16 } else { 24 }.min(inner.width);
+        for (i, label) in [
+            (3, source_label),
+            (0, "Storage folder"),
+            (1, "Filter"),
+            (2, "Local skill name"),
+        ] {
             let y = if i == 2 {
                 inner.bottom() - 1
             } else {
-                inner.y + i as u16
+                inner.y + if i == 3 { 0 } else { i as u16 + 1 }
             };
             f.render_widget(
                 Paragraph::new(Span::styled(label, th.dim())),
-                Rect::new(inner.x, y, 12.min(inner.width), 1),
+                Rect::new(inner.x, y, label_width, 1),
             );
             self.fields[i] = Rect::new(
-                inner.x + 12.min(inner.width),
+                inner.x + label_width,
                 y,
-                inner.width.saturating_sub(12),
+                inner.width.saturating_sub(label_width),
                 1,
             );
         }
+        self.source_name.render(
+            f,
+            self.fields[3],
+            self.focus == 4,
+            if archive {
+                "required · e.g. merlin"
+            } else {
+                "owner/repository"
+            },
+            th,
+        );
         self.alias
             .render(f, self.fields[0], self.focus == 0, "", th);
         self.search.render(
@@ -563,7 +685,7 @@ impl RepositoryPicker {
             th,
         );
         if self.focus == 3 {
-            self.name.render(f, self.fields[2], true, "", th);
+            self.local_name.render(f, self.fields[2], true, "", th);
         } else if let Some(path) = self.selected() {
             let name = self.resolved_name(&path, ctx);
             f.render_widget(
@@ -573,9 +695,9 @@ impl RepositoryPicker {
         }
         self.list.rows = Rect::new(
             inner.x,
-            inner.y + 3,
+            inner.y + 4,
             inner.width,
-            inner.height.saturating_sub(4),
+            inner.height.saturating_sub(5),
         );
         let root_skill = self.selection.fetched.choices.iter().any(String::is_empty);
         let rows: Vec<_> = self
@@ -605,7 +727,7 @@ impl RepositoryPicker {
                     "[ ] "
                 };
                 let label = if path.is_empty() {
-                    ". (repository root)"
+                    ". (source root)"
                 } else {
                     path.rsplit('/').next().unwrap_or(path)
                 };
@@ -674,10 +796,10 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                 external: false,
                 name_mismatch: false,
                 tags: vec![],
-                presets: Vec::new(),
-                source_name: None,
+                presets: vec![],
                 note: None,
                 source: Some(fetched.repository.source(key, Some(&fetched.revision))),
+                source_name: Some(fetched.repository.display_name()),
                 current_hash: None,
                 baseline_hash: None,
                 deploy: BTreeMap::new(),
@@ -687,10 +809,12 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
         .collect();
     Snapshot {
         root: fetched.workdir.clone(),
-        presets: Default::default(),
-        repositories: Default::default(),
         skills,
         agents: vec![],
+        presets: Default::default(),
+        repositories: [(fetched.repository.alias.clone(), fetched.repository.clone())]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -715,7 +839,7 @@ mod tests {
         let ws = Workspace::open(&root).unwrap();
         let fetched = FetchedRepository {
             repository: Repository {
-                name: None,
+                name: Some("sample/tools".into()),
                 kind: skills::meta::SourceKind::Archive,
                 alias: "sample-tools".into(),
                 url: "https://example.com/sample/tools".into(),
@@ -780,6 +904,225 @@ mod tests {
             .collect();
         assert!(text.contains("reader"));
         assert!(text.contains("writer"));
+    }
+
+    #[test]
+    fn archive_name_is_required_and_retained_through_browsing_and_install_retry() {
+        let temp = skills::ops::DownloadDir::new("archive-name-picker").unwrap();
+        let root = temp.path().join("library");
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let fetched = FetchedRepository {
+            repository: Repository {
+                name: None,
+                kind: SourceKind::Archive,
+                alias: "latest--skills.tar".into(),
+                url: "https://example.com/latest/skills.tar".into(),
+                branch: String::new(),
+            },
+            revision: "digest".into(),
+            workdir: temp.path().join("download"),
+            choices: vec!["reader".into()],
+            invalid: BTreeMap::new(),
+        };
+        std::fs::create_dir_all(fetched.workdir.join("reader")).unwrap();
+        std::fs::write(
+            fetched.workdir.join("reader/SKILL.md"),
+            "---\nname: reader\ndescription: Read a project\n---\nRead code\n",
+        )
+        .unwrap();
+        let mut picker = RepositoryPicker::new(fetched, &ctx);
+        let press = |picker: &mut RepositoryPicker, code| {
+            picker.key(KeyEvent::new(code, KeyModifiers::NONE), &ctx)
+        };
+        assert_eq!(picker.focus, 4);
+        assert!(picker.source_name.value().is_empty());
+        picker.focus = 2;
+        assert!(matches!(
+            &press(&mut picker, KeyCode::Enter)[0],
+            Action::Error(_)
+        ));
+        assert_eq!(picker.focus, 4);
+
+        assert!(picker.paste("Merlin Tools", &ctx).is_empty());
+        assert!(press(&mut picker, KeyCode::Enter).is_empty());
+        assert_eq!(picker.focus, 2);
+        assert_eq!(
+            picker.selection.fetched.repository.name.as_deref(),
+            Some("Merlin Tools")
+        );
+        assert_eq!(
+            picker
+                .candidates
+                .get("reader")
+                .unwrap()
+                .source_name
+                .as_deref(),
+            Some("Merlin Tools")
+        );
+        assert_eq!(
+            picker.selection.fetched.repository.alias,
+            "latest--skills.tar"
+        );
+
+        press(&mut picker, KeyCode::Char('/'));
+        picker.paste("repo:\"Merlin Tools\"", &ctx);
+        assert!(picker.matches_filter("reader"));
+        picker.search = Input::default();
+        picker.refilter();
+        picker.completion.close();
+        press(&mut picker, KeyCode::Enter);
+        press(&mut picker, KeyCode::Char('v'));
+        assert!(picker.preview.is_open());
+        press(&mut picker, KeyCode::Esc);
+        assert_eq!(picker.source_name.value(), "Merlin Tools");
+
+        press(&mut picker, KeyCode::Char('e'));
+        picker.local_name = Input::with_value("project-reader");
+        press(&mut picker, KeyCode::Enter);
+        let selected = press(&mut picker, KeyCode::Enter)
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Spawn(Task::InstallRepository(selection)) => Some(*selection),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            selected.names.get("reader").map(String::as_str),
+            Some("project-reader")
+        );
+        let mut restored = RepositoryPicker::restore(selected);
+        assert_eq!(restored.source_name.value(), "Merlin Tools");
+        assert_eq!(
+            restored.selection.fetched.repository.alias,
+            "latest--skills.tar"
+        );
+        assert_eq!(
+            restored.selection.names.get("reader").map(String::as_str),
+            Some("project-reader")
+        );
+
+        for (width, height) in [(120, 35), (80, 24), (44, 20), (24, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| restored.draw(f, f.area(), &ctx)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            if width >= 80 {
+                assert!(text.contains("Package name (required)"));
+                assert!(text.contains("Merlin Tools"));
+                assert!(text.contains("Storage folder"));
+                assert!(text.contains("Local skill name"));
+            } else if width >= 44 {
+                assert!(text.contains("Package name *"));
+                assert!(text.contains("Merlin Tools"));
+            }
+            assert!(
+                restored
+                    .fields
+                    .iter()
+                    .all(|field| field.right() <= width && field.bottom() <= height)
+            );
+        }
+    }
+
+    #[test]
+    fn source_name_navigation_is_separate_from_storage_and_skill_names() {
+        let temp = skills::ops::DownloadDir::new("source-name-navigation").unwrap();
+        let root = temp.path().join("library");
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = RepositoryPicker::restore(InstallSelection {
+            fetched: FetchedRepository {
+                repository: Repository {
+                    name: None,
+                    kind: SourceKind::Git,
+                    alias: "sample--tools".into(),
+                    url: "https://github.com/sample/tools".into(),
+                    branch: "main".into(),
+                },
+                revision: "revision".into(),
+                workdir: temp.path().join("download"),
+                choices: vec!["reader".into()],
+                invalid: BTreeMap::new(),
+            },
+            paths: vec!["reader".into()],
+            names: BTreeMap::new(),
+        });
+        assert_eq!(picker.source_name.value(), "sample/tools");
+        assert_eq!(picker.focus, 1);
+        let press = |picker: &mut RepositoryPicker, code| {
+            picker.key(KeyEvent::new(code, KeyModifiers::NONE), &ctx)
+        };
+        press(&mut picker, KeyCode::BackTab);
+        assert_eq!(picker.focus, 0);
+        press(&mut picker, KeyCode::BackTab);
+        assert_eq!(picker.focus, 4);
+        picker.source_name = Input::with_value("Custom tools");
+        press(&mut picker, KeyCode::Tab);
+        assert_eq!(picker.focus, 0);
+        assert_eq!(
+            picker.selection.fetched.repository.name.as_deref(),
+            Some("Custom tools")
+        );
+        assert_eq!(picker.selection.fetched.repository.alias, "sample--tools");
+        assert!(picker.selection.names.is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
+        picker.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: picker.fields[3].x,
+                row: picker.fields[3].y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        assert_eq!(picker.focus, 4);
+        picker.source_name = Input::with_value("Changed tools");
+        picker.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: picker.fields[1].x,
+                row: picker.fields[1].y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        assert_eq!(picker.focus, 1);
+        assert_eq!(
+            picker.selection.fetched.repository.name.as_deref(),
+            Some("Changed tools")
+        );
     }
 
     #[test]

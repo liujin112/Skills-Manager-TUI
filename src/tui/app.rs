@@ -343,6 +343,16 @@ impl App {
             body: Rect::default(),
         };
         app.on_snapshot();
+        if let Some(report) = &app.ws.preset_migration {
+            app.toast(
+                format!(
+                    "Converted {} presets to fixed members · backup: {}",
+                    report.migrated_names.len(),
+                    report.backup_dir.display()
+                ),
+                Level::Info,
+            );
+        }
         Ok(app)
     }
 
@@ -586,10 +596,8 @@ impl App {
                             }
                         )),
                         Action::Search {
-                            query: format!(
-                                "repo:{}",
-                                skills::repository::source_name(&selection.fetched.repository.url)
-                                    .unwrap_or_else(|| selection.fetched.repository.alias.clone())
+                            query: skills::search::source_query_token(
+                                &selection.fetched.repository.display_name(),
                             ),
                             focus_list: true,
                         },
@@ -1250,9 +1258,10 @@ impl App {
         let label = match &task {
             Task::Scan | Task::PollRoot => None,
             Task::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
-            Task::InstallRepository(selection) => {
-                Some(format!("Install {}", selection.fetched.repository.alias))
-            }
+            Task::InstallRepository(selection) => Some(format!(
+                "Install {}",
+                selection.fetched.repository.display_name()
+            )),
             Task::Install { reference, .. } => Some(format!("Install {reference}")),
             Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
             Task::Prepare(key) => Some(format!("Prepare update: {key}")),
@@ -2133,8 +2142,8 @@ mod matrix_key_tests {
             }
             let fetched = skills::repository::FetchedRepository {
                 repository: skills::repository::Repository {
-                    name: None,
                     kind: Default::default(),
+                    name: None,
                     alias: reference.into(),
                     url: format!("https://example.com/sample/{reference}"),
                     branch: "main".into(),

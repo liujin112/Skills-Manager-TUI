@@ -1,7 +1,7 @@
 //! Presets tab: what each preset holds, and adding to or taking from it.
 //!
 //! Turning a preset on or off is the Agents page's job, one agent at a time.
-//! This page is where a preset is defined: which skills belong to it. The
+//! This page defines each package's fixed skill list. The
 //! cards summarize each preset's purpose and members; deployment lives on Agents.
 
 use super::matrix::Matrix;
@@ -9,8 +9,7 @@ use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::components::group;
 use crate::tui::components::group_prompt::Prompt;
-use crate::tui::components::layout::frame;
-use crate::tui::components::layout::split_panes;
+use crate::tui::components::layout::{frame, split_panes};
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
 use crate::tui::widgets::{CardGrid, ScrollTrack};
@@ -20,18 +19,15 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::history;
-use skills::preset::Preset;
+use skills::preset::{Preset, TagCoverage, tag_coverages};
+use std::collections::BTreeSet;
 
 #[derive(Default)]
 pub struct PresetsView {
     presets: Vec<Preset>,
-    tag_groups: Vec<(String, Vec<String>)>,
-    tag_cursor: usize,
-    tag_offset: usize,
-    tag_rects: Vec<(usize, Rect)>,
-    focus_tags: bool,
+    tag_groups: Vec<TagCoverage>,
+    tag_area: Rect,
     visible_members: Vec<String>,
-    tags_enabled: bool,
 
     all_presets: Vec<Preset>,
     filter: super::filter::Filter,
@@ -89,18 +85,12 @@ impl PresetsView {
         self.color_prompt.is_some()
             || self.filter.editing
             || (self.focus_members
-                && !self.focus_tags
                 && self
                     .skill_search
                     .as_ref()
                     .is_some_and(|(_, v)| v.input_focused()))
     }
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
-        let snap = self.member_snapshot(ctx);
-        let ctx = &Ctx {
-            snap: &snap,
-            ..*ctx
-        };
         if let Some(prompt) = self.color_prompt.as_mut() {
             return prompt.paste(text);
         }
@@ -110,7 +100,6 @@ impl PresetsView {
             return actions;
         }
         if self.focus_members
-            && !self.focus_tags
             && let Some((_, view)) = self.skill_search.as_mut()
         {
             return view.paste(text, ctx);
@@ -163,40 +152,6 @@ impl PresetsView {
         }
     }
 
-    // Presets can retain keys whose directories and metadata have been removed.
-    // Keep those members searchable and removable in the shared skill panel.
-    fn member_snapshot<'a>(
-        &self,
-        ctx: &Ctx<'a>,
-    ) -> std::borrow::Cow<'a, skills::reconcile::Snapshot> {
-        use skills::reconcile::{SkillRecord, SkillStatus};
-        let mut snap = std::borrow::Cow::Borrowed(ctx.snap);
-        for key in self.all_presets.iter().flat_map(|p| &p.skills) {
-            if snap.get(key).is_none() {
-                snap.to_mut().skills.push(SkillRecord {
-                    key: key.clone(),
-                    path: ctx.ws.root.join(key),
-                    status: SkillStatus::Missing,
-                    name: None,
-                    description: None,
-                    body: None,
-                    external: false,
-                    name_mismatch: false,
-                    tags: vec![],
-                    presets: Vec::new(),
-                    source_name: None,
-                    note: None,
-                    source: None,
-                    current_hash: None,
-                    baseline_hash: None,
-                    deploy: Default::default(),
-                    meta: None,
-                });
-            }
-        }
-        snap
-    }
-
     fn ensure_skill_search(&mut self, ctx: &Ctx) {
         let name = self.selected().map(|p| p.name.clone()).unwrap_or_default();
         if self
@@ -210,132 +165,48 @@ impl PresetsView {
                 LayoutScope::Presets,
                 ctx,
             );
+            view.hidden_group = Some((group::Kind::Preset, name.clone()));
             view.focus_list();
             self.skill_search = Some((name, view));
         }
     }
 
-    fn member_count(&self) -> usize {
-        self.visible_members.len()
-    }
-
     fn refresh_groups(&mut self, ctx: &Ctx) {
-        self.tags_enabled = ctx.settings.tags_enabled;
-        let selected = self.tag_groups.get(self.tag_cursor).map(|g| g.0.clone());
-        self.tag_groups.clear();
-        if self.tags_enabled {
-            let mut names: std::collections::BTreeSet<String> =
-                ctx.ws.config.tags.iter().map(|t| t.name.clone()).collect();
-            names.extend(ctx.snap.all_tags().into_keys());
-            for name in names {
-                let keys = ctx
-                    .snap
-                    .skills
-                    .iter()
-                    .filter(|r| r.status.is_present() && r.tags.contains(&name))
-                    .map(|r| r.key.clone())
-                    .collect();
-                self.tag_groups.push((name, keys));
-            }
-        }
-        self.tags_enabled = !self.tag_groups.is_empty();
-        if !self.tags_enabled {
-            self.focus_tags = false;
-        }
-        self.tag_cursor = selected
-            .and_then(|name| self.tag_groups.iter().position(|g| g.0 == name))
-            .unwrap_or(0);
-        self.visible_members = self
-            .selected()
-            .map(|p| p.skills.clone())
-            .unwrap_or_default();
+        self.visible_members = self.selected().map(Preset::members).unwrap_or_default();
+        self.tag_groups = if ctx.settings.tags_enabled {
+            let members: BTreeSet<_> = self.visible_members.iter().cloned().collect();
+            tag_coverages(&ctx.ws.config, &members)
+                .into_iter()
+                .filter(|tag| tag.included > 0)
+                .collect()
+        } else {
+            vec![]
+        };
     }
 
-    fn edit_members(&self, keys: Vec<String>, add: bool) -> Vec<Action> {
-        let Some(p) = self.selected() else {
+    fn remove_members(&self, keys: Vec<String>) -> Vec<Action> {
+        let Some(preset) = self.selected() else {
             return vec![];
         };
-        let name = p.name.clone();
+        let name = preset.name.clone();
         vec![Action::WriteMeta(Box::new(move |ws| {
             history::preset_edit(ws, &name, |members| {
-                if add {
-                    for key in &keys {
-                        if !members.contains(key) {
-                            members.push(key.clone());
-                        }
-                    }
-                } else {
-                    members.retain(|key| !keys.contains(key));
-                }
+                members.retain(|key| !keys.contains(key))
             })
         }))]
     }
 
-    fn toggle_members(&self, keys: Vec<String>) -> Vec<Action> {
-        let add = self
-            .selected()
-            .is_some_and(|p| keys.iter().any(|key| !p.skills.contains(key)));
-        self.edit_members(keys, add)
-    }
-
     fn draw_tags(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) -> Rect {
-        self.tag_rects.clear();
-        if !self.tags_enabled || area.height < 3 || self.selected().is_none() {
+        self.tag_area = Rect::default();
+        if self.tag_groups.is_empty() || area.height < 3 {
             return area;
         }
-        let budget = area.width.saturating_sub(4) as usize;
-        let members = self
-            .selected()
-            .map(|p| p.skills.clone())
-            .unwrap_or_default();
-        let rendered: Vec<_> = self
-            .tag_groups
-            .iter()
-            .enumerate()
-            .map(|(i, (name, keys))| {
-                let count = keys.iter().filter(|key| members.contains(key)).count();
-                group::Pill {
-                    coverage: Some((count, keys.len())),
-                    selected: i == self.tag_cursor,
-                    focused: self.focus_tags,
-                    ..group::Pill::new(name, group::tag_fill(name, ctx))
-                }
-                .render(ctx, budget)
-            })
-            .collect();
-        let widths: Vec<_> = rendered
-            .iter()
-            .map(|p| p.iter().map(Span::width).sum::<usize>() + 1)
-            .collect();
-        let visible =
-            super::agents::pill_window(&widths, self.tag_cursor, &mut self.tag_offset, budget);
-        let mut spans = vec![Span::styled(
-            if visible.start > 0 { "‹ " } else { "  " },
-            ctx.settings.theme.dim(),
-        )];
-        let mut x = area.x + 2;
-        for i in visible.clone() {
-            spans.extend(rendered[i].clone());
-            spans.push(Span::raw(" "));
-            self.tag_rects
-                .push((i, Rect::new(x, area.y + 1, (widths[i] - 1) as u16, 1)));
-            x += widths[i] as u16;
-        }
-        spans.push(Span::styled(
-            if visible.end < self.tag_groups.len() {
-                "›"
-            } else {
-                " "
-            },
-            ctx.settings.theme.dim(),
-        ));
+        self.tag_area = Rect { height: 3, ..area };
+        let spans =
+            group::tag_coverage_pills(&self.tag_groups, ctx, area.width.saturating_sub(4) as usize);
         f.render_widget(
             Paragraph::new(Line::from(spans)),
-            Rect {
-                y: area.y + 1,
-                height: 1,
-                ..area
-            },
+            Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 1),
         );
         Rect {
             y: area.y + 3,
@@ -350,15 +221,15 @@ impl PresetsView {
         self.with_selected(|p| Modal::preset_members(&p.name, ctx))
     }
 
-    /// Tags and presets share their identity, count and description layout.
+    /// Match the Tags sidebar while keeping package membership counts.
     fn preset_card(&self, p: &Preset, ctx: &Ctx, inner_w: usize) -> Vec<Line<'static>> {
-        group::group_card(
+        group::sidebar_card(
             &p.name,
-            p.skills.len(),
+            p.members().len(),
             p.description.as_deref(),
             group::preset_fill(p, ctx),
             inner_w,
-            &ctx.settings.theme,
+            ctx,
         )
     }
 
@@ -371,11 +242,7 @@ impl PresetsView {
             width: inner.width.saturating_sub(1),
             ..inner
         };
-        let heights = self
-            .presets
-            .iter()
-            .map(|preset| group::card_height(preset.description.as_deref()))
-            .collect();
+        let heights = self.presets.iter().map(group::preset_card_height).collect();
         self.list.layout_heights(content, heights);
         if self.presets.is_empty() {
             f.render_widget(
@@ -406,15 +273,11 @@ impl PresetsView {
             } else {
                 frame(f, cell, on, !self.focus_members && !self.filter.editing, th)
             };
-            let lines = self.preset_card(&self.presets[i], ctx, ci.width as usize);
-            f.render_widget(
-                Paragraph::new(lines).style(if cell.height < 3 && on {
-                    th.selected()
-                } else {
-                    ratatui::style::Style::default()
-                }),
-                ci,
+            let lines = group::fit_preset_card(
+                self.preset_card(&self.presets[i], ctx, ci.width as usize),
+                ci.height,
             );
+            f.render_widget(Paragraph::new(lines), ci);
         }
         group::draw_track(f, inner, &self.list, selected, &mut self.list_track, th);
     }
@@ -422,11 +285,6 @@ impl PresetsView {
 
 impl View for PresetsView {
     fn status(&self, ctx: &Ctx) -> String {
-        let snap = self.member_snapshot(ctx);
-        let ctx = &Ctx {
-            snap: &snap,
-            ..*ctx
-        };
         self.skill_search
             .as_ref()
             .map_or_else(String::new, |(_, v)| v.status(ctx))
@@ -439,12 +297,7 @@ impl View for PresetsView {
             .pending
             .clone()
             .or_else(|| self.selected().map(|p| p.name.clone()));
-        self.all_presets = ctx.ws.presets.list().unwrap_or_default();
-        let snap = self.member_snapshot(ctx);
-        let ctx = &Ctx {
-            snap: &snap,
-            ..*ctx
-        };
+        self.all_presets = ctx.snap.presets.by_name.values().cloned().collect();
         self.refilter();
         if let Some(i) = keep.and_then(|k| self.presets.iter().position(|p| p.name == k)) {
             self.list.select(Some(i));
@@ -459,11 +312,6 @@ impl View for PresetsView {
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        let snap = self.member_snapshot(ctx);
-        let ctx = &Ctx {
-            snap: &snap,
-            ..*ctx
-        };
         if let Some(prompt) = self.color_prompt.as_mut() {
             let result = prompt.key(k);
             return self.finish_color(result);
@@ -473,65 +321,12 @@ impl View for PresetsView {
         }
         self.refresh_groups(ctx);
         self.ensure_skill_search(ctx);
-        if self.focus_members && self.focus_tags {
-            match k.code {
-                KeyCode::Left | KeyCode::Char('h') if self.tag_cursor > 0 => self.tag_cursor -= 1,
-                KeyCode::Right | KeyCode::Char('l') => {
-                    self.tag_cursor = (self.tag_cursor + 1).min(self.tag_groups.len() - 1)
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.focus_tags = false;
-                    self.skill_search.as_mut().unwrap().1.focus_list();
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.focus_tags = false;
-                    self.skill_search.as_mut().unwrap().1.focus_input();
-                }
-                KeyCode::Esc | KeyCode::Left => {
-                    self.focus_members = false;
-                    self.focus_tags = false;
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    return self.toggle_members(self.tag_groups[self.tag_cursor].1.clone());
-                }
-                KeyCode::Char('a') => {
-                    return self.edit_members(self.tag_groups[self.tag_cursor].1.clone(), true);
-                }
-                KeyCode::Char('x') | KeyCode::Delete => {
-                    return self.edit_members(self.tag_groups[self.tag_cursor].1.clone(), false);
-                }
-                KeyCode::Char('/') => {
-                    self.focus_tags = false;
-                    self.skill_search.as_mut().unwrap().1.focus_input();
-                }
-                KeyCode::Char('m') => {
-                    self.focus_tags = false;
-                    let view = &mut self.skill_search.as_mut().unwrap().1;
-                    view.focus_list();
-                    return view.handle_key(k, ctx);
-                }
-                _ => return vec![],
-            }
-            return vec![];
-        }
-        if self.focus_members
-            && self
-                .skill_search
-                .as_ref()
-                .is_some_and(|(_, view)| view.panel_at_top())
-            && k.code == KeyCode::Up
-            && self.tags_enabled
-        {
-            self.focus_tags = true;
-            return vec![];
-        }
-
         if !self.focus_members && self.filter.key(k) {
             self.refilter();
             return vec![];
         }
         if self.focus_members
-            && let Some((name, view)) = self.skill_search.as_mut()
+            && let Some((_, view)) = self.skill_search.as_mut()
         {
             if k.code == KeyCode::Left && view.panel_back() {
                 self.focus_members = false;
@@ -540,36 +335,20 @@ impl View for PresetsView {
             if view.panel_actions_ready() {
                 if matches!(k.code, KeyCode::Char('x') | KeyCode::Delete) && k.modifiers.is_empty()
                 {
-                    let name = name.clone();
                     let keys = view.panel_keys(ctx);
-                    return vec![Action::WriteMeta(Box::new(move |ws| {
-                        history::preset_edit(ws, &name, |members| {
-                            members.retain(|key| !keys.contains(key))
-                        })
-                    }))];
+                    return self.remove_members(keys);
                 }
                 if k.code == KeyCode::Char('a') && k.modifiers.is_empty() {
-                    let keys = view.panel_keys(ctx);
-                    return self.edit_members(keys, true);
+                    return self.add_members(ctx);
                 }
             }
-            let editing = view.input_focused();
-            let actions = view.handle_key(k, ctx);
-            if editing
-                && !view.input_focused()
-                && matches!(k.code, KeyCode::Down | KeyCode::Enter)
-                && self.tags_enabled
-            {
-                self.focus_tags = true;
-            }
-            return actions;
+            return view.handle_key(k, ctx);
         }
         if k.code == KeyCode::Char('M') {
             self.matrix.open(ctx);
             return vec![];
         }
         let n = self.presets.len();
-        let m = self.member_count();
         match k.code {
             KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
             // Esc means "back" everywhere else in the program, so here it goes
@@ -600,20 +379,15 @@ impl View for PresetsView {
                 vec![]
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if m > 0 || self.tags_enabled {
+                if self.selected().is_some() {
                     self.focus_members = true;
-                    self.focus_tags = self.tags_enabled;
                 }
                 vec![]
             }
             KeyCode::Char('c') => vec![Action::OpenModal(Box::new(Modal::new_preset()))],
             KeyCode::Char('C') => {
                 if let Some(p) = self.selected() {
-                    self.color_prompt = Some(Prompt::for_color(
-                        &p.name,
-                        p.color.as_deref(),
-                        &ctx.settings.theme,
-                    ));
+                    self.color_prompt = Some(Prompt::for_preset_color(p, &ctx.settings.theme));
                 }
                 vec![]
             }
@@ -633,11 +407,6 @@ impl View for PresetsView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        let snap = self.member_snapshot(ctx);
-        let ctx = &Ctx {
-            snap: &snap,
-            ..*ctx
-        };
         if let Some(prompt) = self.color_prompt.as_mut() {
             let result = prompt.mouse(m);
             return self.finish_color(result);
@@ -650,13 +419,7 @@ impl View for PresetsView {
         let at = (m.column, m.row).into();
         let pressing = m.kind == MouseEventKind::Down(MouseButton::Left);
         let dragging = m.kind == MouseEventKind::Drag(MouseButton::Left);
-        if pressing
-            && let Some((index, _)) = self.tag_rects.iter().find(|(_, rect)| rect.contains(at))
-        {
-            self.tag_cursor = *index;
-            self.focus_members = true;
-            self.filter.editing = false;
-            self.focus_tags = true;
+        if self.tag_area.contains(at) {
             return vec![];
         }
         if pressing && self.filter.rect.contains(at) {
@@ -666,7 +429,6 @@ impl View for PresetsView {
         }
         if self.right.contains(at) {
             self.focus_members = true;
-            self.focus_tags = false;
             self.filter.editing = false;
             return self.skill_search.as_mut().unwrap().1.handle_mouse(m, ctx);
         }
@@ -695,11 +457,6 @@ impl View for PresetsView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let snap = self.member_snapshot(ctx);
-        let ctx = &Ctx {
-            snap: &snap,
-            ..*ctx
-        };
         self.refresh_groups(ctx);
         let (left, right) = split_panes(area, 38, ctx);
         self.left = left;
@@ -708,7 +465,7 @@ impl View for PresetsView {
         self.draw_presets(f, content, ctx);
         self.ensure_skill_search(ctx);
         if let Some((name, mut view)) = self.skill_search.take() {
-            view.set_panel_active(self.focus_members && !self.focus_tags);
+            view.set_panel_active(self.focus_members);
             view.draw_with_content_header(f, right, ctx, |f, content| {
                 self.draw_tags(f, content, ctx)
             });
@@ -724,15 +481,6 @@ impl View for PresetsView {
         if self.color_prompt.is_some() {
             return &[("↑↓", "colour"), ("Enter", "apply"), ("Esc", "cancel")];
         }
-        if self.focus_members && self.focus_tags {
-            return &[
-                ("←→", "tags"),
-                ("↓", "skills"),
-                ("Enter/Space", "toggle group"),
-                ("a/x", "add/remove group"),
-                ("Esc", "presets"),
-            ];
-        }
         if self.filter.editing {
             return &[("Enter/↓", "presets"), ("Esc", "clear filter")];
         }
@@ -747,7 +495,7 @@ impl View for PresetsView {
         if self.focus_members {
             &[
                 ("/", "filter skills"),
-                ("a", "add skills"),
+                ("a", "edit skills"),
                 ("x", "remove"),
                 ("m", "multi-select"),
                 ("Enter", "preview"),
@@ -761,7 +509,7 @@ impl View for PresetsView {
                 ("c", "create"),
                 ("C", "colour"),
                 ("M", "matrix"),
-                ("a", "add skills"),
+                ("a", "edit skills"),
                 ("e", "description"),
                 ("D", "delete preset"),
                 ("Esc/q", "library"),
@@ -838,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn preset_cards_show_members_and_fit_unicode_without_agent_status() {
+    fn preset_sidebar_cards_share_tag_style_and_fit_unicode_without_agent_status() {
         let root = skills::ops::DownloadDir::new("preset-card-test").unwrap();
         Config {
             agents: vec![],
@@ -875,6 +623,9 @@ mod tests {
         let view = PresetsView::default();
         let lines = view.preset_card(&preset, &ctx, 65);
         assert_eq!(lines.len(), 2);
+        assert!(lines[0].to_string().starts_with("● Office"));
+        assert_eq!(lines[0].spans[1].style, theme.bold());
+        assert!(lines[0].spans.iter().all(|span| span.style.bg.is_none()));
         let mut compact = preset.clone();
         compact.description = None;
         let compact_lines = view.preset_card(&compact, &ctx, 65);
@@ -907,6 +658,12 @@ mod tests {
                 text.contains("Office"),
                 "preset must remain visible at height {height}"
             );
+            if height >= 5 {
+                assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "╭");
+            }
+            if height >= 6 {
+                assert_eq!(terminal.backend().buffer()[(1, 4)].symbol(), "╰");
+            }
         }
         for width in 0..80 {
             assert!(
@@ -970,10 +727,7 @@ mod tests {
             assert!(!view.skill_search.as_ref().unwrap().1.panel_actions_ready());
             assert!(view.focus_members);
             assert_eq!(
-                view.skill_search.as_ref().unwrap().1.panel_keys(&Ctx {
-                    snap: &view.member_snapshot(&ctx),
-                    ..ctx
-                }),
+                view.skill_search.as_ref().unwrap().1.panel_keys(&ctx),
                 vec!["printer"]
             );
             assert_eq!(std::fs::read(ws.presets.path("reading")).unwrap(), before);
@@ -1005,13 +759,28 @@ mod tag_group_tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
+    use skills::{
+        Workspace,
+        config::{Config, TagConfig},
+    };
 
-    #[test]
-    fn tag_pills_show_coverage_edit_members_and_disappear_when_disabled() {
-        let temp = skills::ops::DownloadDir::new("preset-tags").unwrap();
+    fn fixture() -> (skills::ops::DownloadDir, Workspace) {
+        let temp = skills::ops::DownloadDir::new("preset-tag-coverage").unwrap();
         let root = temp.path();
-        skills::config::Config {
+        let tag = |name: &str, members: &[&str]| TagConfig {
+            name: name.into(),
+            skills: members.iter().map(|name| (*name).into()).collect(),
+            color: Some("blue".into()),
+            description: None,
+        };
+        Config {
             agents: vec![],
+            tags: vec![
+                tag("all", &["alpha", "beta", "beta"]),
+                tag("overlap", &["alpha", "gamma"]),
+                tag("zero", &["gamma"]),
+                tag("empty", &[]),
+            ],
             ..Default::default()
         }
         .save(root)
@@ -1024,30 +793,46 @@ mod tag_group_tests {
             )
             .unwrap();
         }
-        let mut ws = skills::Workspace::open(root).unwrap();
-        skills::ops::edit::tag_add(&ws, "alpha", &["python".into(), "testing".into()]).unwrap();
-        skills::ops::edit::tag_add(&ws, "beta", &["python".into()]).unwrap();
+        let ws = Workspace::open(root).unwrap();
         ws.presets
             .save(&Preset {
-                name: "dev".into(),
-                skills: vec!["alpha".into()],
+                name: "work".into(),
+                skills: vec!["alpha".into(), "beta".into(), "alpha".into()],
                 ..Default::default()
             })
             .unwrap();
-        ws.config = ws.load_config().unwrap();
+        (temp, ws)
+    }
+
+    #[test]
+    fn composition_counts_overlap_without_creating_an_editable_tag_selector() {
+        let (_temp, ws) = fixture();
         let snap = ws.scan().unwrap();
-        let theme = crate::tui::theme::Theme::default();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
-            settings: &{
-                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
-                settings.theme = theme;
-                settings
-            },
+            settings: &settings,
         };
         let mut view = PresetsView::default();
         view.refresh(&ctx);
+        assert_eq!(view.visible_members, ["alpha", "beta"]);
+        assert_eq!(
+            view.tag_groups,
+            [
+                TagCoverage {
+                    name: "all".into(),
+                    included: 2,
+                    total: 2
+                },
+                TagCoverage {
+                    name: "overlap".into(),
+                    included: 1,
+                    total: 2
+                },
+            ]
+        );
+        let before = std::fs::read(ws.presets.path("work")).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(130, 30)).unwrap();
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         let screen: String = terminal
@@ -1057,124 +842,112 @@ mod tag_group_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(screen.contains("python 1/2"));
-        assert!(screen.contains("testing 1/1"));
+        assert!(screen.contains("all"));
+        assert!(screen.contains("2/2"));
+        assert!(screen.contains("1/2"));
+        assert!(screen.contains('✓') && screen.contains('◐'));
+        assert!(!screen.contains("[✓]") && !screen.contains("[ ]"));
+        assert!(!screen.contains("zero") && !screen.contains("empty"));
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+        ] {
+            let actions = view.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: view.tag_area.x + 3,
+                    row: view.tag_area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &ctx,
+            );
+            assert!(actions.is_empty());
+            assert!(
+                !view.focus_members,
+                "read-only composition must not change focus"
+            );
+            assert!(!view.filter.editing);
+        }
         assert!(
-            terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .any(|cell| cell.symbol() == "/" && cell.bg != ratatui::style::Color::Reset)
+            view.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &ctx)
+                .is_empty()
         );
-        assert!(!screen.contains("Untagged"));
-        assert!(!screen.contains("All 1/"));
-        assert_eq!(view.tag_groups.len(), 2);
-        assert!(!screen.contains("[✓]"));
-        assert!(!screen.contains("[ ]"));
-        assert_eq!(view.visible_members, ["alpha"]);
-        let (index, rect) = view
-            .tag_rects
-            .iter()
-            .find(|(i, _)| view.tag_groups[*i].0 == "python")
-            .cloned()
-            .unwrap();
-        view.handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: rect.x,
-                row: rect.y,
-                modifiers: KeyModifiers::NONE,
-            },
-            &ctx,
-        );
-        assert_eq!(view.tag_cursor, index);
-        assert_eq!(view.visible_members, ["alpha"]);
-        let keys = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        let Action::WriteMeta(add) = view.handle_key(keys(KeyCode::Char('a')), &ctx).remove(0)
-        else {
-            panic!("group edit")
+        assert_eq!(std::fs::read(ws.presets.path("work")).unwrap(), before);
+        assert_eq!(view.visible_members, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn removing_a_member_does_not_modify_its_tags() {
+        let (_temp, ws) = fixture();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
         };
-        add(&ws).unwrap();
-        assert_eq!(
-            ws.presets.load("dev").unwrap().unwrap().skills,
-            ["alpha", "beta"]
-        );
-        assert!(ws.scan().unwrap().get("alpha").unwrap().deploy.is_empty());
-        // Removing a tag group leaves a member from another group alone.
-        skills::history::preset_edit(&ws, "dev", |members| members.push("gamma".into())).unwrap();
+        let mut view = PresetsView::default();
         view.refresh(&ctx);
-        let Action::WriteMeta(remove) = view.handle_key(keys(KeyCode::Char('x')), &ctx).remove(0)
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        view.handle_key(key(KeyCode::Right), &ctx);
+        let Action::WriteMeta(remove) = view.handle_key(key(KeyCode::Char('x')), &ctx).remove(0)
         else {
-            panic!("group edit")
+            panic!("member removal");
         };
         remove(&ws).unwrap();
-        assert_eq!(ws.presets.load("dev").unwrap().unwrap().skills, ["gamma"]);
         assert_eq!(
-            skills::config::Config::load(root)
-                .unwrap()
-                .skill_tags("alpha"),
-            ["python", "testing"]
+            ws.presets.load("work").unwrap().unwrap().members(),
+            ["beta"]
         );
-        view.focus_members = false;
-        view.focus_tags = false;
-        view.filter.input = crate::tui::widgets::Input::with_value("no-such-preset");
-        view.refilter();
-        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        assert!(
-            view.tag_rects.is_empty(),
-            "no coverage without a selected preset"
-        );
-        assert!(view.handle_key(keys(KeyCode::Esc), &ctx).is_empty());
-        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        assert!(
-            !view.tag_rects.is_empty(),
-            "clearing restores preset coverage"
-        );
-        skills::config::Config::set_tags_enabled(root, false).unwrap();
-        ws.config = ws.load_config().unwrap();
-        let snap = ws.scan().unwrap();
-        assert!(snap.skills.iter().all(|r| r.tags.is_empty()));
-        let ctx = Ctx {
-            ws: &ws,
-            snap: &snap,
-            settings: &{
-                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
-                settings.theme = theme;
-                settings
-            },
-        };
-        view.refresh(&ctx);
-        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        assert!(view.tag_rects.is_empty());
-        assert_eq!(view.visible_members, ["gamma"]);
-        assert!(!Tab::visible(false).contains(&Tab::Tags));
-        assert!(Tab::visible(true).contains(&Tab::Tags));
         assert_eq!(
-            skills::config::Config::load(root)
-                .unwrap()
-                .skill_tags("alpha"),
-            ["python", "testing"]
+            Config::load(&ws.root).unwrap().skill_tags("alpha"),
+            ["all", "overlap"]
         );
-        assert!(!root.join(".skills-meta/local.toml").exists());
-        skills::config::Config::edit_tags(root, |tags| tags.clear()).unwrap();
-        skills::config::Config::set_tags_enabled(root, true).unwrap();
-        ws.config = ws.load_config().unwrap();
-        let snap = ws.scan().unwrap();
-        let ctx = Ctx {
-            ws: &ws,
-            snap: &snap,
-            settings: &{
-                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
-                settings.theme = theme;
-                settings
-            },
-        };
-        view.refresh(&ctx);
-        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        assert!(view.tag_rects.is_empty());
-        assert_eq!(view.visible_members, ["gamma"]);
-        view.handle_key(keys(KeyCode::Right), &ctx);
-        assert!(!view.focus_tags);
+        assert!(ws.root.join("alpha/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn changing_or_hiding_tags_only_changes_the_composition_summary() {
+        let (_temp, mut ws) = fixture();
+        let mut view = PresetsView::default();
+        for (hide, expected_groups) in [(false, 2), (false, 1), (true, 0)] {
+            if expected_groups == 1 {
+                Config::edit_tags(&ws.root, |tags| {
+                    tags.iter_mut()
+                        .find(|tag| tag.name == "all")
+                        .unwrap()
+                        .skills
+                        .push("gamma".into());
+                    tags.iter_mut()
+                        .find(|tag| tag.name == "overlap")
+                        .unwrap()
+                        .skills = vec!["gamma".into()];
+                })
+                .unwrap();
+            }
+            Config::set_tags_enabled(&ws.root, !hide).unwrap();
+            ws.config = ws.load_config().unwrap();
+            let snap = ws.scan().unwrap();
+            let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+            let ctx = Ctx {
+                ws: &ws,
+                snap: &snap,
+                settings: &settings,
+            };
+            view.refresh(&ctx);
+            assert_eq!(view.visible_members, ["alpha", "beta"]);
+            assert_eq!(view.tag_groups.len(), expected_groups);
+            if expected_groups == 1 {
+                assert_eq!(
+                    (view.tag_groups[0].included, view.tag_groups[0].total),
+                    (2, 3)
+                );
+            }
+            assert_eq!(
+                ws.presets.load("work").unwrap().unwrap().members(),
+                ["alpha", "beta"]
+            );
+        }
     }
 }

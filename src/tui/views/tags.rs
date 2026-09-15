@@ -149,7 +149,8 @@ impl TagsView {
             LayoutScope::Tags,
             ctx,
         ));
-        self.skill_search.as_mut().unwrap().hide_tags = true;
+        self.skill_search.as_mut().unwrap().hidden_group =
+            self.actionable_tag().map(|tag| (group::Kind::Tag, tag));
         self.focus_grid = true;
     }
 
@@ -220,7 +221,12 @@ impl TagsView {
             .iter()
             .find(|t| t.name == tag)
             .and_then(|t| t.color.as_deref());
-        self.prompt = Some(Prompt::for_color(&tag, current, &ctx.settings.theme));
+        self.prompt = Some(Prompt::for_color(
+            group::Kind::Tag,
+            &tag,
+            current,
+            &ctx.settings.theme,
+        ));
         vec![]
     }
 
@@ -322,13 +328,13 @@ impl TagsView {
             } else {
                 frame(f, cell, on, focused && !self.filter.editing, th)
             };
-            let lines = group::group_card(
+            let lines = group::sidebar_card(
                 tag,
                 *count,
                 descriptions[i],
                 tag_fill(tag, ctx),
                 inner.width as usize,
-                th,
+                ctx,
             );
             f.render_widget(Paragraph::new(lines), inner);
         }

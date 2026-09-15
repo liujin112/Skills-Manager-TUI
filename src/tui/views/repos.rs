@@ -1,4 +1,4 @@
-//! Repository grouping of the existing inventory, including flat local skills.
+//! Installed Git repositories, URL packages and local skills from one inventory.
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::components::layout::split_panes;
@@ -10,10 +10,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{List, ListItem, Paragraph, Wrap},
 };
-use skills::repository::{Repository, alias_of};
+use skills::repository::alias_of;
 
 #[derive(Clone)]
 struct Project {
+    alias: Option<String>,
     name: String,
     local: bool,
     source: String,
@@ -30,7 +31,6 @@ pub struct ReposView {
     project: Option<usize>,
     nav: ListNav,
     saved_project: usize,
-    error: Option<String>,
     scroll: u16,
     reading: bool,
     right: Rect,
@@ -118,40 +118,42 @@ impl View for ReposView {
         let selected_project = self
             .project
             .and_then(|i| self.projects.get(i))
-            .map(|p| (p.local, p.name.clone()));
+            .map(|p| p.alias.clone());
         let selected_skill = self
             .nav
             .selected()
             .and_then(|i| self.members.get(i))
             .cloned();
         let mut groups = std::collections::BTreeMap::<Option<String>, Project>::new();
-        self.error = None;
-        match Repository::list(&ctx.ws.root) {
-            Ok(repos) => {
-                for repo in repos {
-                    let source =
-                        crate::tui::icons::source(ctx.settings.ui.icons, &repo.source("", None));
-                    groups.insert(
-                        Some(repo.alias.clone()),
-                        Project {
-                            name: repo.alias,
-                            local: false,
-                            source,
-                            keys: vec![],
-                        },
-                    );
-                }
-            }
-            Err(error) => self.error = Some(format!("{error:#}")),
+        for repo in ctx.snap.repositories.values() {
+            let source = crate::tui::icons::source(ctx.settings.ui.icons, &repo.source("", None));
+            let kind = match repo.kind {
+                skills::meta::SourceKind::Git => "Git repository",
+                skills::meta::SourceKind::Archive => "URL package",
+            };
+            groups.insert(
+                Some(repo.alias.clone()),
+                Project {
+                    alias: Some(repo.alias.clone()),
+                    name: repo.display_name(),
+                    local: false,
+                    source: format!("{kind} · {source}"),
+                    keys: vec![],
+                },
+            );
         }
         for record in &ctx.snap.skills {
             if let Some(alias) = alias_of(&record.key) {
                 groups
                     .entry(Some(alias.into()))
                     .or_insert_with(|| Project {
-                        name: alias.into(),
+                        alias: Some(alias.into()),
+                        name: record
+                            .source_display_name()
+                            .unwrap_or("Unregistered source")
+                            .into(),
                         local: false,
-                        source: "Unregistered repository".into(),
+                        source: "Unregistered source".into(),
                         keys: vec![],
                     })
                     .keys
@@ -160,6 +162,7 @@ impl View for ReposView {
                 groups
                     .entry(None)
                     .or_insert_with(|| Project {
+                        alias: None,
                         name: "Local skills".into(),
                         local: true,
                         source: "Skills outside repository directories".into(),
@@ -180,7 +183,7 @@ impl View for ReposView {
         if let Some(i) = self
             .projects
             .iter()
-            .position(|p| Some(&(p.local, p.name.clone())) == selected_project.as_ref())
+            .position(|p| Some(&p.alias) == selected_project.as_ref())
         {
             self.nav.select(Some(i));
             self.open();
@@ -215,7 +218,7 @@ impl View for ReposView {
         if self.project.is_some() && matches!(k.code, KeyCode::Char('/' | 'm')) {
             let mut view = super::search::SearchView::panel(
                 self.members.clone(),
-                "Repository skills".into(),
+                "Source skills".into(),
                 crate::tui::settings::LayoutScope::Repositories,
                 ctx,
             );
@@ -227,6 +230,16 @@ impl View for ReposView {
             return vec![];
         }
         match k.code {
+            KeyCode::Char('r') if self.project.is_none() => {
+                if let Some(project) = self.nav.selected().and_then(|i| self.projects.get(i))
+                    && let Some(alias) = project.alias.as_ref()
+                    && ctx.snap.repositories.contains_key(alias)
+                {
+                    return vec![Action::OpenModal(Box::new(
+                        crate::tui::modal::Modal::rename_source(alias, &project.name),
+                    ))];
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::PageDown => self.move_by(10),
@@ -280,7 +293,7 @@ impl View for ReposView {
             return;
         }
         let area = if self.project.is_none() {
-            self.filter.draw(f, area, "Filter repositories", ctx)
+            self.filter.draw(f, area, "Filter sources", ctx)
         } else {
             area
         };
@@ -294,7 +307,10 @@ impl View for ReposView {
                 if project.local {
                     ctx.ws.root.clone()
                 } else {
-                    ctx.ws.root.join("repos").join(&project.name)
+                    ctx.ws
+                        .root
+                        .join("repos")
+                        .join(project.alias.as_ref().unwrap())
                 }
             })
             .unwrap_or_else(|| ctx.ws.root.join("repos"));
@@ -327,7 +343,7 @@ impl View for ReposView {
         let title = if self.project.is_some() {
             " skills "
         } else {
-            " repositories "
+            " sources "
         };
         let block = ctx
             .settings
@@ -376,9 +392,6 @@ impl View for ReposView {
             ),
             Line::raw(""),
         ];
-        if let Some(error) = &self.error {
-            lines.push(Line::styled(error.clone(), ctx.settings.theme.err()));
-        }
         if let Some(i) = self.project {
             lines.push(Line::raw(self.projects[i].source.clone()));
             if let Some(record) = self
@@ -394,7 +407,7 @@ impl View for ReposView {
                     inner.width as usize,
                 ));
             } else {
-                lines.push(Line::raw("No installed skills in this repository."));
+                lines.push(Line::raw("No installed skills in this source."));
             }
         } else {
             if let Some(project) = self.nav.selected().and_then(|i| self.projects.get(i)) {
@@ -413,13 +426,21 @@ impl View for ReposView {
                 lines.push(Line::raw(project.source.clone()));
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Enter → browse skills",
+                    if project
+                        .alias
+                        .as_ref()
+                        .is_some_and(|alias| ctx.snap.repositories.contains_key(alias))
+                    {
+                        "Enter → browse skills · r rename source"
+                    } else {
+                        "Enter → browse skills"
+                    },
                     ctx.settings.theme.accent(),
                 ));
             }
             if self.projects.is_empty() {
                 lines.push(Line::raw(
-                    "No skills or repositories found. Install from Library first.",
+                    "No skills or sources found. Install from Library first.",
                 ));
             }
         }
@@ -435,14 +456,25 @@ impl View for ReposView {
 
     fn hints(&self) -> Hints {
         if self.filter.editing {
-            return &[("Enter/↓", "repositories"), ("Esc", "clear filter")];
+            return &[("Enter/↓", "sources"), ("Esc", "clear filter")];
         }
         if let Some(view) = self.skill_search.as_ref() {
             return view.hints();
         }
+        if self.project.is_some() {
+            return &[
+                ("↑↓", "navigate / scroll"),
+                ("Enter/→", "open"),
+                ("Esc/←", "back"),
+                ("Ctrl+r", "refresh"),
+                ("/", "filter skills"),
+                ("q", "library"),
+            ];
+        }
         &[
             ("↑↓", "navigate / scroll"),
             ("Enter/→", "open"),
+            ("r", "rename source"),
             ("Esc/←", "back"),
             ("Ctrl+r", "refresh"),
             ("/", "filter current list"),
@@ -454,6 +486,109 @@ impl View for ReposView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skills::repository::Repository;
+
+    #[test]
+    fn named_packages_use_shared_metadata_and_keep_storage_paths_when_renamed() {
+        let tmp = skills::ops::DownloadDir::new("named-package-display").unwrap();
+        let mut ws = skills::Workspace::open(tmp.path()).unwrap();
+        ws.config.agents.clear();
+        let repo = Repository {
+            alias: "stable-folder".into(),
+            name: Some("Merlin Skills".into()),
+            kind: skills::meta::SourceKind::Archive,
+            url: "https://example.test/latest/skills.tar".into(),
+            branch: String::new(),
+        };
+        repo.save(&ws).unwrap();
+        let key = "repos/stable-folder/review";
+        std::fs::create_dir_all(ws.root.join(key)).unwrap();
+        std::fs::write(
+            ws.root.join(key).join("SKILL.md"),
+            "---\nname: review\ndescription: test\n---\nBody",
+        )
+        .unwrap();
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(repo.source("review", None)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        settings.ui.icons = skills::config::Icons::Text;
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = ReposView::default();
+        view.refresh(&ctx);
+        assert_eq!(view.projects[0].name, "Merlin Skills");
+        assert!(view.projects[0].source.starts_with("URL package"));
+        let action = view.handle_key(
+            KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE),
+            &ctx,
+        );
+        assert!(matches!(action.as_slice(), [Action::OpenModal(_)]));
+        let record = snap.get(key).unwrap();
+        let badge =
+            crate::tui::components::skill::repository_badge(record, settings.ui.icons).unwrap();
+        assert_eq!(badge, "archive Merlin Skills");
+        let preview = super::super::preview::preview_lines(record, &ctx, &[], 180);
+        assert!(
+            preview
+                .iter()
+                .any(|line| line.to_string().contains("source   archive Merlin Skills"))
+        );
+        assert!(preview.iter().any(|line| {
+            line.to_string()
+                .contains("https://example.test/latest/skills.tar")
+        }));
+        let mut completion = super::super::completion::Completion::default();
+        let mut input = crate::tui::widgets::Input::with_value("repo:Merl");
+        completion.update(&input, &ctx);
+        completion.accept(&mut input);
+        assert_eq!(input.value(), "repo:\"Merlin Skills\" ");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 20)).unwrap();
+        terminal
+            .draw(|frame| view.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Merlin Skills · 1 skills"));
+        assert!(screen.contains("repos/stable-folder"));
+        assert!(!screen.contains("repos/Merlin Skills"));
+        view.open();
+        Repository::rename(&ws, "stable-folder", "Training Tools").unwrap();
+        // A view refresh consistently uses the supplied snapshot, even if metadata changed afterward.
+        view.refresh(&ctx);
+        assert_eq!(view.projects[0].name, "Merlin Skills");
+        let snap = ws.scan().unwrap();
+        let ctx = Ctx { snap: &snap, ..ctx };
+        view.refresh(&ctx);
+        assert_eq!(view.project, Some(0));
+        assert_eq!(view.projects[0].name, "Training Tools");
+        assert_eq!(view.members, [key]);
+        assert_eq!(
+            crate::tui::components::skill::repository_badge(
+                snap.get(key).unwrap(),
+                settings.ui.icons
+            )
+            .as_deref(),
+            Some("archive Training Tools")
+        );
+    }
+
     #[test]
     fn navigate_preview_refresh_and_render_small_terminals() {
         let tmp = skills::ops::DownloadDir::new("repos-view-test").unwrap();
@@ -582,7 +717,7 @@ mod tests {
         assert!(
             view.projects
                 .iter()
-                .any(|p| p.name == "empty" && p.keys.is_empty())
+                .any(|p| p.alias.as_deref() == Some("empty") && p.keys.is_empty())
         );
         let mut keys: Vec<_> = view.projects.iter().flat_map(|p| p.keys.clone()).collect();
         keys.sort();

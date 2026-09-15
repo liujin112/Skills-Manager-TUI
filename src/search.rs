@@ -780,6 +780,8 @@ fn damerau_levenshtein(a: &str, b: &str, max: usize) -> usize {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
+    /// Stable identity for retaining a selection when a new scan reorders records.
+    pub key: String,
     pub index: usize,
     pub score: f32,
     /// Fields that contained a match, ordered by weight (best first).
@@ -891,6 +893,7 @@ impl Searcher {
             return (0..records.len())
                 .filter(|i| allowed[*i])
                 .map(|index| Hit {
+                    key: records[index].key.clone(),
                     index,
                     score: 0.0,
                     fields: Vec::new(),
@@ -906,6 +909,7 @@ impl Searcher {
             .map(|h| {
                 let excerpt = excerpt_for(&records[h.doc], &h.terms, &h.fields);
                 Hit {
+                    key: records[h.doc].key.clone(),
                     index: h.doc,
                     score: h.score,
                     fields: h.fields,
