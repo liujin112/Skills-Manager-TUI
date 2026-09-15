@@ -1,5 +1,7 @@
 //! Library tab: input, result list, preview.
+mod context;
 use crate::tui::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
+use crate::tui::components::context_menu::{Command, Request, Target};
 
 use super::preview::{Overlay, preview_lines};
 use super::{View, wheel};
@@ -579,22 +581,14 @@ impl SearchView {
     }
 
     fn batch_action(&self, operation: char, ctx: &Ctx) -> Vec<Action> {
-        let keys = self.checked.iter().cloned().collect::<Vec<_>>();
-        if keys.is_empty() {
-            return vec![Action::Error("No selected skills".into())];
-        }
-        let modal = match operation {
-            't' => Modal::batch_tags(keys, ctx),
-            'd' => match &self.scope_agent {
-                Some(agent) => Modal::batch_deploy_agent(keys, agent, ctx),
-                None => Modal::batch_deploy(keys, ctx),
-            },
-            'p' => Modal::batch_presets(keys, ctx),
+        let command = match operation {
+            't' => Command::Tags,
+            'p' => Command::Presets,
+            'd' => Command::Deploy,
             _ => return vec![],
         };
-        vec![Action::OpenModal(Box::new(modal))]
+        self.batch_command(command, self.checked.iter().cloned().collect(), ctx)
     }
-
     fn render_state<'a>(
         &'a self,
         r: &SkillRecord,
@@ -1162,6 +1156,13 @@ impl SearchView {
 }
 
 impl View for SearchView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        self.menu_at(x, y, ctx)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        self.run_menu(target, command, ctx)
+    }
+
     fn focus_root(&mut self) {
         self.focus = Focus::List;
     }
@@ -1411,38 +1412,33 @@ impl View for SearchView {
                 // in a single column, Right opens the selected skill's preview.
                 KeyCode::Right | KeyCode::Char('l') if self.grid.cols() > 1 => self.move_sel(1),
                 KeyCode::Left | KeyCode::Char('h') if self.grid.cols() > 1 => self.move_sel(-1),
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_preview(ctx),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    acts = self.skill_command(Command::Open, ctx)
+                }
                 KeyCode::Char('t') if ctx.settings.tags_enabled => {
                     acts = if self.multi {
                         self.batch_action('t', ctx)
                     } else {
-                        self.act_tags(ctx)
+                        self.skill_command(Command::Tags, ctx)
                     }
                 }
-                KeyCode::Char('n') => acts = self.act_note(ctx),
+                KeyCode::Char('n') => acts = self.skill_command(Command::Note, ctx),
                 KeyCode::Char('d') => {
                     acts = if self.multi {
                         self.batch_action('d', ctx)
                     } else {
-                        self.act_deploy(ctx)
+                        self.skill_command(Command::Deploy, ctx)
                     }
                 }
-                KeyCode::Char('p') => {
-                    if let Some(record) = self.selected(ctx) {
-                        acts = vec![Action::OpenModal(Box::new(Modal::batch_presets(
-                            vec![record.key.clone()],
-                            ctx,
-                        )))];
-                    }
-                }
-                KeyCode::Char('r') => acts = self.act_rename(ctx),
-                KeyCode::Char('s') => acts = self.act_set_source(ctx),
-                KeyCode::Char('a') => acts = self.act_accept(ctx),
+                KeyCode::Char('p') => acts = self.skill_command(Command::Presets, ctx),
+                KeyCode::Char('r') => acts = self.skill_command(Command::Rename, ctx),
+                KeyCode::Char('s') => acts = self.skill_command(Command::Source, ctx),
+                KeyCode::Char('a') => acts = self.skill_command(Command::Accept, ctx),
                 KeyCode::Char('m') => self.multi = true,
-                KeyCode::Char('M') => acts = self.act_migrate(ctx),
-                KeyCode::Char('u') => acts = self.act_check(ctx),
-                KeyCode::Char('U') => acts = self.act_update(ctx),
-                KeyCode::Char('x') => acts = self.act_remove(ctx),
+                KeyCode::Char('M') => acts = self.skill_command(Command::Migrate, ctx),
+                KeyCode::Char('u') => acts = self.skill_command(Command::Check, ctx),
+                KeyCode::Char('U') => acts = self.skill_command(Command::Update, ctx),
+                KeyCode::Char('x') => acts = self.skill_command(Command::Remove, ctx),
                 KeyCode::Char('v') | KeyCode::Char('V') => {
                     // Cycle from most to least room per skill.
                     if self.is_picker() {
@@ -1485,19 +1481,19 @@ impl View for SearchView {
                     acts = if self.multi {
                         self.batch_action('t', ctx)
                     } else {
-                        self.act_tags(ctx)
+                        self.skill_command(Command::Tags, ctx)
                     }
                 }
-                KeyCode::Char('n') => acts = self.act_note(ctx),
+                KeyCode::Char('n') => acts = self.skill_command(Command::Note, ctx),
                 KeyCode::Char('d') => {
                     acts = if self.multi {
                         self.batch_action('d', ctx)
                     } else {
-                        self.act_deploy(ctx)
+                        self.skill_command(Command::Deploy, ctx)
                     }
                 }
-                KeyCode::Char('u') => acts = self.act_check(ctx),
-                KeyCode::Char('U') => acts = self.act_update(ctx),
+                KeyCode::Char('u') => acts = self.skill_command(Command::Check, ctx),
+                KeyCode::Char('U') => acts = self.skill_command(Command::Update, ctx),
                 _ => {}
             },
         }
@@ -1622,20 +1618,6 @@ impl View for SearchView {
                     }
                 }
             }
-        }
-        if let MouseEventKind::Down(MouseButton::Right) = m.kind
-            && self.list_rect.contains(at)
-            && self.grid.click(m.column, m.row).is_some()
-        {
-            self.focus = Focus::List;
-            if self.is_picker() {
-                return vec![];
-            }
-            return if self.multi {
-                self.batch_action('d', ctx)
-            } else {
-                self.act_deploy(ctx)
-            };
         }
         vec![]
     }

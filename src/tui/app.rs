@@ -11,6 +11,7 @@ use super::views::{
     search::SearchView, tags::TagsView,
 };
 use super::widgets::{SPINNER, fit, width};
+use crate::tui::components::context_menu::{ContextMenu, MenuEvent};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -190,6 +191,7 @@ pub struct App {
     pub health: HealthView,
     pub repos: ReposView,
     pub modal: Option<Modal>,
+    context_menu: Option<ContextMenu>,
     pending_task_ui: VecDeque<Action>,
     batch_running: bool,
     batch_modal_owned: bool,
@@ -334,6 +336,7 @@ impl App {
             health: HealthView::default(),
             repos: ReposView::default(),
             modal: None,
+            context_menu: None,
             pending_task_ui: VecDeque::new(),
             batch_running: false,
             batch_modal_owned: false,
@@ -379,6 +382,7 @@ impl App {
     }
 
     fn on_snapshot(&mut self) {
+        self.context_menu = None;
         self.settings
             .reload(&self.ws.config, &self.session_settings);
         if !self.settings.tags_enabled && self.tab == Tab::Tags {
@@ -460,7 +464,10 @@ impl App {
                 }
                 Vec::new()
             }
-            Msg::Resize => Vec::new(),
+            Msg::Resize => {
+                self.context_menu = None;
+                Vec::new()
+            }
             Msg::Progress(id, detail) => {
                 self.toasts.progress(id, detail);
                 Vec::new()
@@ -712,6 +719,9 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
+        if self.context_menu.is_some() {
+            return vec![];
+        }
         if self.focus == AppFocus::Tabs && self.modal.is_none() {
             return vec![];
         }
@@ -757,6 +767,10 @@ impl App {
         }
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            let event = menu.key(k);
+            return self.context_event(event);
         }
         if self.batch_running
             && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
@@ -891,6 +905,35 @@ impl App {
         }
     }
 
+    fn context_event(&mut self, event: MenuEvent) -> Vec<Action> {
+        match event {
+            MenuEvent::Stay => vec![],
+            MenuEvent::Close => {
+                self.context_menu = None;
+                vec![]
+            }
+            MenuEvent::Execute(command) => {
+                let Some(menu) = self.context_menu.take() else {
+                    return vec![];
+                };
+                let ctx = Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    settings: &self.settings,
+                };
+                let target = &menu.request.target;
+                match self.tab {
+                    Tab::Search => self.search.context_execute(target, command, &ctx),
+                    Tab::Tags => self.tags.context_execute(target, command, &ctx),
+                    Tab::Presets => self.presets.context_execute(target, command, &ctx),
+                    Tab::Repos => self.repos.context_execute(target, command, &ctx),
+                    Tab::Agents => self.agents.context_execute(target, command, &ctx),
+                    Tab::Health => self.health.context_execute(target, command, &ctx),
+                }
+            }
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
         if let Some(prompt) = self.quit_prompt.as_ref() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -903,6 +946,10 @@ impl App {
                 }
             }
             return vec![];
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            let event = menu.mouse(m);
+            return self.context_event(event);
         }
         if self.batch_running
             && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
@@ -919,6 +966,21 @@ impl App {
         }
         if self.tab == Tab::Agents && self.agents.group_popup_open() {
             return self.agents.handle_mouse(m, &ctx);
+        }
+        if m.kind == MouseEventKind::Down(MouseButton::Right) {
+            let request = match self.tab {
+                Tab::Search => self.search.context_menu(m.column, m.row, &ctx),
+                Tab::Tags => self.tags.context_menu(m.column, m.row, &ctx),
+                Tab::Presets => self.presets.context_menu(m.column, m.row, &ctx),
+                Tab::Repos => self.repos.context_menu(m.column, m.row, &ctx),
+                Tab::Agents => self.agents.context_menu(m.column, m.row, &ctx),
+                Tab::Health => self.health.context_menu(m.column, m.row, &ctx),
+            };
+            if let Some(request) = request {
+                self.focus = AppFocus::Page;
+                self.context_menu = Some(ContextMenu::new(request, m.column, m.row));
+            }
+            return vec![];
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind
             && let Some((_, tab)) = self
@@ -1014,7 +1076,10 @@ impl App {
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
             Action::Spawn(task) => self.spawn(task),
-            Action::OpenModal(m) => self.modal = Some(*m),
+            Action::OpenModal(m) => {
+                self.context_menu = None;
+                self.modal = Some(*m);
+            }
             Action::CloseModal => {
                 self.modal = match self.modal.take() {
                     Some(Modal::Message { return_to, .. }) => return_to.map(|modal| *modal),
@@ -1208,6 +1273,7 @@ impl App {
     /// changes: a key for the tab already showing is not a return to it, and
     /// must not throw away a focus the user has just set.
     fn switch_tab(&mut self, t: Tab) {
+        self.context_menu = None;
         let t = if t == Tab::Tags && !self.settings.tags_enabled {
             Tab::Search
         } else {
@@ -1373,6 +1439,9 @@ impl App {
     // ---- drawing ----------------------------------------------------------
 
     pub fn draw(&mut self, f: &mut Frame) {
+        if self.modal.is_some() || self.quit_prompt.is_some() {
+            self.context_menu = None;
+        }
         let area = f.area();
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -1419,6 +1488,9 @@ impl App {
         self.draw_footer(f, rows[2]);
         if let Some(m) = self.modal.as_mut() {
             m.draw(f, area, &ctx);
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.draw(f, area, &self.settings.theme);
         }
         // Above everything: a notification should be readable over a dialog.
         self.toasts.draw(f, area, &self.settings.theme);
@@ -1509,6 +1581,11 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
+        if self.context_menu.is_some() {
+            f.render_widget(Paragraph::new(" ".repeat(area.width as usize)), area);
+            return;
+        }
+
         let th = &self.settings.theme;
         let ctx = Ctx {
             ws: &self.ws,
@@ -2781,5 +2858,77 @@ mod escape_hierarchy_tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert_eq!(app.focus, AppFocus::Page);
+    }
+}
+
+#[cfg(test)]
+mod context_menu_tests {
+    use super::*;
+    use crate::tui::components::context_menu::{Command, Item, Request, Target};
+    #[test]
+    fn context_menu_blocks_page_input_and_closes_for_modal_resize_snapshot() {
+        let root = skills::ops::DownloadDir::new("context-app").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new_with_launch_directory(
+            Workspace::open(root.path()).unwrap(),
+            tx,
+            Some(root.path()),
+        )
+        .unwrap();
+        let make = || {
+            ContextMenu::new(
+                Request {
+                    title: "test".into(),
+                    detail: "single".into(),
+                    target: Target::Skill("test".into()),
+                    items: vec![Item::new(
+                        Command::Open,
+                        "View",
+                        KeyCode::Enter,
+                        true,
+                        "",
+                        0,
+                    )],
+                },
+                5,
+                5,
+            )
+        };
+        app.context_menu = Some(make());
+        assert!(app.on_key(KeyEvent::from(KeyCode::Char('4'))).is_empty());
+        assert_eq!(app.tab, Tab::Search);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let point = app
+            .tab_rects
+            .iter()
+            .find(|(_, t)| *t == Tab::Agents)
+            .unwrap()
+            .0;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: point.x,
+            row: point.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.tab, Tab::Search);
+        app.context_menu = Some(make());
+        app.handle(Msg::Resize);
+        assert!(app.context_menu.is_none());
+        app.context_menu = Some(make());
+        app.apply(Action::OpenModal(Box::new(Modal::help())));
+        assert!(app.context_menu.is_none());
+        assert!(matches!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .as_slice(),
+            [Action::Quit]
+        ));
     }
 }

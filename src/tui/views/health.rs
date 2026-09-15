@@ -5,9 +5,11 @@
 //! it. The footer shows only those keys, so the user never has to guess which
 //! of `a`, `m`, `x` and `U` fits the row under the cursor.
 
+mod context;
 use super::preview::{Overlay, kv};
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::layout::split_panes;
 use crate::tui::components::skill::{status_glyph, status_text};
 use crate::tui::event::Task;
@@ -328,13 +330,13 @@ impl HealthView {
         self.rows.iter().filter(|r| r.heading.is_none()).count()
     }
 
-    fn agent_action(&self, code: KeyCode, ctx: &Ctx) -> Option<Vec<Action>> {
+    fn agent_command(&self, code: Command, ctx: &Ctx) -> Option<Vec<Action>> {
         let row = self.selected_row()?;
         let agent = row.agent.as_ref()?;
         let actions = match (&row.state, code) {
-            (Some(EntryState::Foreign { .. }), KeyCode::Char('x') | KeyCode::Char('a')) => {
+            (Some(EntryState::Foreign { .. }), Command::Remove | Command::Adopt) => {
                 use skills::ops::agent_links::{self, Repair};
-                let operation = if code == KeyCode::Char('a') {
+                let operation = if code == Command::Adopt {
                     Repair::Adopt
                 } else {
                     Repair::Remove
@@ -357,14 +359,13 @@ impl HealthView {
                     Box::new(move |ws| plan.apply(ws)),
                 )))]);
             }
-            (Some(EntryState::Broken { .. }), KeyCode::Char('x') | KeyCode::Enter) => {
+            (Some(EntryState::Broken { .. }), Command::Remove | Command::Open) => {
                 deploy::plan_clean(ctx.ws, ctx.snap, agent, std::slice::from_ref(&row.key))
             }
-            (
-                Some(EntryState::Shadow { same_content: true }),
-                KeyCode::Char('r') | KeyCode::Enter,
-            ) => deploy::plan_relink(ctx.ws, ctx.snap, agent, std::slice::from_ref(&row.key)),
-            (Some(EntryState::AgentOnly), KeyCode::Char('a') | KeyCode::Enter) => {
+            (Some(EntryState::Shadow { same_content: true }), Command::Relink | Command::Open) => {
+                deploy::plan_relink(ctx.ws, ctx.snap, agent, std::slice::from_ref(&row.key))
+            }
+            (Some(EntryState::AgentOnly), Command::Adopt | Command::Open) => {
                 let report = ctx.snap.agent(agent)?;
                 return Some(vec![Action::OpenModal(Box::new(Modal::adopt(
                     agent,
@@ -372,7 +373,7 @@ impl HealthView {
                     report.skills_dir.join(&row.key),
                 )))]);
             }
-            (_, KeyCode::Enter) => return Some(vec![Action::SwitchTab(Tab::Agents)]),
+            (_, Command::Open) => return Some(vec![Action::SwitchTab(Tab::Agents)]),
             _ => return None,
         };
         Some(match actions {
@@ -387,6 +388,17 @@ impl HealthView {
     /// The right pane: what the record actually carries for this status and
     /// which keys act on it. Nothing here is guessed; where the record
     /// cannot answer a question, the text says so.
+    fn agent_action(&self, code: KeyCode, ctx: &Ctx) -> Option<Vec<Action>> {
+        let command = match code {
+            KeyCode::Enter => Command::Open,
+            KeyCode::Char('x') => Command::Remove,
+            KeyCode::Char('a') => Command::Adopt,
+            KeyCode::Char('r') => Command::Relink,
+            _ => return None,
+        };
+        self.agent_command(command, ctx)
+    }
+
     fn detail_lines(&self, r: &SkillRecord, caps: Caps, ctx: &Ctx) -> Vec<Line<'static>> {
         let th = &ctx.settings.theme;
         let key = r.key.clone();
@@ -687,6 +699,34 @@ impl HealthView {
 }
 
 impl View for HealthView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        if self.preview.is_open() || !self.left.contains((x, y).into()) {
+            return None;
+        }
+        let index = self.list.row_at(y, self.rows.len())?;
+        if self.rows.get(index)?.heading.is_some() {
+            return None;
+        }
+        self.list.select(Some(index));
+        self.filter.editing = false;
+        self.detail_scroll = 0;
+        self.issue_menu(ctx)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        if !self
+            .issue_menu(ctx)
+            .is_some_and(|r| &r.target == target && r.allows(command))
+        {
+            return vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )];
+        }
+        if self.selected_row().is_some_and(|r| r.agent.is_some()) {
+            return self.agent_command(command, ctx).unwrap_or_default();
+        }
+        self.issue_command(command, ctx)
+    }
+
     fn focus_root(&mut self) {
         self.filter.editing = false;
     }
@@ -710,7 +750,17 @@ impl View for HealthView {
         if let Some(actions) = self.agent_action(k.code, ctx) {
             return actions;
         }
-        let caps = self.selected_row().map(|r| r.caps).unwrap_or_default();
+        let command = match k.code {
+            KeyCode::Char('U') => Some(Command::Update),
+            KeyCode::Char('a') => Some(Command::Accept),
+            KeyCode::Char('m') => Some(Command::Migrate),
+            KeyCode::Char('x') => Some(Command::Remove),
+            _ => None,
+        };
+        if let Some(command) = command {
+            return self.issue_command(command, ctx);
+        }
+
         match k.code {
             KeyCode::Char('M') => self.select_skills(None),
             KeyCode::Char('q') => vec![Action::BackToParent],
@@ -754,53 +804,6 @@ impl View for HealthView {
                     ]
                 }
             }
-            // The guards below mirror `Caps::of`: a key the footer does not
-            // show is simply ignored, never answered with an error toast.
-            KeyCode::Char('U') if caps.update => match self.selected(ctx) {
-                Some(r) => vec![
-                    Action::Spawn(Task::Prepare(r.key.clone())),
-                    Action::Toast(format!("fetching {}…", r.key)),
-                ],
-                None => vec![],
-            },
-            KeyCode::Char('a') if caps.accept => match self.selected(ctx) {
-                Some(r) => {
-                    let key = r.key.clone();
-                    vec![Action::Write(Box::new(move |ws| {
-                        edit::accept(ws, &key).map(|_| format!("baseline updated for {key}"))
-                    }))]
-                }
-                None => vec![],
-            },
-            KeyCode::Char('m') if caps.migrate => match self.selected(ctx) {
-                Some(r) => match &r.status {
-                    SkillStatus::Renamed { to } => {
-                        let (old, new) = (r.key.clone(), to.clone());
-                        vec![Action::Write(Box::new(move |ws| {
-                            edit::migrate_meta(ws, &old, &new)
-                                .map(|_| format!("migrated {old} → {new}"))
-                        }))]
-                    }
-                    _ => vec![],
-                },
-                None => vec![],
-            },
-            // Clean up an entry that is not a working skill. What that means
-            // depends on which half is missing: the directory or the files in it.
-            KeyCode::Char('x') if caps.clean => match self
-                .selected(ctx)
-                .map(|r| (r.key.clone(), r.status.clone()))
-            {
-                Some((key, SkillStatus::Missing)) => {
-                    vec![Action::OpenModal(Box::new(Modal::forget_missing(&key)))]
-                }
-                Some((key, SkillStatus::Invalid { reason })) => {
-                    vec![Action::OpenModal(Box::new(Modal::discard_invalid(
-                        &key, &reason,
-                    )))]
-                }
-                _ => vec![],
-            },
             _ => vec![],
         }
     }
@@ -1190,6 +1193,22 @@ mod tests {
                 [Action::ConfirmLinks { .. }]
             ));
         }
+        view.list
+            .select(view.rows.iter().position(|r| r.key == "broken-item"));
+        let request = view.issue_menu(&ctx).unwrap();
+        assert!(!request.items.iter().any(|i| i.command == Command::Check));
+        assert!(matches!(
+            view.context_execute(&request.target, Command::Remove, &ctx)
+                .as_slice(),
+            [Action::ConfirmLinks { .. }]
+        ));
+        view.list
+            .select(view.rows.iter().position(|r| r.key == "printer"));
+        assert!(matches!(
+            view.context_execute(&request.target, Command::Remove, &ctx)
+                .as_slice(),
+            [Action::Error(_)]
+        ));
         view.list
             .select(view.rows.iter().position(|r| r.key == "foreign-item"));
         assert!(matches!(

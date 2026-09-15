@@ -2,6 +2,7 @@
 use super::search::{SearchView, SkillPanelOptions};
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::context_menu::{Command, Request, Target};
 use crate::tui::components::layout::{frame, split_panes};
 use crate::tui::settings::LayoutScope;
 use crate::tui::widgets::{CardGrid, fit, width};
@@ -198,6 +199,22 @@ impl ReposView {
 }
 
 impl View for ReposView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        let view = self.skill_search.as_mut()?;
+        let request = view.context_menu(x, y, ctx)?;
+        self.focus_skills = true;
+        self.filter.editing = false;
+        Some(request)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        match self.skill_search.as_mut() {
+            Some(view) => view.context_execute(target, command, ctx),
+            None => vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )],
+        }
+    }
+
     fn focus_root(&mut self) {
         self.focus_skills = false;
         self.filter.editing = false;

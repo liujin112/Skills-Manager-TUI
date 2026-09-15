@@ -7,6 +7,7 @@
 use super::matrix::Matrix;
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::context_menu::{Command, Request, Target};
 use crate::tui::components::group;
 use crate::tui::components::group_prompt::Prompt;
 use crate::tui::components::layout::{frame, split_panes};
@@ -287,6 +288,41 @@ impl PresetsView {
 }
 
 impl View for PresetsView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        if self.color_prompt.is_some() || self.matrix.hints().is_some() {
+            return None;
+        }
+        let view = &mut self.skill_search.as_mut()?.1;
+        let mut request = view.context_menu(x, y, ctx)?;
+        request.items.retain(|item| item.command != Command::Accept);
+        for item in &mut request.items {
+            if item.command == Command::Remove {
+                item.label = "Remove from preset".into();
+            }
+        }
+        self.focus_members = true;
+        self.filter.editing = false;
+        Some(request)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        if command == Command::Remove {
+            if let Target::Skill(key) = target
+                && ctx.snap.get(key).is_some()
+            {
+                return self.remove_members(vec![key.clone()]);
+            }
+            return vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )];
+        }
+        match self.skill_search.as_mut().map(|(_, v)| v) {
+            Some(view) => view.context_execute(target, command, ctx),
+            None => vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )],
+        }
+    }
+
     fn focus_from_above(&mut self) {
         self.focus_members = false;
         self.filter.editing = true;
