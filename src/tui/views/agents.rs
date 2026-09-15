@@ -489,6 +489,7 @@ impl AgentsView {
                     name_mismatch: doc.name != *alias,
                     tags: vec![],
                     presets: Vec::new(),
+                    source_name: None,
                     note: None,
                     source: None,
                     current_hash: None,

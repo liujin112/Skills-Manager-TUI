@@ -535,6 +535,7 @@ mod tests {
         let ws = skills::Workspace::open(tmp.path()).unwrap();
         for alias in ["demo", "empty"] {
             Repository {
+                name: None,
                 kind: Default::default(),
                 alias: alias.into(),
                 url: "https://example.com/demo.git".into(),

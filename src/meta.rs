@@ -471,6 +471,7 @@ mod tests {
         let ws = crate::Workspace::open(temp.path()).unwrap();
         let repo = crate::repository::Repository {
             alias: "owner--repo".into(),
+            name: Some("Owner tools".into()),
             kind: SourceKind::Git,
             url: "https://example.com/owner/repo".into(),
             branch: "main".into(),

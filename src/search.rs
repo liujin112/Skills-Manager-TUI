@@ -5,13 +5,70 @@
 //! refreshed after every scan, retaining the index when searchable text is unchanged.
 //!
 //! Query syntax: free words plus `tag:x`, `agent:y`, `status:z`, `source:w`
-//! and `untagged` filters.
+//! `preset:x` and `untagged` filters.
 
 use crate::config::{FieldWeights, SearchConfig};
 use crate::dict::Dictionaries;
 use crate::reconcile::{DeployState, SkillRecord};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
+
+/// Query token boundaries, including quoted source names such as `repo:"My Skills"`.
+/// Completion uses the same boundaries so accepting a name replaces the whole filter.
+pub fn query_token_ranges(input: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut chars = input.char_indices().peekable();
+    while let Some((start, first)) = chars.next() {
+        if first.is_whitespace() {
+            continue;
+        }
+        let quoted_source = input[start..].starts_with("repo:\"");
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut end = start + first.len_utf8();
+        while let Some(&(index, ch)) = chars.peek() {
+            if ch.is_whitespace() && !quoted {
+                break;
+            }
+            chars.next();
+            end = index + ch.len_utf8();
+            if quoted_source {
+                if escaped {
+                    escaped = false;
+                } else if quoted && ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quoted = !quoted;
+                }
+            }
+        }
+        ranges.push(start..end);
+    }
+    ranges
+}
+
+pub fn source_query_value(value: &str) -> String {
+    if value.starts_with('"') {
+        serde_json::from_str(value).unwrap_or_else(|_| value.trim_matches('"').into())
+    } else {
+        value.into()
+    }
+}
+
+pub fn source_query_token(name: &str) -> String {
+    if name
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '"' || ch == '\\')
+    {
+        format!(
+            "repo:{}",
+            serde_json::to_string(name).expect("string serializes")
+        )
+    } else {
+        format!("repo:{name}")
+    }
+}
 
 // ---- query ------------------------------------------------------------------
 
@@ -32,7 +89,8 @@ impl Query {
     pub fn parse(input: &str) -> Self {
         let mut q = Query::default();
         let mut free = Vec::new();
-        for tok in input.split_whitespace() {
+        for range in query_token_ranges(input) {
+            let tok = &input[range];
             if let Some(v) = tok.strip_prefix("tag:") {
                 if v.is_empty() {
                     q.untagged = true;
@@ -56,7 +114,7 @@ impl Query {
                     q.sources.push(v.to_lowercase());
                 }
             } else if let Some(v) = tok.strip_prefix("repo:") {
-                q.repositories.push(v.to_string());
+                q.repositories.push(source_query_value(v));
             } else if tok == "untagged" {
                 q.untagged = true;
             } else {
@@ -107,11 +165,16 @@ impl Query {
         if !self.repositories.is_empty()
             && !self.repositories.iter().any(|a| {
                 crate::repository::alias_of(&r.key) == Some(a.as_str())
+                    || r.source_display_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(a))
                     || r.source
                         .as_ref()
                         .and_then(crate::meta::Source::url)
-                        .and_then(crate::repository::source_name)
-                        .is_some_and(|name| name.eq_ignore_ascii_case(a))
+                        .is_some_and(|url| {
+                            url.eq_ignore_ascii_case(a)
+                                || crate::repository::source_name(url)
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(a))
+                        })
             })
         {
             return false;
@@ -1028,6 +1091,7 @@ mod tests {
             presets: Vec::new(),
             note: None,
             source: None,
+            source_name: None,
             current_hash: None,
             baseline_hash: None,
             deploy: BTreeMap::new(),
@@ -1126,6 +1190,33 @@ mod tests {
         assert!(!Query::parse("repo:other/cli").filter(&r));
         assert!(Query::parse("source:repository").filter(&r));
         assert!(!Query::parse("source:local").filter(&r));
+    }
+
+    #[test]
+    fn repository_filter_accepts_current_display_names_and_quoted_values() {
+        let mut record = rec("repos/stable-storage/one", "", "", &[]);
+        record.source_name = Some("Merlin Skills".into());
+        record.source = Some(crate::meta::Source::Archive {
+            url: "https://example.test/latest/skills.tar".into(),
+            subpath: None,
+            revision: None,
+        });
+        assert!(Query::parse("repo:\"Merlin Skills\" source:repository").filter(&record));
+        assert!(Query::parse("repo:stable-storage").filter(&record));
+        assert!(Query::parse("repo:https://example.test/latest/skills.tar").filter(&record));
+        let query = Query::parse("before repo:\"Merlin Skills\" tag:work after");
+        assert_eq!(query.repositories, ["Merlin Skills"]);
+        assert_eq!(query.text, "before after");
+        assert_eq!(query.tags, ["work"]);
+        for name in ["工具 包", "Merlin \"Skills\"", "My \\ Skills"] {
+            record.source_name = Some(name.into());
+            let encoded = source_query_token(name);
+            assert_eq!(Query::parse(&encoded).repositories, [name]);
+            assert!(Query::parse(&encoded).filter(&record));
+        }
+        record.source_name = Some("Renamed".into());
+        assert!(!Query::parse("repo:\"Merlin Skills\"").filter(&record));
+        assert!(Query::parse("repo:renamed").filter(&record));
     }
 
     #[test]

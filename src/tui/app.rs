@@ -2133,6 +2133,7 @@ mod matrix_key_tests {
             }
             let fetched = skills::repository::FetchedRepository {
                 repository: skills::repository::Repository {
+                    name: None,
                     kind: Default::default(),
                     alias: reference.into(),
                     url: format!("https://example.com/sample/{reference}"),

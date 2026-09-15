@@ -94,6 +94,8 @@ pub struct SkillRecord {
     pub presets: Vec<String>,
     pub note: Option<String>,
     pub source: Option<crate::meta::Source>,
+    /// Display identity from this snapshot's source metadata, independent of storage keys.
+    pub source_name: Option<String>,
     /// Calculated only when needed for baseline, rename, or shadow comparison.
     pub current_hash: Option<String>,
     pub baseline_hash: Option<String>,
@@ -104,6 +106,10 @@ pub struct SkillRecord {
 }
 
 impl SkillRecord {
+    pub fn source_display_name(&self) -> Option<&str> {
+        self.source_name.as_deref()
+    }
+
     pub fn source_kind(&self) -> &'static str {
         if self
             .source
@@ -199,6 +205,7 @@ pub struct Snapshot {
     pub skills: Vec<SkillRecord>,
     pub agents: Vec<AgentReport>,
     pub presets: crate::preset::PresetIndex,
+    pub repositories: BTreeMap<String, crate::repository::Repository>,
 }
 
 impl Snapshot {
@@ -257,6 +264,7 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
         skills: records.into_values().collect(),
         agents,
         presets: snapshot.presets.clone(),
+        repositories: snapshot.repositories.clone(),
     })
 }
 
@@ -326,6 +334,10 @@ fn scan_inventory(
     let root = crate::paths::resolve_root(Some(root))?;
     let root = root.as_path();
     let store = MetaStore::new(root);
+    let repositories: BTreeMap<_, _> = crate::repository::Repository::list(root)?
+        .into_iter()
+        .map(|repository| (repository.alias.clone(), repository))
+        .collect();
     let mut records: BTreeMap<String, SkillRecord> = BTreeMap::new();
 
     // Preserve flat local skills; repository skill identities are relative paths.
@@ -429,6 +441,7 @@ fn scan_inventory(
                 presets: Vec::new(),
                 note: None,
                 source: None,
+                source_name: None,
                 current_hash: None,
                 baseline_hash: None,
                 deploy: BTreeMap::new(),
@@ -454,6 +467,7 @@ fn scan_inventory(
                     presets: Vec::new(),
                     note: None,
                     source: None,
+                    source_name: None,
                     current_hash: None,
                     baseline_hash: None,
                     deploy: BTreeMap::new(),
@@ -480,6 +494,7 @@ fn scan_inventory(
                     presets: Vec::new(),
                     note: None,
                     source: None,
+                    source_name: None,
                     current_hash: None,
                     baseline_hash: None,
                     deploy: BTreeMap::new(),
@@ -519,6 +534,7 @@ fn scan_inventory(
             presets: Vec::new(),
             note: None,
             source: None,
+            source_name: None,
             current_hash: None,
             baseline_hash: None,
             deploy: BTreeMap::new(),
@@ -527,6 +543,18 @@ fn scan_inventory(
     }
 
     for rec in records.values_mut() {
+        rec.source_name = crate::repository::alias_of(&rec.key)
+            .and_then(|alias| repositories.get(alias))
+            .map(crate::repository::Repository::display_name)
+            .or_else(|| match &rec.source {
+                Some(crate::meta::Source::Git { url, .. }) => Some(
+                    crate::repository::default_display_name(crate::meta::SourceKind::Git, url),
+                ),
+                Some(crate::meta::Source::Archive { url, .. }) => Some(
+                    crate::repository::default_display_name(crate::meta::SourceKind::Archive, url),
+                ),
+                _ => crate::repository::alias_of(&rec.key).map(|_| "Unregistered source".into()),
+            });
         if rec.status == SkillStatus::MissingSource
             && crate::repository::alias_of(&rec.key).is_none()
             && !rec
@@ -651,6 +679,7 @@ fn scan_inventory(
         skills: records.into_values().collect(),
         agents,
         presets,
+        repositories,
     })
 }
 
@@ -815,6 +844,98 @@ mod scan_cost_tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn source_names_are_scanned_once_and_refresh_without_changing_skill_identity() {
+        use crate::{meta::SourceKind, repository::Repository};
+        let tmp = crate::ops::DownloadDir::new("source-display-names").unwrap();
+        let mut ws = crate::Workspace::open(tmp.path()).unwrap();
+        ws.config.agents.clear();
+        for (alias, name, kind, url) in [
+            (
+                "larksuite--cli",
+                None,
+                SourceKind::Git,
+                "https://github.com/larksuite/cli.git",
+            ),
+            (
+                "skills-tar",
+                Some("Merlin Skills"),
+                SourceKind::Archive,
+                "https://example.test/latest/skills.tar",
+            ),
+            (
+                "legacy-archive",
+                None,
+                SourceKind::Archive,
+                "https://example.test/latest/skills.tar",
+            ),
+        ] {
+            let repository = Repository {
+                alias: alias.into(),
+                name: name.map(str::to_owned),
+                kind,
+                url: url.into(),
+                branch: String::new(),
+            };
+            repository.save(&ws).unwrap();
+            let key = format!("repos/{alias}/one");
+            skill(&ws.root, &key);
+            ws.meta
+                .save(
+                    &key,
+                    &SkillMeta {
+                        source: Some(repository.source("one", None)),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let first = ws.scan().unwrap();
+        assert_eq!(first.repositories.len(), 3);
+        assert_eq!(
+            first
+                .get("repos/larksuite--cli/one")
+                .unwrap()
+                .source_display_name(),
+            Some("larksuite/cli")
+        );
+        let key = "repos/skills-tar/one";
+        assert_eq!(
+            first.get(key).unwrap().source_display_name(),
+            Some("Merlin Skills")
+        );
+        assert_eq!(
+            first
+                .get("repos/legacy-archive/one")
+                .unwrap()
+                .source_display_name(),
+            Some("Unnamed package")
+        );
+        Repository::rename(&ws, "skills-tar", "Training Tools").unwrap();
+        let rescoped = rescope(&first, &[]).unwrap();
+        assert_eq!(
+            rescoped.get(key).unwrap().source_display_name(),
+            Some("Merlin Skills")
+        );
+        assert_eq!(
+            rescoped.repositories["skills-tar"].display_name(),
+            "Merlin Skills"
+        );
+        let refreshed = ws.scan().unwrap();
+        assert_eq!(
+            refreshed.get(key).unwrap().source_display_name(),
+            Some("Training Tools")
+        );
+        assert_eq!(
+            first.get(key).unwrap().path,
+            refreshed.get(key).unwrap().path
+        );
+        assert_eq!(
+            first.get(key).unwrap().source,
+            refreshed.get(key).unwrap().source
+        );
     }
 
     #[test]

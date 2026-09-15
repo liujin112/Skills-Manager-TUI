@@ -251,6 +251,8 @@ fn archive_cli_reuses_repository_selection_names_deployment_and_duplicate_handli
         &url,
         "--repo-alias",
         "tools",
+        "--source-name",
+        "Merlin skills",
         "--select",
         "bundle/skills/review",
         "--name",
@@ -278,6 +280,10 @@ fn archive_cli_reuses_repository_selection_names_deployment_and_duplicate_handli
         fixture.ws.scan().unwrap().get(key).unwrap().status,
         SkillStatus::Repository
     );
+    assert_eq!(
+        Repository::list(&fixture.ws.root).unwrap()[0].display_name(),
+        "Merlin skills"
+    );
 
     let duplicate = fixture.json(&[
         "install",
@@ -304,10 +310,45 @@ fn archive_cli_reuses_repository_selection_names_deployment_and_duplicate_handli
         renamed["installed"],
         serde_json::json!(["repos/tools/writer-copy"])
     );
+    let metadata_before = fixture.ws.meta.load(key).unwrap();
+    let rename = fixture.cli(&["repos", "rename", "tools", "Merlin tools"]);
+    assert!(
+        rename.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rename.stderr)
+    );
+    assert_eq!(fixture.ws.meta.load(key).unwrap(), metadata_before);
     let all = fixture.json(&["install", &url, "--repo-alias", "tools", "--all"]);
     assert_eq!(all["installed"], serde_json::json!(["repos/tools/nested"]));
     assert_eq!(fixture.ws.scan().unwrap().skills.len(), 3);
     assert!(!fixture.ws.root.join("repos/tools/child").exists());
+    assert_eq!(
+        Repository::list(&fixture.ws.root).unwrap()[0].display_name(),
+        "Merlin tools"
+    );
+}
+
+#[test]
+fn archive_cli_requires_a_source_name_separate_from_a_skill_name() {
+    let fixture = Fixture::new();
+    let server = HttpArchive::new(zip_archive("v1"));
+    let url = server.url("/bundle.zip");
+    let output = fixture.cli(&[
+        "install",
+        &url,
+        "--subpath",
+        "bundle/skills/review",
+        "--name",
+        "renamed-skill",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--source-name"));
+    assert!(
+        server.requests.lock().unwrap().is_empty(),
+        "missing name must be reported before downloading"
+    );
+    assert!(fixture.ws.meta.list_keys().unwrap().is_empty());
+    assert!(Repository::list(&fixture.ws.root).unwrap().is_empty());
 }
 
 #[test]
@@ -333,6 +374,8 @@ fn archive_subpath_preserves_wrapper_paths_and_detects_format_from_bytes() {
         &url,
         "--repo-alias",
         "tools",
+        "--source-name",
+        "Downloaded tools",
         "--subpath",
         "bundle/skills/review",
     ]);
@@ -430,7 +473,7 @@ fn redirected_archive_uses_shared_fetch_install_check_and_update_flow() {
     let url = server.url("/redirect");
     let reference = install::parse_ref(&url, None, None).unwrap();
     let mut messages = vec![];
-    let fetched = FetchedRepository::fetch_with_progress(
+    let mut fetched = FetchedRepository::fetch_with_progress(
         &fixture.ws,
         &reference,
         Some("tools"),
@@ -439,6 +482,7 @@ fn redirected_archive_uses_shared_fetch_install_check_and_update_flow() {
     .unwrap();
     assert_eq!(fetched.repository.kind, SourceKind::Archive);
     assert_eq!(fetched.repository.url, url);
+    fetched.repository.set_name("Downloaded tools").unwrap();
     assert!(messages.iter().any(|message| message.contains("Scan:")));
     let keys = fetched
         .install(
@@ -483,6 +527,10 @@ fn redirected_archive_uses_shared_fetch_install_check_and_update_flow() {
     );
     assert_eq!(record.source.as_ref().unwrap().url(), Some(url.as_str()));
     assert!(!update::check(&fixture.ws, key).unwrap().update_available);
+    assert_eq!(
+        Repository::list(&fixture.ws.root).unwrap()[0].display_name(),
+        "Downloaded tools"
+    );
 }
 
 #[test]
@@ -495,6 +543,8 @@ fn archive_update_retains_local_resolution_and_revalidates_before_publish() {
         &url,
         "--repo-alias",
         "tools",
+        "--source-name",
+        "Downloaded tools",
         "--subpath",
         "bundle/skills/review",
     ]);

@@ -675,6 +675,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                 name_mismatch: false,
                 tags: vec![],
                 presets: Vec::new(),
+                source_name: None,
                 note: None,
                 source: Some(fetched.repository.source(key, Some(&fetched.revision))),
                 current_hash: None,
@@ -687,6 +688,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
     Snapshot {
         root: fetched.workdir.clone(),
         presets: Default::default(),
+        repositories: Default::default(),
         skills,
         agents: vec![],
     }
@@ -713,6 +715,7 @@ mod tests {
         let ws = Workspace::open(&root).unwrap();
         let fetched = FetchedRepository {
             repository: Repository {
+                name: None,
                 kind: skills::meta::SourceKind::Archive,
                 alias: "sample-tools".into(),
                 url: "https://example.com/sample/tools".into(),
@@ -815,6 +818,7 @@ mod tests {
         let mut picker = RepositoryPicker::new(
             FetchedRepository {
                 repository: Repository {
+                    name: None,
                     kind: Default::default(),
                     alias: "sample--tools".into(),
                     url: "https://github.com/sample/tools".into(),
@@ -900,6 +904,7 @@ mod tests {
         let mut picker = RepositoryPicker::restore(InstallSelection {
             fetched: FetchedRepository {
                 repository: Repository {
+                    name: None,
                     kind: Default::default(),
                     alias: "sampleorg--kit".into(),
                     url: "https://github.com/sampleorg/kit".into(),
@@ -980,6 +985,7 @@ mod tests {
         };
         let fetched = FetchedRepository {
             repository: Repository {
+                name: None,
                 kind: Default::default(),
                 alias: "sample--tools".into(),
                 url: "https://example.com/sample/tools.git".into(),
