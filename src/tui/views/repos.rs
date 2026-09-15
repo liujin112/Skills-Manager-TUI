@@ -2,6 +2,7 @@
 use super::search::{SearchView, SkillPanelOptions};
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::context_menu::{Command, Request, Target};
 use crate::tui::components::layout::{frame, split_panes};
 use crate::tui::settings::LayoutScope;
 use crate::tui::widgets::{CardGrid, fit, width};
@@ -198,6 +199,22 @@ impl ReposView {
 }
 
 impl View for ReposView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        let view = self.skill_search.as_mut()?;
+        let request = view.context_menu(x, y, ctx)?;
+        self.focus_skills = true;
+        self.filter.editing = false;
+        Some(request)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        match self.skill_search.as_mut() {
+            Some(view) => view.context_execute(target, command, ctx),
+            None => vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )],
+        }
+    }
+
     fn focus_root(&mut self) {
         self.focus_skills = false;
         self.filter.editing = false;
@@ -469,7 +486,26 @@ impl View for ReposView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skills::repository::Repository;
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{Workspace, config::Config, repository::Repository};
+
+    fn context_request<V: crate::tui::views::View>(
+        view: &mut V,
+        ctx: &Ctx,
+        width: u16,
+        height: u16,
+    ) -> Request {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), ctx)).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(request) = view.context_menu(x, y, ctx) {
+                    return request;
+                }
+            }
+        }
+        panic!("expected a context menu target in the rendered repository panel");
+    }
 
     #[test]
     fn named_packages_use_shared_metadata_and_keep_storage_paths_when_renamed() {
@@ -570,6 +606,67 @@ mod tests {
             .as_deref(),
             Some("archive Training Tools")
         );
+    }
+
+    #[test]
+    fn repositories_context_menu_delegates_to_the_shared_skill_panel() {
+        let tmp = skills::ops::DownloadDir::new("repos-context-menu").unwrap();
+        let root = tmp.path();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root)
+        .unwrap();
+        let ws = Workspace::open(root).unwrap();
+        Repository {
+            alias: "demo".into(),
+            name: Some("Demo skills".into()),
+            kind: skills::meta::SourceKind::Git,
+            url: "https://example.test/demo.git".into(),
+            branch: "main".into(),
+        }
+        .save(&ws)
+        .unwrap();
+        let key = "repos/demo/example";
+        std::fs::create_dir_all(root.join(key)).unwrap();
+        std::fs::write(
+            root.join(key).join("SKILL.md"),
+            "---\nname: example\ndescription: Example skill\n---\nBody",
+        )
+        .unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = ReposView::default();
+        view.refresh(&ctx);
+
+        let request = context_request(&mut view, &ctx, 140, 30);
+        assert_eq!(request.target, Target::Skill(key.into()));
+        assert!(view.focus_skills);
+        assert!(
+            request
+                .items
+                .iter()
+                .any(|item| item.command == Command::Accept)
+        );
+        assert_eq!(
+            request
+                .items
+                .iter()
+                .find(|item| item.command == Command::Remove)
+                .map(|item| item.label.as_str()),
+            Some("Delete skill")
+        );
+        assert!(matches!(
+            view.context_execute(&request.target, Command::Open, &ctx)
+                .as_slice(),
+            []
+        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::context_menu::{Command, Request, Target};
 use crate::tui::components::group::{self, tag_fill};
 use crate::tui::components::group_prompt::{Ask, Prompt};
 use crate::tui::components::layout::frame;
@@ -364,6 +365,41 @@ impl TagsView {
 }
 
 impl View for TagsView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        if self.prompt.is_some() {
+            return None;
+        }
+        let view = self.skill_search.as_mut()?;
+        let mut request = view.context_menu(x, y, ctx)?;
+        request.items.retain(|item| item.command != Command::Accept);
+        for item in &mut request.items {
+            if item.command == Command::Remove {
+                item.label = "Remove from tag".into();
+            }
+        }
+        self.focus_grid = true;
+        self.filter.editing = false;
+        Some(request)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        if command == Command::Remove {
+            if let Target::Skill(key) = target
+                && ctx.snap.get(key).is_some()
+            {
+                return self.remove_members(vec![key.clone()]);
+            }
+            return vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )];
+        }
+        match self.skill_search.as_mut() {
+            Some(view) => view.context_execute(target, command, ctx),
+            None => vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )],
+        }
+    }
+
     fn focus_from_above(&mut self) {
         self.focus_grid = false;
         self.filter.editing = true;
@@ -654,7 +690,26 @@ impl View for TagsView {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
     use skills::config::TagConfig;
+
+    fn context_request<V: crate::tui::views::View>(
+        view: &mut V,
+        ctx: &Ctx,
+        width: u16,
+        height: u16,
+    ) -> Request {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), ctx)).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(request) = view.context_menu(x, y, ctx) {
+                    return request;
+                }
+            }
+        }
+        panic!("expected a context menu target in the rendered member panel");
+    }
 
     #[test]
     fn tags_draw_and_edit_from_the_supplied_configuration_snapshot() {
@@ -718,5 +773,63 @@ mod snapshot_tests {
             );
             view.prompt = None;
         }
+    }
+
+    #[test]
+    fn tags_context_menu_uses_shared_member_actions_and_tag_specific_remove_label() {
+        let tmp = skills::ops::DownloadDir::new("tags-context-menu").unwrap();
+        let root = tmp.path();
+        Config {
+            agents: vec![],
+            tags: vec![TagConfig {
+                name: "work".into(),
+                skills: vec!["sample".into()],
+                color: None,
+                description: None,
+            }],
+            ..Default::default()
+        }
+        .save(root)
+        .unwrap();
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        std::fs::write(
+            root.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample skill\n---\nBody",
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = TagsView::default();
+        view.refresh(&ctx);
+        view.select("work", &snap);
+
+        let request = context_request(&mut view, &ctx, 120, 30);
+        assert_eq!(request.target, Target::Skill("sample".into()));
+        assert!(
+            !request
+                .items
+                .iter()
+                .any(|item| item.command == Command::Accept)
+        );
+        assert_eq!(
+            request
+                .items
+                .iter()
+                .find(|item| item.command == Command::Remove)
+                .map(|item| item.label.as_str()),
+            Some("Remove from tag")
+        );
+        assert!(request.items.iter().any(|item| item.disabled.is_some()));
+        assert!(matches!(
+            view.context_execute(&request.target, Command::Remove, &ctx)
+                .as_slice(),
+            [Action::WriteMeta(_)]
+        ));
     }
 }

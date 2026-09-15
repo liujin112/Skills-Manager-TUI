@@ -16,7 +16,18 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
+use crate::tui::components::context_menu::{Command, Request, Target};
+
 pub trait View {
+    fn context_menu(&mut self, _x: u16, _y: u16, _ctx: &Ctx) -> Option<Request> {
+        None
+    }
+    fn context_execute(&mut self, _target: &Target, _command: Command, _ctx: &Ctx) -> Vec<Action> {
+        vec![Action::Error(
+            "Target changed; reopen the context menu".into(),
+        )]
+    }
+
     fn status(&self, _ctx: &Ctx) -> String {
         String::new()
     }

@@ -11,6 +11,7 @@ use super::views::{
     search::SearchView, tags::TagsView,
 };
 use super::widgets::{SPINNER, fit, width};
+use crate::tui::components::context_menu::{ContextMenu, MenuEvent};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -190,6 +191,7 @@ pub struct App {
     pub health: HealthView,
     pub repos: ReposView,
     pub modal: Option<Modal>,
+    context_menu: Option<ContextMenu>,
     pending_task_ui: VecDeque<Action>,
     batch_running: bool,
     batch_modal_owned: bool,
@@ -334,6 +336,7 @@ impl App {
             health: HealthView::default(),
             repos: ReposView::default(),
             modal: None,
+            context_menu: None,
             pending_task_ui: VecDeque::new(),
             batch_running: false,
             batch_modal_owned: false,
@@ -379,6 +382,7 @@ impl App {
     }
 
     fn on_snapshot(&mut self) {
+        self.context_menu = None;
         self.settings
             .reload(&self.ws.config, &self.session_settings);
         if !self.settings.tags_enabled && self.tab == Tab::Tags {
@@ -460,7 +464,10 @@ impl App {
                 }
                 Vec::new()
             }
-            Msg::Resize => Vec::new(),
+            Msg::Resize => {
+                self.context_menu = None;
+                Vec::new()
+            }
             Msg::Progress(id, detail) => {
                 self.toasts.progress(id, detail);
                 Vec::new()
@@ -712,6 +719,9 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
+        if self.context_menu.is_some() {
+            return vec![];
+        }
         if self.focus == AppFocus::Tabs && self.modal.is_none() {
             return vec![];
         }
@@ -757,6 +767,10 @@ impl App {
         }
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            let event = menu.key(k);
+            return self.context_event(event);
         }
         if self.batch_running
             && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
@@ -891,6 +905,35 @@ impl App {
         }
     }
 
+    fn context_event(&mut self, event: MenuEvent) -> Vec<Action> {
+        match event {
+            MenuEvent::Stay => vec![],
+            MenuEvent::Close => {
+                self.context_menu = None;
+                vec![]
+            }
+            MenuEvent::Execute(command) => {
+                let Some(menu) = self.context_menu.take() else {
+                    return vec![];
+                };
+                let ctx = Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    settings: &self.settings,
+                };
+                let target = &menu.request.target;
+                match self.tab {
+                    Tab::Search => self.search.context_execute(target, command, &ctx),
+                    Tab::Tags => self.tags.context_execute(target, command, &ctx),
+                    Tab::Presets => self.presets.context_execute(target, command, &ctx),
+                    Tab::Repos => self.repos.context_execute(target, command, &ctx),
+                    Tab::Agents => self.agents.context_execute(target, command, &ctx),
+                    Tab::Health => self.health.context_execute(target, command, &ctx),
+                }
+            }
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
         if let Some(prompt) = self.quit_prompt.as_ref() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -903,6 +946,10 @@ impl App {
                 }
             }
             return vec![];
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            let event = menu.mouse(m);
+            return self.context_event(event);
         }
         if self.batch_running
             && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
@@ -919,6 +966,21 @@ impl App {
         }
         if self.tab == Tab::Agents && self.agents.group_popup_open() {
             return self.agents.handle_mouse(m, &ctx);
+        }
+        if m.kind == MouseEventKind::Down(MouseButton::Right) {
+            let request = match self.tab {
+                Tab::Search => self.search.context_menu(m.column, m.row, &ctx),
+                Tab::Tags => self.tags.context_menu(m.column, m.row, &ctx),
+                Tab::Presets => self.presets.context_menu(m.column, m.row, &ctx),
+                Tab::Repos => self.repos.context_menu(m.column, m.row, &ctx),
+                Tab::Agents => self.agents.context_menu(m.column, m.row, &ctx),
+                Tab::Health => self.health.context_menu(m.column, m.row, &ctx),
+            };
+            if let Some(request) = request {
+                self.focus = AppFocus::Page;
+                self.context_menu = Some(ContextMenu::new(request, m.column, m.row));
+            }
+            return vec![];
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind
             && let Some((_, tab)) = self
@@ -1014,7 +1076,10 @@ impl App {
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
             Action::Spawn(task) => self.spawn(task),
-            Action::OpenModal(m) => self.modal = Some(*m),
+            Action::OpenModal(m) => {
+                self.context_menu = None;
+                self.modal = Some(*m);
+            }
             Action::CloseModal => {
                 self.modal = match self.modal.take() {
                     Some(Modal::Message { return_to, .. }) => return_to.map(|modal| *modal),
@@ -1208,6 +1273,7 @@ impl App {
     /// changes: a key for the tab already showing is not a return to it, and
     /// must not throw away a focus the user has just set.
     fn switch_tab(&mut self, t: Tab) {
+        self.context_menu = None;
         let t = if t == Tab::Tags && !self.settings.tags_enabled {
             Tab::Search
         } else {
@@ -1373,6 +1439,9 @@ impl App {
     // ---- drawing ----------------------------------------------------------
 
     pub fn draw(&mut self, f: &mut Frame) {
+        if self.modal.is_some() || self.quit_prompt.is_some() {
+            self.context_menu = None;
+        }
         let area = f.area();
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -1419,6 +1488,9 @@ impl App {
         self.draw_footer(f, rows[2]);
         if let Some(m) = self.modal.as_mut() {
             m.draw(f, area, &ctx);
+        }
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.draw(f, area, &self.settings.theme);
         }
         // Above everything: a notification should be readable over a dialog.
         self.toasts.draw(f, area, &self.settings.theme);
@@ -1509,6 +1581,11 @@ impl App {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
+        if self.context_menu.is_some() {
+            f.render_widget(Paragraph::new(" ".repeat(area.width as usize)), area);
+            return;
+        }
+
         let th = &self.settings.theme;
         let ctx = Ctx {
             ws: &self.ws,
@@ -2781,5 +2858,315 @@ mod escape_hierarchy_tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert_eq!(app.focus, AppFocus::Page);
+    }
+}
+
+#[cfg(test)]
+mod context_menu_tests {
+    use super::*;
+    use crate::tui::components::context_menu::{Command, Item, Request, Target};
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{
+        Workspace,
+        config::{AgentConfig, TagConfig},
+        preset::Preset,
+        repository::Repository,
+    };
+
+    fn draw_app(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn interactive_app() -> (skills::ops::DownloadDir, App) {
+        let root = skills::ops::DownloadDir::new("context-interaction").unwrap();
+        let library = root.path().join("library");
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&library).unwrap();
+        Config {
+            agents: vec![AgentConfig {
+                key: "sample-agent".into(),
+                name: "Sample agent".into(),
+                skills_dir: agent_dir.display().to_string(),
+            }],
+            tags: vec![TagConfig {
+                name: "work".into(),
+                skills: vec!["sample".into()],
+                color: None,
+                description: None,
+            }],
+            ..Default::default()
+        }
+        .save(&library)
+        .unwrap();
+        std::fs::create_dir_all(library.join("sample")).unwrap();
+        std::fs::write(
+            library.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample skill\n---\nBody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(library.join("invalid-item")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::os::unix::fs::symlink(library.join("sample"), agent_dir.join("sample")).unwrap();
+        std::os::unix::fs::symlink(library.join("missing-target"), agent_dir.join("broken"))
+            .unwrap();
+
+        let ws = Workspace::open(&library).unwrap();
+        Repository {
+            alias: "demo".into(),
+            name: Some("Demo skills".into()),
+            kind: skills::meta::SourceKind::Git,
+            url: "https://example.test/demo.git".into(),
+            branch: "main".into(),
+        }
+        .save(&ws)
+        .unwrap();
+        let repo_skill = library.join("repos/demo/repo-skill");
+        std::fs::create_dir_all(&repo_skill).unwrap();
+        std::fs::write(
+            repo_skill.join("SKILL.md"),
+            "---\nname: repo-skill\ndescription: Repository skill\n---\nBody",
+        )
+        .unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "Office".into(),
+                skills: vec!["sample".into()],
+                ..Preset::default()
+            })
+            .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let launch_directory = library;
+        let mut app = App::new_with_launch_directory(ws, tx, Some(&launch_directory)).unwrap();
+        app.ws.inventory_products = Some(std::collections::BTreeSet::from(["sample-agent".into()]));
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.agents.refresh(&ctx);
+        (root, app)
+    }
+
+    fn open_first_menu(app: &mut App, width: u16, height: u16) -> (u16, u16) {
+        draw_app(app, width, height);
+        let body = app.body;
+        for row in body.y..body.bottom() {
+            for column in body.x..body.right() {
+                app.handle(Msg::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                if app.context_menu.is_some() {
+                    return (column, row);
+                }
+            }
+        }
+        panic!("no context-menu target rendered for {:?}", app.tab);
+    }
+
+    fn outside_menu(app: &App, width: u16, height: u16) -> (u16, u16) {
+        let area = app.context_menu.as_ref().unwrap().menu_area();
+        [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ]
+        .into_iter()
+        .find(|(x, y)| !area.contains((*x, *y).into()))
+        .unwrap_or((0, 0))
+    }
+
+    #[test]
+    fn mouse_context_menu_flow_works_for_every_page_on_isolated_fixture() {
+        let (_root, mut app) = interactive_app();
+        for tab in Tab::ALL {
+            app.apply(Action::SwitchTab(tab));
+            app.enter_page();
+            let (_column, _row) = open_first_menu(&mut app, 140, 35);
+            let request = app.context_menu.as_ref().unwrap().request.clone();
+            match tab {
+                Tab::Search | Tab::Tags | Tab::Presets => {
+                    assert!(matches!(request.target, Target::Skill(_)));
+                }
+                Tab::Repos => assert!(matches!(request.target, Target::Skill(_))),
+                Tab::Agents => assert!(matches!(
+                    request.target,
+                    Target::Entry { ref scope, .. } if scope == "sample-agent"
+                )),
+                Tab::Health => assert!(matches!(
+                    request.target,
+                    Target::Entry { ref scope, .. } if scope.is_empty()
+                )),
+            }
+            assert!(!request.items.is_empty());
+
+            // A right click inside the menu is consumed by the menu itself.
+            draw_app(&mut app, 140, 35);
+            let open_rect = app
+                .context_menu
+                .as_ref()
+                .unwrap()
+                .hit_rect_for(Command::Open)
+                .unwrap();
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: open_rect.x,
+                row: open_rect.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(app.context_menu.is_some());
+
+            if let Some(item) = request.items.iter().find(|item| item.disabled.is_some()) {
+                let command = item.command;
+                let reason = item.disabled.clone().unwrap();
+                let rect = app
+                    .context_menu
+                    .as_ref()
+                    .unwrap()
+                    .hit_rect_for(command)
+                    .unwrap();
+                app.handle(Msg::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let screen = draw_app(&mut app, 140, 35);
+                assert!(
+                    screen.contains(&reason),
+                    "missing disabled reason for {command:?}"
+                );
+            }
+
+            let (column, row) = outside_menu(&app, 140, 35);
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(app.context_menu.is_none());
+        }
+
+        // Exercise an actual enabled mouse click through App::handle. Open is
+        // side-effect free on disk and closes the menu after opening preview.
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        open_first_menu(&mut app, 140, 35);
+        draw_app(&mut app, 140, 35);
+        let open_rect = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .hit_rect_for(Command::Open)
+            .unwrap();
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: open_rect.x,
+            row: open_rect.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn mouse_context_menu_stays_bounded_when_the_terminal_is_small() {
+        let (_root, mut app) = interactive_app();
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        open_first_menu(&mut app, 80, 12);
+        draw_app(&mut app, 80, 12);
+        let area = app.context_menu.as_ref().unwrap().menu_area();
+        assert!(area.right() <= 80 && area.bottom() <= 12);
+        for _ in 0..20 {
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        draw_app(&mut app, 80, 12);
+        let area = app.context_menu.as_ref().unwrap().menu_area();
+        assert!(area.right() <= 80 && area.bottom() <= 12);
+    }
+
+    #[test]
+    fn context_menu_blocks_page_input_and_closes_for_modal_resize_snapshot() {
+        let root = skills::ops::DownloadDir::new("context-app").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new_with_launch_directory(
+            Workspace::open(root.path()).unwrap(),
+            tx,
+            Some(root.path()),
+        )
+        .unwrap();
+        let make = || {
+            ContextMenu::new(
+                Request {
+                    title: "test".into(),
+                    detail: "single".into(),
+                    target: Target::Skill("test".into()),
+                    items: vec![Item::new(
+                        Command::Open,
+                        "View",
+                        KeyCode::Enter,
+                        true,
+                        "",
+                        0,
+                    )],
+                },
+                5,
+                5,
+            )
+        };
+        app.context_menu = Some(make());
+        assert!(app.on_key(KeyEvent::from(KeyCode::Char('4'))).is_empty());
+        assert_eq!(app.tab, Tab::Search);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let point = app
+            .tab_rects
+            .iter()
+            .find(|(_, t)| *t == Tab::Agents)
+            .unwrap()
+            .0;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: point.x,
+            row: point.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.tab, Tab::Search);
+        app.context_menu = Some(make());
+        app.handle(Msg::Resize);
+        assert!(app.context_menu.is_none());
+        app.context_menu = Some(make());
+        app.apply(Action::OpenModal(Box::new(Modal::help())));
+        assert!(app.context_menu.is_none());
+        assert!(matches!(
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .as_slice(),
+            [Action::Quit]
+        ));
     }
 }

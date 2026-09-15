@@ -7,6 +7,7 @@
 use super::matrix::Matrix;
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::components::context_menu::{Command, Request, Target};
 use crate::tui::components::group;
 use crate::tui::components::group_prompt::Prompt;
 use crate::tui::components::layout::{frame, split_panes};
@@ -287,6 +288,41 @@ impl PresetsView {
 }
 
 impl View for PresetsView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        if self.color_prompt.is_some() || self.matrix.hints().is_some() {
+            return None;
+        }
+        let view = &mut self.skill_search.as_mut()?.1;
+        let mut request = view.context_menu(x, y, ctx)?;
+        request.items.retain(|item| item.command != Command::Accept);
+        for item in &mut request.items {
+            if item.command == Command::Remove {
+                item.label = "Remove from preset".into();
+            }
+        }
+        self.focus_members = true;
+        self.filter.editing = false;
+        Some(request)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        if command == Command::Remove {
+            if let Target::Skill(key) = target
+                && ctx.snap.get(key).is_some()
+            {
+                return self.remove_members(vec![key.clone()]);
+            }
+            return vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )];
+        }
+        match self.skill_search.as_mut().map(|(_, v)| v) {
+            Some(view) => view.context_execute(target, command, ctx),
+            None => vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )],
+        }
+    }
+
     fn focus_from_above(&mut self) {
         self.focus_members = false;
         self.filter.editing = true;
@@ -584,7 +620,26 @@ mod tests {
     use super::*;
     use crate::tui::theme::Theme;
     use crossterm::event::KeyModifiers;
+    use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config};
+
+    fn context_request<V: crate::tui::views::View>(
+        view: &mut V,
+        ctx: &Ctx,
+        width: u16,
+        height: u16,
+    ) -> Request {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), ctx)).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(request) = view.context_menu(x, y, ctx) {
+                    return request;
+                }
+            }
+        }
+        panic!("expected a context menu target in the rendered member panel");
+    }
 
     #[test]
     fn preset_colour_picker_saves_resets_and_cancels_without_changing_members() {
@@ -644,6 +699,65 @@ mod tests {
         view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctx);
         assert!(view.color_prompt.is_none());
         assert_eq!(ws.presets.load("Office").unwrap().unwrap(), preset);
+    }
+
+    #[test]
+    fn presets_context_menu_uses_shared_member_actions_and_preset_specific_remove_label() {
+        let tmp = skills::ops::DownloadDir::new("presets-context-menu").unwrap();
+        let root = tmp.path();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root)
+        .unwrap();
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        std::fs::write(
+            root.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample skill\n---\nBody",
+        )
+        .unwrap();
+        let ws = Workspace::open(root).unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "Office".into(),
+                skills: vec!["sample".into()],
+                ..Preset::default()
+            })
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = PresetsView::default();
+        view.select("Office");
+        view.refresh(&ctx);
+
+        let request = context_request(&mut view, &ctx, 120, 30);
+        assert_eq!(request.target, Target::Skill("sample".into()));
+        assert!(
+            !request
+                .items
+                .iter()
+                .any(|item| item.command == Command::Accept)
+        );
+        assert_eq!(
+            request
+                .items
+                .iter()
+                .find(|item| item.command == Command::Remove)
+                .map(|item| item.label.as_str()),
+            Some("Remove from preset")
+        );
+        assert!(request.items.iter().any(|item| item.disabled.is_some()));
+        assert!(matches!(
+            view.context_execute(&request.target, Command::Remove, &ctx)
+                .as_slice(),
+            [Action::WriteMeta(_)]
+        ));
     }
 
     #[test]

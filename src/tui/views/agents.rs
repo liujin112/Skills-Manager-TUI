@@ -32,7 +32,9 @@ use skills::preset::{Preset, TagCoverage, tag_coverages};
 
 use skills::reconcile::{AgentDirMode, EntryState};
 
+mod context;
 mod groups;
+use crate::tui::components::context_menu::{Command, Item, Request, Target};
 
 /// Keyboard focus follows the page bands. `[` and `]` switch agents
 /// without requiring focus to return to the agent selector.
@@ -808,37 +810,7 @@ impl AgentsView {
                 && self.focus() == Focus::Entries
                 && self.selected_caps().linked
             {
-                let rows = self.rows(ctx);
-                let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
-                    return vec![];
-                };
-                let Some(record) = row.record.filter(|_| row.linked) else {
-                    return vec![];
-                };
-                let Some(agent) = ctx.ws.config.agent(&self.scope).cloned() else {
-                    return vec![];
-                };
-                let project = self.project();
-                let key = record.key.clone();
-                return vec![Action::OpenModal(Box::new(
-                    Modal::confirm_meta(
-                        format!("Uninstall {} from {}", record.key, agent.display_name()),
-                        vec![
-                            format!("Remove link from {}", agent.skills_dir),
-                            "The central skill is kept.".into(),
-                        ],
-                        Box::new(move |ws| {
-                            skills::ops::targets::set_deployed(
-                                ws,
-                                &agent,
-                                project.as_deref(),
-                                &[key],
-                                false,
-                            )
-                        }),
-                    )
-                    .in_background(vec![record.key.clone()]),
-                ))];
+                return self.entry_command(Command::Remove, ctx);
             }
         }
         match k.code {
@@ -945,11 +917,11 @@ impl AgentsView {
                     KeyCode::Right => self.entries.move_by(1, n),
                     KeyCode::Char('l') => self.entries.move_by(1, n),
                     KeyCode::Char('r') if self.selected_caps().relink => {
-                        return self.repair(ctx, &rows, false);
+                        return self.entry_command(Command::Relink, ctx);
                     }
                     KeyCode::Left | KeyCode::Char('h') => self.entries.move_by(-1, n),
                     KeyCode::Char('x') if self.selected_caps().clean => {
-                        return self.repair(ctx, &rows, true);
+                        return self.entry_command(Command::Remove, ctx);
                     }
                     KeyCode::Home | KeyCode::Char('g') => {
                         self.entries.first(n);
@@ -957,28 +929,12 @@ impl AgentsView {
                     KeyCode::End | KeyCode::Char('G') => {
                         self.entries.last(n);
                     }
-                    KeyCode::Enter => self.preview_entry(ctx),
+                    KeyCode::Enter => return self.entry_command(Command::Open, ctx),
                     // Only an entry the root knows nothing about can be taken
                     // in; everything else here is either already ours or the
                     // agent's to keep.
                     KeyCode::Char('a') if self.selected_caps().adopt => {
-                        let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
-                            return vec![Action::Error("nothing selected".into())];
-                        };
-                        if !matches!(row.state, Some(EntryState::AgentOnly)) {
-                            return vec![Action::Error(format!(
-                                "{}: adopt applies to entries the root does not have",
-                                row.name
-                            ))];
-                        }
-                        let Some(report) = ctx.snap.agent(&self.scope) else {
-                            return vec![];
-                        };
-                        return vec![Action::OpenModal(Box::new(Modal::adopt(
-                            &self.scope,
-                            &row.name,
-                            report.skills_dir.join(&row.name),
-                        )))];
+                        return self.entry_command(Command::Adopt, ctx);
                     }
                     _ => {}
                 }
@@ -1941,6 +1897,51 @@ impl AgentsView {
 }
 
 impl View for AgentsView {
+    fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
+        if self.preview.is_open()
+            || self.matrix.hints().is_some()
+            || self.quick.popup.is_some()
+            || !self.left.contains((x, y).into())
+            || self.entries_track.contains((x, y).into())
+        {
+            return None;
+        }
+        let index = self.entries.hit(x, y)?;
+        let data = self.scoped.clone();
+        let scoped = data.as_ref().map(|d| Ctx {
+            ws: &d.0,
+            snap: &d.1,
+            settings: ctx.settings,
+        });
+        let ctx = scoped.as_ref().unwrap_or(ctx);
+        self.rows(ctx).get(index)?;
+        self.entries.select(Some(index));
+        self.set_focus(Focus::Entries);
+        self.filter_editing = false;
+        self.search_panel.completion.close();
+        self.entry_menu(ctx)
+    }
+    fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        let data = self.scoped.clone();
+        let scoped = data.as_ref().map(|d| Ctx {
+            ws: &d.0,
+            snap: &d.1,
+            settings: ctx.settings,
+        });
+        let ctx = scoped.as_ref().unwrap_or(ctx);
+        let Some(request) = self
+            .entry_menu(ctx)
+            .filter(|r| &r.target == target && r.allows(command))
+        else {
+            return vec![Action::Error(
+                "Target changed; reopen the context menu".into(),
+            )];
+        };
+        let _ = request;
+        let actions = self.entry_command(command, ctx);
+        self.scoped_actions(actions, ctx)
+    }
+
     fn focus_root(&mut self) {
         self.filter_editing = false;
         self.set_focus(Focus::Agents);
@@ -3562,7 +3563,23 @@ mod deployment_scope_tests {
         write(&ws).unwrap();
         view.refresh(&ctx);
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        let actions = view.handle_key(key(KeyCode::Char('x')), &ctx);
+        let cell = view.entries.cell(view.entries.selected().unwrap()).unwrap();
+        let request = view.context_menu(cell.x + 1, cell.y, &ctx).unwrap();
+        let Target::Entry { path, .. } = &request.target else {
+            panic!("scoped target")
+        };
+        assert_eq!(
+            *path,
+            project
+                .canonicalize()
+                .unwrap()
+                .join(".claude/skills/sample")
+        );
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('x')), &ctx).as_slice(),
+            [Action::OpenModal(_)]
+        ));
+        let actions = view.context_execute(&request.target, Command::Remove, &ctx);
         let Action::OpenModal(modal) = actions.into_iter().next().unwrap() else {
             panic!("uninstall confirmation")
         };
