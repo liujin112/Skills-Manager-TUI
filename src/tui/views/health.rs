@@ -821,8 +821,10 @@ impl View for HealthView {
         }
         if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
+                self.filter.editing = false;
                 self.select_by(d);
             } else if self.right.contains(at) {
+                self.filter.editing = false;
                 let max = (self.detail_rows as i32 - self.detail_height as i32).max(0);
                 self.detail_scroll = (self.detail_scroll as i32 + d).clamp(0, max) as u16;
             }
@@ -832,10 +834,13 @@ impl View for HealthView {
             && self.left.contains(at)
             && let Some((_, double)) = self.list.click(m.row, self.rows.len())
         {
+            self.filter.editing = false;
             self.detail_scroll = 0;
             if double {
                 return self.open_selected(ctx);
             }
+        } else if m.kind == MouseEventKind::Down(MouseButton::Left) && self.right.contains(at) {
+            self.filter.editing = false;
         }
         vec![]
     }

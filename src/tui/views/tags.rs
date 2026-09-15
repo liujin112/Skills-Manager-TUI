@@ -590,7 +590,7 @@ impl View for TagsView {
             return vec![];
         }
         if self.right.contains(at) {
-            if pressing {
+            if pressing || wheel(&m, ctx).is_some() {
                 self.focus_grid = true;
                 self.filter.editing = false;
             }
@@ -598,6 +598,8 @@ impl View for TagsView {
         }
         if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
+                self.focus_grid = false;
+                self.filter.editing = false;
                 self.list.move_by(d.signum(), self.rows.len());
                 self.sync_members(ctx.snap);
             }
@@ -606,6 +608,7 @@ impl View for TagsView {
         if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.list_drag) {
             self.list_drag = true;
             self.focus_grid = false;
+            self.filter.editing = false;
             if let Some(row) = self.list_track.index_at(m.row, self.list.grid_rows()) {
                 self.list.select_row(row);
                 self.sync_members(ctx.snap);
@@ -617,6 +620,7 @@ impl View for TagsView {
         }
         if pressing && self.left.contains(at) {
             self.focus_grid = false;
+            self.filter.editing = false;
             if let Some((_, double)) = self.list.click(m.column, m.row) {
                 self.sync_members(ctx.snap);
                 if double && !self.members.is_empty() {

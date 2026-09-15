@@ -510,7 +510,7 @@ impl View for PresetsView {
             return vec![];
         }
         if self.right.contains(at) {
-            if pressing {
+            if pressing || wheel(&m, ctx).is_some() {
                 self.focus_members = true;
                 self.filter.editing = false;
             }
@@ -518,6 +518,8 @@ impl View for PresetsView {
         }
         if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
+                self.focus_members = false;
+                self.filter.editing = false;
                 self.list.move_by(d.signum(), self.presets.len());
             }
             return vec![];
@@ -525,6 +527,7 @@ impl View for PresetsView {
         if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.list_drag) {
             self.list_drag = true;
             self.focus_members = false;
+            self.filter.editing = false;
             if let Some(row) = self.list_track.index_at(m.row, self.list.grid_rows()) {
                 self.list.select_row(row);
             }
@@ -535,6 +538,7 @@ impl View for PresetsView {
         }
         if pressing && self.left.contains(at) {
             self.focus_members = false;
+            self.filter.editing = false;
             self.list.click(m.column, m.row);
         }
         vec![]

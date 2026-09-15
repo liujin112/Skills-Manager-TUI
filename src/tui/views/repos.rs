@@ -355,7 +355,7 @@ impl View for ReposView {
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
         let point = (m.column, m.row).into();
         if self.skills.contains(point) {
-            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) || wheel(&m, ctx).is_some() {
                 self.focus_skills = true;
                 self.filter.editing = false;
             }
@@ -365,16 +365,25 @@ impl View for ReposView {
         }
         if let Some(delta) = wheel(&m, ctx) {
             if self.left.contains(point) {
+                self.focus_skills = false;
+                self.filter.editing = false;
                 self.move_by(delta, ctx);
             } else if self.details.contains(point) {
+                self.focus_skills = false;
+                self.filter.editing = false;
                 self.scroll = (i32::from(self.scroll) + delta).clamp(0, u16::MAX as i32) as u16;
             }
-        } else if m.kind == MouseEventKind::Down(MouseButton::Left) && self.left.contains(point) {
-            self.focus_skills = false;
-            self.filter.editing = self.filter.click_input(m.column, m.row);
-            if !self.filter.editing {
-                self.nav.click(m.column, m.row);
-                self.sync_panel(ctx, false);
+        } else if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            if self.details.contains(point) {
+                self.focus_skills = false;
+                self.filter.editing = false;
+            } else if self.left.contains(point) {
+                self.focus_skills = false;
+                self.filter.editing = self.filter.click_input(m.column, m.row);
+                if !self.filter.editing {
+                    self.nav.click(m.column, m.row);
+                    self.sync_panel(ctx, false);
+                }
             }
         }
         vec![]
