@@ -269,11 +269,7 @@ impl SearchView {
 
     pub fn panel_keys(&self, ctx: &Ctx) -> Vec<String> {
         if self.multi {
-            if self.layout_scope == LayoutScope::Presets {
-                self.checked.iter().cloned().collect()
-            } else {
-                self.visible_checked(ctx)
-            }
+            self.checked.iter().cloned().collect()
         } else {
             self.selected(ctx)
                 .map(|r| vec![r.key.clone()])
@@ -583,15 +579,9 @@ impl SearchView {
     }
 
     fn batch_action(&self, operation: char, ctx: &Ctx) -> Vec<Action> {
-        let keys = if operation == 'p' {
-            self.checked.iter().cloned().collect()
-        } else {
-            self.visible_checked(ctx)
-        };
+        let keys = self.checked.iter().cloned().collect::<Vec<_>>();
         if keys.is_empty() {
-            return vec![Action::Error(
-                "No selected skills in the current filter".into(),
-            )];
+            return vec![Action::Error("No selected skills".into())];
         }
         let modal = match operation {
             't' => Modal::batch_tags(keys, ctx),
@@ -2264,7 +2254,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_select_filters_targets_and_keeps_identity_and_scope() {
+    fn multi_select_preserves_all_targets_across_filters_and_keeps_scope() {
         let root = std::env::temp_dir().join(format!("skills-multi-select-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         skills::config::Config {
@@ -2312,7 +2302,7 @@ mod tests {
         view.set_query("no-match-at-all", &ctx);
         assert!(matches!(
             view.batch_action('t', &ctx).as_slice(),
-            [Action::Error(_)]
+            [Action::OpenModal(_)]
         ));
         view.set_query("", &ctx);
         assert_eq!(view.visible_checked(&ctx).len(), 3);

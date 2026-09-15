@@ -313,7 +313,7 @@ fn create_empty_tag_then_add_members_with_shared_picker() {
 }
 
 #[test]
-fn tag_panel_filters_locally_and_batch_writes_exclude_hidden_selections() {
+fn tag_panel_filters_locally_and_batch_writes_include_hidden_selections() {
     let mut ws = fixture("tags");
     let snap = ws.scan().unwrap();
     let theme = Theme::default();
@@ -353,7 +353,7 @@ fn tag_panel_filters_locally_and_batch_writes_exclude_hidden_selections() {
     ws.config = ws.load_config().unwrap();
     let next = ws.scan().unwrap();
     assert!(next.get("alpha").unwrap().tags.contains(&"reviewed".into()));
-    assert!(!next.get("beta").unwrap().tags.contains(&"reviewed".into()));
+    assert!(next.get("beta").unwrap().tags.contains(&"reviewed".into()));
     let ctx = Ctx {
         ws: &ws,
         snap: &next,
