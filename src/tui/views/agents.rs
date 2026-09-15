@@ -1282,9 +1282,14 @@ impl AgentsView {
                 band.width.saturating_sub(2) as usize,
             );
             let mut x = band.x + 1;
-            for i in visible.start..(visible.end + 1).min(self.destinations.len()) {
+            for (i, card_width) in widths
+                .iter()
+                .enumerate()
+                .take((visible.end + 1).min(self.destinations.len()))
+                .skip(visible.start)
+            {
                 let scope = &self.destinations[i];
-                let w = widths[i] as u16 - 1;
+                let w = *card_width as u16 - 1;
                 let clipped_width = w.min(band.right().saturating_sub(1).saturating_sub(x));
                 if clipped_width == 0 {
                     break;
@@ -2062,17 +2067,15 @@ impl View for AgentsView {
         if !self.preview.is_open()
             && self.matrix.hints().is_none()
             && m.kind == MouseEventKind::Down(MouseButton::Left)
-        {
-            if let Some(index) = self
+            && let Some(index) = self
                 .group_rects
                 .iter()
                 .take(2)
                 .position(|rect| rect.contains((m.column, m.row).into()))
-            {
-                self.set_focus([Focus::Agents, Focus::Scopes][index]);
-                self.filter_editing = false;
-                self.search_panel.completion.close();
-            }
+        {
+            self.set_focus([Focus::Agents, Focus::Scopes][index]);
+            self.filter_editing = false;
+            self.search_panel.completion.close();
         }
         if !self.preview.is_open()
             && self.matrix.hints().is_none()

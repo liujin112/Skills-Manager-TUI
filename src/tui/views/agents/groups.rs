@@ -419,7 +419,7 @@ impl AgentsView {
                 .map(|(p, _)| p.members())
                 .unwrap_or_default()
         } else {
-            match skills::preset::tag_members(&ctx.ws.config, &[key.name.clone()]) {
+            match skills::preset::tag_members(&ctx.ws.config, std::slice::from_ref(&key.name)) {
                 Ok(k) => k,
                 Err(e) => return vec![Action::Error(e.to_string())],
             }
@@ -550,11 +550,11 @@ impl AgentsView {
                     as usize;
                 return Some(vec![]);
             }
-            if m.kind == MouseEventKind::Down(MouseButton::Left) {
-                if let Some((_, i)) = self.quick.popup_hits.iter().find(|(r, _)| r.contains(at)) {
-                    self.quick.popup_cursor = *i;
-                    return self.quick_key(KeyEvent::new(KeyCode::Enter, m.modifiers), ctx);
-                }
+            if m.kind == MouseEventKind::Down(MouseButton::Left)
+                && let Some((_, i)) = self.quick.popup_hits.iter().find(|(r, _)| r.contains(at))
+            {
+                self.quick.popup_cursor = *i;
+                return self.quick_key(KeyEvent::new(KeyCode::Enter, m.modifiers), ctx);
             }
             return Some(vec![]);
         }

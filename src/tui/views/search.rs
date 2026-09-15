@@ -661,7 +661,7 @@ impl SearchView {
                 vec![]
             }
             Ok(false) => vec![],
-            Err(error) => vec![Action::Error(error.into())],
+            Err(error) => vec![Action::Error(error)],
         }
     }
 
@@ -933,7 +933,7 @@ impl SearchView {
 /// Drawing, split by band. `draw` itself only decides which of these run.
 impl SearchView {
     fn input_title(&self, ctx: &Ctx) -> Line<'static> {
-        let title = Line::from(vec![
+        Line::from(vec![
             Span::raw(" "),
             Span::raw({
                 let total = ctx
@@ -964,8 +964,7 @@ impl SearchView {
                 )
             }),
             Span::raw(" "),
-        ]);
-        title
+        ])
     }
 
     /// The results, as a grid of cells that happens to be one column wide in
