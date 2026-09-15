@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub struct Query {
     pub text: String,
     pub tags: Vec<String>,
+    pub presets: Vec<String>,
     pub agents: Vec<String>,
     pub statuses: Vec<String>,
     pub sources: Vec<String>,
@@ -37,6 +38,10 @@ impl Query {
                     q.untagged = true;
                 } else {
                     q.tags.push(v.to_lowercase());
+                }
+            } else if let Some(v) = tok.strip_prefix("preset:") {
+                if !v.is_empty() {
+                    q.presets.push(v.to_lowercase());
                 }
             } else if let Some(v) = tok.strip_prefix("agent:") {
                 if !v.is_empty() {
@@ -65,6 +70,7 @@ impl Query {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
             && self.tags.is_empty()
+            && self.presets.is_empty()
             && self.agents.is_empty()
             && self.statuses.is_empty()
             && self.sources.is_empty()
@@ -85,6 +91,11 @@ impl Query {
             match r.deploy.get(a) {
                 Some(DeployState::Deployed) => {}
                 _ => return false,
+            }
+        }
+        for preset in &self.presets {
+            if !r.presets.iter().any(|name| name.to_lowercase() == *preset) {
+                return false;
             }
         }
         if !self.statuses.is_empty() {
@@ -1014,6 +1025,7 @@ mod tests {
             external: false,
             name_mismatch: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            presets: Vec::new(),
             note: None,
             source: None,
             current_hash: None,

@@ -674,6 +674,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                 external: false,
                 name_mismatch: false,
                 tags: vec![],
+                presets: Vec::new(),
                 note: None,
                 source: Some(fetched.repository.source(key, Some(&fetched.revision))),
                 current_hash: None,
@@ -685,6 +686,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
         .collect();
     Snapshot {
         root: fetched.workdir.clone(),
+        presets: Default::default(),
         skills,
         agents: vec![],
     }

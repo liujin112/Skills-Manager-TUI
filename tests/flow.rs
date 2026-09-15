@@ -723,7 +723,7 @@ fn preset_status_activation_and_overlap() {
         "---\nname: two\n---\ndifferent\n"
     );
 
-    // A member missing from the root is reported, not counted.
+    // A member missing from the root remains in the package's denominator.
     let ghost = Preset {
         name: "ghost".into(),
         skills: vec!["one".into(), "nope".into()],
@@ -731,7 +731,8 @@ fn preset_status_activation_and_overlap() {
     };
     let st = preset_status(&snap, &ghost, &scope);
     assert_eq!(st.absent, vec!["nope"]);
-    assert_eq!(st.total, 2);
+    assert_eq!(st.total, 4);
+    assert_eq!(st.state(), PresetState::Partial);
 }
 
 /// Applying a plan against a tree that moved on: what is already right is left

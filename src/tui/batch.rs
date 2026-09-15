@@ -1316,7 +1316,7 @@ mod tests {
         for name in ["one", "two"] {
             assert_eq!(
                 ws.presets.load(name).unwrap().unwrap().skills,
-                vec!["other", "alpha", "beta"]
+                vec!["alpha", "beta", "other"]
             );
         }
         let Some(history::Intent::Meta(changes)) = intent else {

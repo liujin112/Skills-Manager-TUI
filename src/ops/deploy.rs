@@ -603,7 +603,7 @@ pub struct PresetStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PresetState {
-    /// No deployable member, or no agent in scope.
+    /// No members or agents in scope.
     Empty,
     /// Every pair is deployed.
     Active,
@@ -627,7 +627,7 @@ impl PresetStatus {
     }
 
     /// Optional compact status text: a fraction for partial coverage, `empty`
-    /// for no deployable members, and no suffix for active/inactive states.
+    /// for no members or agents in scope, and no suffix for active/inactive states.
     pub fn progress(&self) -> Option<String> {
         match self.state() {
             PresetState::Partial => Some(format!("{}/{}", self.installed, self.total)),
@@ -637,20 +637,18 @@ impl PresetStatus {
     }
 }
 
-/// Count deployed member/agent pairs across the explicit `scope`. Only members
-/// present in the skills root count; a member whose directory is gone is listed
-/// in `absent` and excluded from the total, so a preset referring to a deleted
-/// skill can still read as complete.
+/// Count every member/agent pair across the explicit `scope`. Missing
+/// library members stay in the denominator so a partial package never toggles off
+/// merely because its unavailable members were hidden from the count.
 pub fn preset_status(snap: &Snapshot, preset: &Preset, scope: &[String]) -> PresetStatus {
-    let agents = scope.to_vec();
+    let members = preset.members();
     let mut installed = 0;
-    let mut total = 0;
+    let total = members.len() * scope.len();
     let mut absent = Vec::new();
-    for skill in &preset.skills {
+    for skill in &members {
         match snap.get(skill) {
             Some(rec) if rec.status.is_present() => {
-                for agent in &agents {
-                    total += 1;
+                for agent in scope {
                     if matches!(rec.deploy.get(agent), Some(DeployState::Deployed)) {
                         installed += 1;
                     }
@@ -674,15 +672,15 @@ pub fn plan_preset_activate(
     preset: &Preset,
     scope: &[String],
 ) -> Result<Vec<Action>> {
+    let members = preset.members();
     let agents = scope.to_vec();
-    let present: Vec<String> = preset
-        .skills
+    let present: Vec<String> = members
         .iter()
         .filter(|s| snap.get(s).is_some_and(|r| r.status.is_present()))
         .cloned()
         .collect();
     let mut actions = plan_deploy(ws, snap, &present, &agents)?;
-    for skill in preset.skills.iter().filter(|s| !present.contains(s)) {
+    for skill in members.iter().filter(|s| !present.contains(s)) {
         actions.push(Action::Skip {
             agent: "*".into(),
             skill: skill.clone(),
@@ -701,9 +699,9 @@ pub fn plan_preset_deactivate(
     preset: &Preset,
     scope: &[String],
 ) -> Result<Vec<Action>> {
+    let members = preset.members();
     let agents = scope.to_vec();
-    let present: Vec<String> = preset
-        .skills
+    let present: Vec<String> = members
         .iter()
         .filter(|s| snap.get(s).is_some())
         .cloned()

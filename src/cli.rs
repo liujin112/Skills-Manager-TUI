@@ -104,13 +104,13 @@ pub enum Command {
     },
     /// Agent directories
     Agents(AgentsArgs),
-    /// Presets: named groups of skills
+    /// Preset packages with fixed skill members
     Preset(PresetArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct ListArgs {
-    /// Free text; supports tag:, agent:, status:, source: prefixes
+    /// Free text; supports tag:, preset:, repo:, agent:, status:, source: prefixes
     pub query: Vec<String>,
     #[arg(long, short = 't')]
     pub tag: Vec<String>,
@@ -342,19 +342,28 @@ pub enum PresetCommand {
         agents: Vec<String>,
         #[arg(long = "skill", value_name = "SKILL")]
         skills: Vec<String>,
+        /// Add a snapshot of each tag's current members
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     Delete {
         name: String,
         #[arg(long, short)]
         yes: bool,
     },
+    /// Add skills, optionally selecting each tag's current members
     Add {
         name: String,
         skills: Vec<String>,
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
+    /// Remove skills, optionally selecting each tag's current members
     Remove {
         name: String,
         skills: Vec<String>,
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     Deploy {
         name: String,
@@ -446,6 +455,13 @@ pub fn run(cli: Cli) -> Result<()> {
         )
     );
     let ws = cli.workspace(create)?;
+    if let Some(report) = &ws.preset_migration {
+        eprintln!(
+            "Migrated {} presets to fixed members; original files: {}",
+            report.migrated_names.len(),
+            report.backup_dir.display()
+        );
+    }
     let command = cli
         .command
         .expect("dispatcher only calls run with a subcommand");
@@ -591,6 +607,7 @@ struct ListRow<'a> {
     name: Option<&'a str>,
     status: &'static str,
     tags: &'a [String],
+    presets: &'a [String],
     deployed: Vec<&'a str>,
     source: Option<&'static str>,
     description: Option<&'a str>,
@@ -625,6 +642,7 @@ fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
                 name: r.name.as_deref(),
                 status: r.status.label(),
                 tags: &r.tags,
+                presets: &r.presets,
                 deployed: r.deployed_to(),
                 source: r.source.as_ref().map(|s| s.kind()),
                 description: r.description.as_deref(),
@@ -1464,7 +1482,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                     println!(
                         "{:<20} {:>3} skills  agents: {}",
                         p.name,
-                        p.skills.len(),
+                        p.members().len(),
                         if p.agents.is_empty() {
                             "all".into()
                         } else {
@@ -1487,6 +1505,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
             description,
             agents,
             skills,
+            tags,
         } => {
             if store.load(&name)?.is_some() {
                 bail!("preset {name} already exists");
@@ -1497,13 +1516,16 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                     .agent(a)
                     .with_context(|| format!("unknown agent: {a}"))?;
             }
-            let p = Preset {
+            let mut skills = skills;
+            skills.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
+            let mut p = Preset {
                 name: name.clone(),
                 description,
                 skills,
                 agents,
                 color: None,
             };
+            p.skills = p.members();
             store.save(&p)?;
             ctx.out(&p, || println!("created preset {name}"))
         }
@@ -1516,23 +1538,25 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                 println!("deleted preset {name}")
             })
         }
-        PresetCommand::Add { name, skills } => {
+        PresetCommand::Add { name, skills, tags } => {
             let mut p = store
                 .load(&name)?
                 .with_context(|| format!("no such preset: {name}"))?;
-            for s in skills {
-                if !p.skills.contains(&s) {
-                    p.skills.push(s);
-                }
-            }
+            p.skills
+                .extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
+            p.skills.extend(skills);
+            p.skills = p.members();
             store.save(&p)?;
             ctx.out(&p, || println!("{name}: {}", p.skills.join(", ")))
         }
-        PresetCommand::Remove { name, skills } => {
+        PresetCommand::Remove { name, skills, tags } => {
             let mut p = store
                 .load(&name)?
                 .with_context(|| format!("no such preset: {name}"))?;
-            p.skills.retain(|s| !skills.contains(s));
+            let mut selected = skills;
+            selected.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
+            p.skills.retain(|s| !selected.contains(s));
+            p.skills = p.members();
             store.save(&p)?;
             ctx.out(&p, || println!("{name}: {}", p.skills.join(", ")))
         }
@@ -1582,24 +1606,11 @@ fn preset_links(ctx: &Ctx, name: &str, agents: &[String], dry_run: bool, on: boo
         ctx.ws.config.agent_keys()
     };
     let snap = ctx.ws.scan()?;
-    // Members that are absent are reported as skips instead of aborting the whole preset.
-    let (present, absent): (Vec<String>, Vec<String>) = p
-        .skills
-        .iter()
-        .cloned()
-        .partition(|s| snap.get(s).is_some());
-    let mut actions = if on {
-        deploy::plan_deploy(&ctx.ws, &snap, &present, &targets)?
+    let actions = if on {
+        deploy::plan_preset_activate(&ctx.ws, &snap, &p, &targets)?
     } else {
-        deploy::plan_undeploy(&ctx.ws, &snap, &present, &targets)?
+        deploy::plan_preset_deactivate(&ctx.ws, &snap, &p, &targets)?
     };
-    for s in absent {
-        actions.push(Action::Skip {
-            agent: "*".into(),
-            skill: s,
-            reason: "not in skills root".into(),
-        });
-    }
     run_actions(ctx, &actions, dry_run)
 }
 

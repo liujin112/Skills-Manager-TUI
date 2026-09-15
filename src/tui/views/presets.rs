@@ -183,6 +183,7 @@ impl PresetsView {
                     external: false,
                     name_mismatch: false,
                     tags: vec![],
+                    presets: Vec::new(),
                     note: None,
                     source: None,
                     current_hash: None,

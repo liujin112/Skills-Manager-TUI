@@ -90,6 +90,8 @@ pub struct SkillRecord {
     pub external: bool,
     pub name_mismatch: bool,
     pub tags: Vec<String>,
+    /// Computed package membership from this snapshot's preset index.
+    pub presets: Vec<String>,
     pub note: Option<String>,
     pub source: Option<crate::meta::Source>,
     /// Calculated only when needed for baseline, rename, or shadow comparison.
@@ -196,6 +198,7 @@ pub struct Snapshot {
     pub root: PathBuf,
     pub skills: Vec<SkillRecord>,
     pub agents: Vec<AgentReport>,
+    pub presets: crate::preset::PresetIndex,
 }
 
 impl Snapshot {
@@ -253,6 +256,7 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
         root: snapshot.root.clone(),
         skills: records.into_values().collect(),
         agents,
+        presets: snapshot.presets.clone(),
     })
 }
 
@@ -422,6 +426,7 @@ fn scan_inventory(
                 external,
                 name_mismatch: doc.as_ref().map(|d| d.name_mismatch()).unwrap_or(false),
                 tags: Vec::new(),
+                presets: Vec::new(),
                 note: None,
                 source: None,
                 current_hash: None,
@@ -446,6 +451,7 @@ fn scan_inventory(
                     external: false,
                     name_mismatch: false,
                     tags: Vec::new(),
+                    presets: Vec::new(),
                     note: None,
                     source: None,
                     current_hash: None,
@@ -471,6 +477,7 @@ fn scan_inventory(
                     external: false,
                     name_mismatch: false,
                     tags: Vec::new(),
+                    presets: Vec::new(),
                     note: None,
                     source: None,
                     current_hash: None,
@@ -493,12 +500,8 @@ fn scan_inventory(
         .filter(|_| config.tags_enabled)
         .flat_map(|tag| tag.skills.clone())
         .collect();
-    references.extend(
-        crate::preset::PresetStore::new(root)
-            .list()?
-            .into_iter()
-            .flat_map(|p| p.skills),
-    );
+    let presets = crate::preset::PresetIndex::new(crate::preset::PresetStore::new(root).list()?);
+    references.extend(presets.by_skill.keys().cloned());
     for key in references {
         if !crate::repository::valid_id(&key) {
             continue;
@@ -513,6 +516,7 @@ fn scan_inventory(
             external: false,
             name_mismatch: false,
             tags: Vec::new(),
+            presets: Vec::new(),
             note: None,
             source: None,
             current_hash: None,
@@ -540,6 +544,7 @@ fn scan_inventory(
         } else {
             Vec::new()
         };
+        rec.presets = presets.by_skill.get(&rec.key).cloned().unwrap_or_default();
     }
 
     // Collect baseline work once, then share completed hashes with agent/shadow
@@ -645,6 +650,7 @@ fn scan_inventory(
         root: root.to_path_buf(),
         skills: records.into_values().collect(),
         agents,
+        presets,
     })
 }
 
