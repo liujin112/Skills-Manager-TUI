@@ -1129,6 +1129,18 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::AgentConfig};
 
+    fn context_request_for_row(view: &mut HealthView, index: usize, ctx: &Ctx) -> Request {
+        let x = view.left.x.saturating_add(1);
+        for y in view.list.rows.y..view.list.rows.bottom() {
+            if view.list.row_at(y, view.rows.len()) == Some(index)
+                && let Some(request) = crate::tui::views::View::context_menu(view, x, y, ctx)
+            {
+                return request;
+            }
+        }
+        panic!("expected a context menu target for health row {index}");
+    }
+
     #[test]
     fn health_lists_agent_issues_and_only_offers_safe_repairs() {
         let root =
@@ -1183,6 +1195,49 @@ mod tests {
             assert!(text.contains(name), "missing {name}");
         }
         assert!(!text.contains("everything is healthy"));
+
+        let broken_index = view
+            .rows
+            .iter()
+            .position(|row| row.agent.as_deref() == Some("sample") && row.key == "broken-item")
+            .unwrap();
+        let broken_request = context_request_for_row(&mut view, broken_index, &ctx);
+        assert!(matches!(
+            broken_request.target,
+            Target::Entry {
+                ref key,
+                ref scope,
+                ..
+            } if key == "broken-item" && scope == "sample"
+        ));
+        assert!(broken_request.allows(Command::Remove));
+        assert!(!broken_request.allows(Command::Relink));
+        assert_eq!(
+            broken_request
+                .items
+                .iter()
+                .find(|item| item.command == Command::Relink)
+                .and_then(|item| item.disabled.as_deref()),
+            Some("Requires an identical unmanaged copy")
+        );
+
+        let invalid_index = view
+            .rows
+            .iter()
+            .position(|row| row.agent.is_none() && row.key == "invalid-item")
+            .unwrap();
+        let invalid_request = context_request_for_row(&mut view, invalid_index, &ctx);
+        assert!(matches!(
+            invalid_request.target,
+            Target::Entry {
+                ref key,
+                ref scope,
+                ..
+            } if key == "invalid-item" && scope.is_empty()
+        ));
+        assert!(invalid_request.allows(Command::Remove));
+        assert!(!invalid_request.allows(Command::Update));
+
         for (name, key) in [("broken-item", 'x'), ("printer", 'r')] {
             view.list
                 .select(view.rows.iter().position(|r| r.key == name));

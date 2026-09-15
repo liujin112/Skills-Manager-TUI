@@ -310,6 +310,18 @@ impl ContextMenu {
             );
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn hit_rect_for(&self, command: Command) -> Option<Rect> {
+        self.hits.iter().find_map(|(rect, index)| {
+            (self.request.items.get(*index)?.command == command).then_some(*rect)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn menu_area(&self) -> Rect {
+        self.area
+    }
 }
 
 #[cfg(test)]

@@ -690,7 +690,26 @@ impl View for TagsView {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
     use skills::config::TagConfig;
+
+    fn context_request<V: crate::tui::views::View>(
+        view: &mut V,
+        ctx: &Ctx,
+        width: u16,
+        height: u16,
+    ) -> Request {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), ctx)).unwrap();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(request) = view.context_menu(x, y, ctx) {
+                    return request;
+                }
+            }
+        }
+        panic!("expected a context menu target in the rendered member panel");
+    }
 
     #[test]
     fn tags_draw_and_edit_from_the_supplied_configuration_snapshot() {
@@ -754,5 +773,63 @@ mod snapshot_tests {
             );
             view.prompt = None;
         }
+    }
+
+    #[test]
+    fn tags_context_menu_uses_shared_member_actions_and_tag_specific_remove_label() {
+        let tmp = skills::ops::DownloadDir::new("tags-context-menu").unwrap();
+        let root = tmp.path();
+        Config {
+            agents: vec![],
+            tags: vec![TagConfig {
+                name: "work".into(),
+                skills: vec!["sample".into()],
+                color: None,
+                description: None,
+            }],
+            ..Default::default()
+        }
+        .save(root)
+        .unwrap();
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        std::fs::write(
+            root.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample skill\n---\nBody",
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = TagsView::default();
+        view.refresh(&ctx);
+        view.select("work", &snap);
+
+        let request = context_request(&mut view, &ctx, 120, 30);
+        assert_eq!(request.target, Target::Skill("sample".into()));
+        assert!(
+            !request
+                .items
+                .iter()
+                .any(|item| item.command == Command::Accept)
+        );
+        assert_eq!(
+            request
+                .items
+                .iter()
+                .find(|item| item.command == Command::Remove)
+                .map(|item| item.label.as_str()),
+            Some("Remove from tag")
+        );
+        assert!(request.items.iter().any(|item| item.disabled.is_some()));
+        assert!(matches!(
+            view.context_execute(&request.target, Command::Remove, &ctx)
+                .as_slice(),
+            [Action::WriteMeta(_)]
+        ));
     }
 }

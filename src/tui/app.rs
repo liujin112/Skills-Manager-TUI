@@ -2865,6 +2865,244 @@ mod escape_hierarchy_tests {
 mod context_menu_tests {
     use super::*;
     use crate::tui::components::context_menu::{Command, Item, Request, Target};
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{
+        Workspace,
+        config::{AgentConfig, TagConfig},
+        preset::Preset,
+        repository::Repository,
+    };
+
+    fn draw_app(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn interactive_app() -> (skills::ops::DownloadDir, App) {
+        let root = skills::ops::DownloadDir::new("context-interaction").unwrap();
+        let library = root.path().join("library");
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&library).unwrap();
+        Config {
+            agents: vec![AgentConfig {
+                key: "sample-agent".into(),
+                name: "Sample agent".into(),
+                skills_dir: agent_dir.display().to_string(),
+            }],
+            tags: vec![TagConfig {
+                name: "work".into(),
+                skills: vec!["sample".into()],
+                color: None,
+                description: None,
+            }],
+            ..Default::default()
+        }
+        .save(&library)
+        .unwrap();
+        std::fs::create_dir_all(library.join("sample")).unwrap();
+        std::fs::write(
+            library.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample skill\n---\nBody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(library.join("invalid-item")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::os::unix::fs::symlink(library.join("sample"), agent_dir.join("sample")).unwrap();
+        std::os::unix::fs::symlink(library.join("missing-target"), agent_dir.join("broken"))
+            .unwrap();
+
+        let ws = Workspace::open(&library).unwrap();
+        Repository {
+            alias: "demo".into(),
+            name: Some("Demo skills".into()),
+            kind: skills::meta::SourceKind::Git,
+            url: "https://example.test/demo.git".into(),
+            branch: "main".into(),
+        }
+        .save(&ws)
+        .unwrap();
+        let repo_skill = library.join("repos/demo/repo-skill");
+        std::fs::create_dir_all(&repo_skill).unwrap();
+        std::fs::write(
+            repo_skill.join("SKILL.md"),
+            "---\nname: repo-skill\ndescription: Repository skill\n---\nBody",
+        )
+        .unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "Office".into(),
+                skills: vec!["sample".into()],
+                ..Preset::default()
+            })
+            .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let launch_directory = library;
+        let mut app = App::new_with_launch_directory(ws, tx, Some(&launch_directory)).unwrap();
+        app.ws.inventory_products = Some(std::collections::BTreeSet::from(["sample-agent".into()]));
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.agents.refresh(&ctx);
+        (root, app)
+    }
+
+    fn open_first_menu(app: &mut App, width: u16, height: u16) -> (u16, u16) {
+        draw_app(app, width, height);
+        let body = app.body;
+        for row in body.y..body.bottom() {
+            for column in body.x..body.right() {
+                app.handle(Msg::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                if app.context_menu.is_some() {
+                    return (column, row);
+                }
+            }
+        }
+        panic!("no context-menu target rendered for {:?}", app.tab);
+    }
+
+    fn outside_menu(app: &App, width: u16, height: u16) -> (u16, u16) {
+        let area = app.context_menu.as_ref().unwrap().menu_area();
+        [
+            (0, 0),
+            (width - 1, 0),
+            (0, height - 1),
+            (width - 1, height - 1),
+        ]
+        .into_iter()
+        .find(|(x, y)| !area.contains((*x, *y).into()))
+        .unwrap_or((0, 0))
+    }
+
+    #[test]
+    fn mouse_context_menu_flow_works_for_every_page_on_isolated_fixture() {
+        let (_root, mut app) = interactive_app();
+        for tab in Tab::ALL {
+            app.apply(Action::SwitchTab(tab));
+            app.enter_page();
+            let (_column, _row) = open_first_menu(&mut app, 140, 35);
+            let request = app.context_menu.as_ref().unwrap().request.clone();
+            match tab {
+                Tab::Search | Tab::Tags | Tab::Presets => {
+                    assert!(matches!(request.target, Target::Skill(_)));
+                }
+                Tab::Repos => assert!(matches!(request.target, Target::Skill(_))),
+                Tab::Agents => assert!(matches!(
+                    request.target,
+                    Target::Entry { ref scope, .. } if scope == "sample-agent"
+                )),
+                Tab::Health => assert!(matches!(
+                    request.target,
+                    Target::Entry { ref scope, .. } if scope.is_empty()
+                )),
+            }
+            assert!(!request.items.is_empty());
+
+            // A right click inside the menu is consumed by the menu itself.
+            draw_app(&mut app, 140, 35);
+            let open_rect = app
+                .context_menu
+                .as_ref()
+                .unwrap()
+                .hit_rect_for(Command::Open)
+                .unwrap();
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: open_rect.x,
+                row: open_rect.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(app.context_menu.is_some());
+
+            if let Some(item) = request.items.iter().find(|item| item.disabled.is_some()) {
+                let command = item.command;
+                let reason = item.disabled.clone().unwrap();
+                let rect = app
+                    .context_menu
+                    .as_ref()
+                    .unwrap()
+                    .hit_rect_for(command)
+                    .unwrap();
+                app.handle(Msg::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let screen = draw_app(&mut app, 140, 35);
+                assert!(
+                    screen.contains(&reason),
+                    "missing disabled reason for {command:?}"
+                );
+            }
+
+            let (column, row) = outside_menu(&app, 140, 35);
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(app.context_menu.is_none());
+        }
+
+        // Exercise an actual enabled mouse click through App::handle. Open is
+        // side-effect free on disk and closes the menu after opening preview.
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        open_first_menu(&mut app, 140, 35);
+        draw_app(&mut app, 140, 35);
+        let open_rect = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .hit_rect_for(Command::Open)
+            .unwrap();
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: open_rect.x,
+            row: open_rect.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn mouse_context_menu_stays_bounded_when_the_terminal_is_small() {
+        let (_root, mut app) = interactive_app();
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        open_first_menu(&mut app, 80, 12);
+        draw_app(&mut app, 80, 12);
+        let area = app.context_menu.as_ref().unwrap().menu_area();
+        assert!(area.right() <= 80 && area.bottom() <= 12);
+        for _ in 0..20 {
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        draw_app(&mut app, 80, 12);
+        let area = app.context_menu.as_ref().unwrap().menu_area();
+        assert!(area.right() <= 80 && area.bottom() <= 12);
+    }
+
     #[test]
     fn context_menu_blocks_page_input_and_closes_for_modal_resize_snapshot() {
         let root = skills::ops::DownloadDir::new("context-app").unwrap();
