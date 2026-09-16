@@ -1566,9 +1566,13 @@ impl View for SearchView {
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m, ctx) {
             if self.preview_rect.contains(at) {
+                self.focus = Focus::Preview;
+                self.choice_focus = ChoiceFocus::List;
                 self.scroll_preview(d);
             } else if self.list_rect.contains(at) {
                 // A wheel notch is a row of cards, however many are on it.
+                self.focus = Focus::List;
+                self.choice_focus = ChoiceFocus::List;
                 self.move_row(d.signum());
             }
             return vec![];
@@ -1804,6 +1808,50 @@ mod tests {
             picker.checked,
             BTreeSet::from(["alpha".into(), "beta".into()])
         );
+    }
+
+    #[test]
+    fn picker_mouse_wheel_returns_focus_from_buttons_to_results() {
+        let root = skills::ops::DownloadDir::new("picker-mouse-focus").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        std::fs::write(
+            root.path().join("alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: alpha\n---\nBody",
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = SearchView::preset_members("daily", &ctx);
+        picker.focus_list();
+        picker.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctx);
+        assert_eq!(picker.choice_focus, ChoiceFocus::Apply);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
+        picker.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: picker.list_rect.x + 1,
+                row: picker.list_rect.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        assert_eq!(picker.focus, Focus::List);
+        assert_eq!(picker.choice_focus, ChoiceFocus::List);
+        assert!(picker.hints().iter().any(|(key, _)| *key == "Enter/Space"));
     }
 
     #[test]

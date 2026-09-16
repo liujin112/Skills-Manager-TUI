@@ -1592,7 +1592,7 @@ impl App {
             snap: &self.snap,
             settings: &self.settings,
         };
-        let status = if self.modal.is_some() {
+        let status = if self.modal.is_some() || self.quit_prompt.is_some() {
             String::new()
         } else {
             match self.tab {
@@ -1605,32 +1605,21 @@ impl App {
         let status = fit(&status, area.width as usize / 3);
         let status_width = width(&status);
         let budget = area.width as usize - status_width;
-        let hints = if self.batch_running && self.batch_modal_owned {
-            &[("…", "saving changes")][..]
-        } else if let Some(m) = &self.modal {
-            m.hints()
-        } else if self.focus == AppFocus::Tabs {
-            &[("←→/Tab", "tabs"), ("Enter/↓", "enter"), ("Esc/q", "quit")][..]
-        } else {
-            match self.tab {
-                Tab::Search => self.search.hints(),
-                Tab::Tags => self.tags.hints(),
-                Tab::Presets => self.presets.hints(),
-                Tab::Agents => self.agents.hints(),
-                Tab::Health => self.health.hints(),
-                Tab::Repos => self.repos.hints(),
-            }
-        };
+        let hints = self.footer_hints();
         // Results moved out to the notification stack, so the footer is only keys.
         let mut spans: Vec<Span> = Vec::new();
         let mut hint_w = 0usize;
         let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
         let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3)
-            + if self.modal.is_none() { 9 } else { 0 };
+            + if self.modal.is_none() && self.quit_prompt.is_none() {
+                9
+            } else {
+                0
+            };
         for (key, desc) in hints {
             if (!self.settings.tags_enabled && *key == "t")
                 || key.contains("Esc")
-                || (*key == "F1" && self.modal.is_none())
+                || (*key == "F1" && self.modal.is_none() && self.quit_prompt.is_none())
             {
                 continue;
             }
@@ -1656,7 +1645,7 @@ impl App {
                 hint_w += piece_w;
             }
         }
-        if self.modal.is_none() && hint_w + 9 <= budget {
+        if self.modal.is_none() && self.quit_prompt.is_none() && hint_w + 9 <= budget {
             spans.push(Span::styled("F1", th.key_hint()));
             spans.push(Span::styled(" help  ", Style::default().fg(th.placeholder)));
             hint_w += 9;
@@ -1668,6 +1657,33 @@ impl App {
         ];
         line.extend(spans);
         f.render_widget(Paragraph::new(Line::from(line)), area);
+    }
+
+    /// Return the shortcuts owned by the surface that currently receives
+    /// keyboard input. Keeping this decision in one place prevents the global
+    /// footer from retaining a page hint while a modal or quit prompt owns
+    /// focus.
+    fn footer_hints(&self) -> Hints {
+        if self.quit_prompt.is_some() {
+            return &[("←→", "buttons"), ("Enter", "confirm"), ("Esc/q", "cancel")];
+        }
+        if self.batch_running && self.batch_modal_owned {
+            return &[("…", "saving changes")];
+        }
+        if let Some(m) = &self.modal {
+            return m.hints();
+        }
+        if self.focus == AppFocus::Tabs {
+            return &[("←→/Tab", "tabs"), ("Enter/↓", "enter"), ("Esc/q", "quit")];
+        }
+        match self.tab {
+            Tab::Search => self.search.hints(),
+            Tab::Tags => self.tags.hints(),
+            Tab::Presets => self.presets.hints(),
+            Tab::Agents => self.agents.hints(),
+            Tab::Health => self.health.hints(),
+            Tab::Repos => self.repos.hints(),
+        }
     }
 }
 
@@ -2958,7 +2974,7 @@ mod context_menu_tests {
 
     fn open_first_menu(app: &mut App, width: u16, height: u16) -> (u16, u16) {
         draw_app(app, width, height);
-        let body = app.body;
+        let body = Rect::new(0, 1, width, height.saturating_sub(2));
         for row in body.y..body.bottom() {
             for column in body.x..body.right() {
                 app.handle(Msg::Mouse(MouseEvent {
@@ -2986,6 +3002,1056 @@ mod context_menu_tests {
         .into_iter()
         .find(|(x, y)| !area.contains((*x, *y).into()))
         .unwrap_or((0, 0))
+    }
+
+    fn footer_line(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        (0..width)
+            .map(|x| terminal.backend().buffer()[(x, height - 1)].symbol())
+            .collect()
+    }
+
+    fn rendered_footer_hints(app: &mut App, width: u16, height: u16) -> Vec<(String, String)> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let key_style = app.settings.theme.key_hint();
+        let is_key = |x: u16| {
+            let cell = &buffer[(x, height - 1)];
+            cell.fg == key_style.fg.unwrap_or(ratatui::style::Color::Reset)
+                && cell.modifier.contains(key_style.add_modifier)
+        };
+        let mut result = Vec::new();
+        let mut x = 0;
+        while x < width {
+            if !is_key(x) {
+                x += 1;
+                continue;
+            }
+            let key_start = x;
+            while x < width && is_key(x) {
+                x += 1;
+            }
+            let key: String = (key_start..x)
+                .map(|column| buffer[(column, height - 1)].symbol())
+                .filter(|symbol| !symbol.is_empty())
+                .collect();
+            let desc_start = x;
+            while x < width && !is_key(x) {
+                x += 1;
+            }
+            let desc: String = (desc_start..x)
+                .map(|column| buffer[(column, height - 1)].symbol())
+                .collect::<String>()
+                .trim()
+                .to_owned();
+            result.push((key, desc));
+        }
+        result
+    }
+
+    fn expected_footer_hints(app: &App) -> Vec<(String, String)> {
+        expected_rendered_hints(app, app.footer_hints())
+    }
+
+    fn expected_rendered_hints(app: &App, hints: Hints) -> Vec<(String, String)> {
+        let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
+        let mut expected = Vec::new();
+        for (key, desc) in hints {
+            if (!app.settings.tags_enabled && *key == "t")
+                || key.contains("Esc")
+                || (*key == "F1" && app.modal.is_none() && app.quit_prompt.is_none())
+            {
+                continue;
+            }
+            expected.push(((*key).to_owned(), (*desc).to_owned()));
+        }
+        if let Some((key, desc)) = escape {
+            expected.push(((*key).to_owned(), (*desc).to_owned()));
+        }
+        if app.modal.is_none() && app.quit_prompt.is_none() {
+            expected.push(("F1".into(), "help".into()));
+        }
+        expected
+    }
+
+    fn assert_footer_exact(app: &mut App, label: &str, hints: Hints) {
+        let footer = footer_line(app, 400, 40);
+        assert_eq!(
+            app.footer_hints(),
+            hints,
+            "{label}: active footer hints do not belong to the expected focus"
+        );
+        let rendered = rendered_footer_hints(app, 400, 40);
+        let expected = expected_rendered_hints(app, hints);
+        assert_eq!(
+            rendered, expected,
+            "{label}: rendered footer hints differ; rendered={rendered:?}, expected={expected:?}, line={footer:?}"
+        );
+    }
+
+    fn assert_footer_matches_focus(app: &mut App, label: &str) {
+        // A wide test surface keeps every applicable hint visible. The footer
+        // still goes through the production budget and ordering code.
+        let footer = footer_line(app, 400, 40);
+        assert!(
+            app.modal.is_none(),
+            "modal footer must be checked by the modal-specific test: {label}"
+        );
+        let expected = expected_footer_hints(app);
+        let rendered = rendered_footer_hints(app, 400, 40);
+        assert_eq!(
+            rendered, expected,
+            "{label}: footer hints do not match the focused panel; rendered={rendered:?}, expected={expected:?}, line={footer:?}"
+        );
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn left_click(app: &mut App, column: u16, row: u16) {
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    fn add_footer_fixture_variants(root: &skills::ops::DownloadDir, app: &mut App) {
+        let library = app.ws.root.clone();
+        let agent = root.path().join("agent");
+        // A malformed root skill gives Health a root issue row. The remaining
+        // entries exercise all agent repair states without touching any user
+        // path: every directory belongs to this DownloadDir fixture.
+        std::fs::create_dir_all(library.join("invalid-root")).unwrap();
+        std::fs::write(library.join("invalid-root/SKILL.md"), "not frontmatter").unwrap();
+        std::fs::create_dir_all(library.join("shadow")).unwrap();
+        std::fs::write(
+            library.join("shadow/SKILL.md"),
+            "---\nname: shadow\ndescription: shadow\n---\nBody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(library.join("shadow-diff")).unwrap();
+        std::fs::write(
+            library.join("shadow-diff/SKILL.md"),
+            "---\nname: shadow-diff\ndescription: shadow\n---\nRoot",
+        )
+        .unwrap();
+        std::fs::create_dir_all(agent.join("shadow")).unwrap();
+        std::fs::write(
+            agent.join("shadow/SKILL.md"),
+            "---\nname: shadow\ndescription: shadow\n---\nBody",
+        )
+        .unwrap();
+        std::fs::create_dir_all(agent.join("shadow-diff")).unwrap();
+        std::fs::write(
+            agent.join("shadow-diff/SKILL.md"),
+            "---\nname: shadow-diff\ndescription: shadow\n---\nAgent copy",
+        )
+        .unwrap();
+        std::fs::create_dir_all(agent.join("agent-only")).unwrap();
+        std::fs::write(
+            agent.join("agent-only/SKILL.md"),
+            "---\nname: agent-only\ndescription: only agent\n---\nBody",
+        )
+        .unwrap();
+        let foreign = root.path().join("foreign-target");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(
+            foreign.join("SKILL.md"),
+            "---\nname: foreign\ndescription: foreign\n---\nBody",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&foreign, agent.join("foreign")).unwrap();
+
+        app.ws.config.tags.push(TagConfig {
+            name: "personal".into(),
+            skills: vec!["sample".into()],
+            color: None,
+            description: None,
+        });
+        app.snap = skills::reconcile::scan(&app.ws.root, &app.ws.config).unwrap();
+        app.on_snapshot();
+    }
+
+    #[test]
+    fn footer_shortcuts_follow_focus_across_all_pages_on_isolated_fixture() {
+        let (root, mut app) = interactive_app();
+        add_footer_fixture_variants(&root, &mut app);
+
+        // Library: input, result list, preview and multi-select each own a
+        // distinct footer. Esc then walks back through the same hierarchy.
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        assert_footer_matches_focus(&mut app, "search list");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "search input");
+        // A completion popup is a third input surface: it keeps input focus,
+        // but replaces the normal input hints until it is accepted or closed.
+        for c in "status:loc".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert_footer_exact(
+            &mut app,
+            "search completion popup",
+            &[
+                ("↑↓", "suggestions"),
+                ("Enter", "complete"),
+                ("Esc", "close suggestions"),
+            ],
+        );
+        key(&mut app, KeyCode::Down);
+        assert_footer_exact(
+            &mut app,
+            "search completion after moving suggestion",
+            &[
+                ("↑↓", "suggestions"),
+                ("Enter", "complete"),
+                ("Esc", "close suggestions"),
+            ],
+        );
+        key(&mut app, KeyCode::Esc);
+        assert_footer_exact(
+            &mut app,
+            "search input after closing completion",
+            &[
+                ("↑↓", "select"),
+                ("↓", "list"),
+                ("Enter", "list"),
+                ("Esc", "clear/results"),
+                ("F1", "help"),
+            ],
+        );
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "search list after input");
+        key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Enter);
+        let preview_footer = footer_line(&mut app, 400, 40);
+        assert!(
+            preview_footer.contains("scroll"),
+            "search preview: {preview_footer:?}"
+        );
+        assert_footer_matches_focus(&mut app, "search preview");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('m'));
+        assert_footer_matches_focus(&mut app, "search multi list");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "search multi input");
+        key(&mut app, KeyCode::Esc);
+        assert_footer_matches_focus(&mut app, "search multi list after input");
+        key(&mut app, KeyCode::Esc);
+        assert_footer_matches_focus(&mut app, "search list after cancelling multi");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, AppFocus::Tabs);
+        assert_footer_matches_focus(&mut app, "tab strip after search");
+
+        // Tags: the left filter, member panel, member preview and tag prompts.
+        app.apply(Action::SwitchTab(Tab::Tags));
+        app.enter_page();
+        assert_footer_matches_focus(&mut app, "tags root");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "tags filter");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Enter);
+        assert_footer_matches_focus(&mut app, "tags members");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "tags member filter");
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "tags member list");
+        key(&mut app, KeyCode::Enter);
+        assert_footer_matches_focus(&mut app, "tags member preview");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Esc);
+        assert_footer_matches_focus(&mut app, "tags root after members");
+        key(&mut app, KeyCode::Char('m'));
+        assert_footer_matches_focus(&mut app, "tags merge prompt");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('C'));
+        assert_footer_matches_focus(&mut app, "tags colour prompt");
+        key(&mut app, KeyCode::Esc);
+        assert_footer_matches_focus(&mut app, "tags root after prompts");
+
+        // Presets: colour, matrix and the embedded member panel.
+        app.apply(Action::SwitchTab(Tab::Presets));
+        app.enter_page();
+        assert_footer_matches_focus(&mut app, "presets root");
+        key(&mut app, KeyCode::Char('C'));
+        assert_footer_matches_focus(&mut app, "presets colour prompt");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('M'));
+        assert_footer_matches_focus(&mut app, "presets matrix");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Enter);
+        assert_footer_matches_focus(&mut app, "preset members");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "preset member filter");
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "preset member list");
+        key(&mut app, KeyCode::Enter);
+        assert_footer_matches_focus(&mut app, "preset member preview");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Esc);
+        assert_footer_matches_focus(&mut app, "presets root after members");
+
+        // Repositories: source filter and the shared skill panel.
+        app.apply(Action::SwitchTab(Tab::Repos));
+        app.enter_page();
+        assert_footer_matches_focus(&mut app, "repos root");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "repos filter");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Enter);
+        assert_footer_matches_focus(&mut app, "repo skills");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "repo skill filter");
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "repo skill list");
+        key(&mut app, KeyCode::Enter);
+        assert_footer_matches_focus(&mut app, "repo skill preview");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Esc);
+        assert_footer_matches_focus(&mut app, "repos root after skills");
+
+        // Agents: selector, scopes, quick groups, group filters, skill search,
+        // repair-specific rows and preview. The fixture contains linked,
+        // broken, shadow, foreign and agent-only entries.
+        app.apply(Action::SwitchTab(Tab::Agents));
+        app.enter_page();
+        assert_footer_matches_focus(&mut app, "agents selector");
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "agents scopes");
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "agents groups");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "agents skill filter");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Up);
+        assert_footer_matches_focus(&mut app, "agents group filters");
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "agents linked entry");
+        key(&mut app, KeyCode::Down);
+        assert_footer_matches_focus(&mut app, "agents broken entry");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.modal.is_none(),
+            "opening an entry should use the inline preview"
+        );
+        assert_footer_matches_focus(&mut app, "agents broken preview");
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('['));
+        assert_footer_matches_focus(&mut app, "agents after scope switch");
+
+        // Health: filtering, the first issue row, and returning to the tabs.
+        app.apply(Action::SwitchTab(Tab::Health));
+        app.enter_page();
+        assert_footer_matches_focus(&mut app, "health issue");
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_matches_focus(&mut app, "health filter");
+        key(&mut app, KeyCode::Esc);
+        assert_footer_matches_focus(&mut app, "health issue after filter");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, AppFocus::Tabs);
+        assert_footer_matches_focus(&mut app, "tab strip after health");
+    }
+
+    #[test]
+    fn footer_shortcuts_follow_mouse_focus_and_wheel_scrolling() {
+        let (root, mut app) = interactive_app();
+        add_footer_fixture_variants(&root, &mut app);
+        let width = 400;
+        let height = 40;
+
+        // Search input/list and the list scrollbar are separate mouse targets.
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        draw_app(&mut app, width, height);
+        let body = app.body;
+        left_click(&mut app, body.x + 2, body.y + 1);
+        assert!(app.search.input_focused());
+        assert_footer_matches_focus(&mut app, "mouse search input");
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x + 2,
+            row: body.y + 6,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(!app.search.input_focused());
+        assert_footer_matches_focus(&mut app, "mouse search list after input wheel");
+        left_click(&mut app, body.x + 2, body.y + 6);
+        assert!(!app.search.input_focused());
+        assert_footer_matches_focus(&mut app, "mouse search list");
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x + 2,
+            row: body.y + 6,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_footer_matches_focus(&mut app, "mouse search list after wheel");
+
+        // The split pages move focus to the right panel when its cards are
+        // clicked; the same click also keeps the panel's footer active.
+        for (tab, label) in [
+            (Tab::Tags, "tags"),
+            (Tab::Presets, "presets"),
+            (Tab::Repos, "repos"),
+        ] {
+            app.apply(Action::SwitchTab(tab));
+            app.enter_page();
+            draw_app(&mut app, width, height);
+            let body = app.body;
+            left_click(&mut app, body.x + 2, body.y + 1);
+            assert!(match tab {
+                Tab::Tags => app.tags.input_focused(),
+                Tab::Presets => app.presets.input_focused(),
+                Tab::Repos => app.repos.input_focused(),
+                _ => unreachable!(),
+            });
+            assert_footer_matches_focus(&mut app, &format!("mouse {label} filter"));
+            // A wheel event transfers focus just like a click. This catches
+            // stale parent focus when entering the embedded skill panel.
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: body.x + 220,
+                row: body.y + 10,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(!match tab {
+                Tab::Tags => app.tags.input_focused(),
+                Tab::Presets => app.presets.input_focused(),
+                Tab::Repos => app.repos.input_focused(),
+                _ => unreachable!(),
+            });
+            assert_footer_matches_focus(
+                &mut app,
+                &format!("mouse {label} skill wheel from filter"),
+            );
+            left_click(&mut app, body.x + 2, body.y + 6);
+            assert!(!match tab {
+                Tab::Tags => app.tags.input_focused(),
+                Tab::Presets => app.presets.input_focused(),
+                Tab::Repos => app.repos.input_focused(),
+                _ => unreachable!(),
+            });
+            left_click(&mut app, body.x + 220, body.y + 6);
+            assert_footer_matches_focus(&mut app, &format!("mouse {label} skill panel"));
+            left_click(&mut app, body.x + 2, body.y + 1);
+            app.handle(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: body.x + 2,
+                row: body.y + 6,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(!match tab {
+                Tab::Tags => app.tags.input_focused(),
+                Tab::Presets => app.presets.input_focused(),
+                Tab::Repos => app.repos.input_focused(),
+                _ => unreachable!(),
+            });
+            assert_footer_matches_focus(&mut app, &format!("mouse {label} skill wheel"));
+            if tab == Tab::Repos {
+                // Repositories have a scrollable details band above skills;
+                // it owns the source footer when selected by the mouse.
+                left_click(&mut app, body.x + 220, body.y + 2);
+                assert_footer_matches_focus(&mut app, "mouse repos details");
+            }
+        }
+
+        // Agents has stacked selector/scope/group/entry bands. Mouse clicks
+        // land on the same owner that keyboard navigation reaches.
+        app.apply(Action::SwitchTab(Tab::Agents));
+        app.enter_page();
+        draw_app(&mut app, width, height);
+        let body = app.body;
+        left_click(&mut app, body.x + 2, body.y + 1);
+        assert_footer_matches_focus(&mut app, "mouse agents selector");
+        left_click(&mut app, body.x + 2, body.y + 7);
+        assert_footer_matches_focus(&mut app, "mouse agents scope");
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        draw_app(&mut app, width, height);
+        let body = app.body;
+        left_click(&mut app, body.x + 220, body.bottom().saturating_sub(3));
+        assert_footer_matches_focus(&mut app, "mouse agents entries");
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x + 220,
+            row: body.bottom().saturating_sub(3),
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_footer_matches_focus(&mut app, "mouse agents entries wheel");
+
+        // Health's issue list and filter are independent focus owners.
+        app.apply(Action::SwitchTab(Tab::Health));
+        app.enter_page();
+        draw_app(&mut app, width, height);
+        let body = app.body;
+        left_click(&mut app, body.x + 2, body.y + 1);
+        assert!(app.health.input_focused());
+        assert_footer_matches_focus(&mut app, "mouse health filter");
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.right().saturating_sub(2),
+            row: body.y + 6,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(!app.health.input_focused());
+        assert_footer_matches_focus(&mut app, "mouse health detail wheel from filter");
+        left_click(&mut app, body.x + 2, body.y + 1);
+        assert!(app.health.input_focused());
+        for row in body.y..body.bottom() {
+            left_click(&mut app, body.x + 2, row);
+            if !app.health.input_focused() {
+                break;
+            }
+        }
+        assert!(!app.health.input_focused());
+        assert_footer_matches_focus(&mut app, "mouse health issues");
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: body.x + 2,
+            row: body.bottom().saturating_sub(1),
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_footer_matches_focus(&mut app, "mouse health issues wheel");
+    }
+
+    #[test]
+    fn footer_hides_tag_action_and_remains_safe_in_narrow_layouts() {
+        let (_root, mut app) = interactive_app();
+        // This is a session-only setting: the fixture config on disk remains
+        // unchanged while the footer exercises the reduced tab set.
+        app.settings.tags_enabled = false;
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        key(&mut app, KeyCode::Char('m'));
+        let footer = footer_line(&mut app, 40, 12);
+        assert!(!footer.contains("t tags"), "hidden tags action: {footer:?}");
+
+        for tab in [
+            Tab::Search,
+            Tab::Presets,
+            Tab::Agents,
+            Tab::Repos,
+            Tab::Health,
+        ] {
+            app.apply(Action::SwitchTab(tab));
+            app.enter_page();
+            let footer = footer_line(&mut app, 40, 12);
+            assert_eq!(footer.chars().count(), 40, "narrow footer {tab:?}");
+        }
+    }
+
+    #[test]
+    fn footer_switches_to_modal_and_quit_popup_controls_without_page_hints() {
+        let (_root, mut app) = interactive_app();
+
+        app.modal = Some(Modal::help());
+        assert_footer_exact(
+            &mut app,
+            "help modal",
+            &[("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("Esc", "close")],
+        );
+
+        app.modal = Some(Modal::message("status", vec!["line".into()]));
+        assert_footer_exact(
+            &mut app,
+            "message modal",
+            &[("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("Esc", "close")],
+        );
+
+        app.modal = Some(Modal::Message {
+            title: "status".into(),
+            lines: vec!["line".into()],
+            scroll: 0,
+            return_to: Some(Box::new(Modal::help())),
+        });
+        assert_footer_exact(
+            &mut app,
+            "message modal returning to selection",
+            &[
+                ("↑↓", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("Esc", "back to selection"),
+            ],
+        );
+
+        app.modal = Some(Modal::new_preset());
+        assert_footer_exact(
+            &mut app,
+            "input save modal",
+            &[("Enter", "save"), ("Esc", "cancel")],
+        );
+        app.modal = Some(Modal::install());
+        assert_footer_exact(
+            &mut app,
+            "input install modal",
+            &[("Enter", "install"), ("Esc", "cancel")],
+        );
+
+        let link = skills::ops::deploy::Action::Link {
+            agent: "sample-agent".into(),
+            skill: "sample".into(),
+            path: app.ws.root.join("agent/sample"),
+            target: app.ws.root.join("sample"),
+        };
+        app.modal = Some(Modal::confirm("confirm".into(), vec![link]));
+        assert_footer_exact(
+            &mut app,
+            "confirm apply focused",
+            &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")],
+        );
+        key(&mut app, KeyCode::Right);
+        assert_footer_exact(
+            &mut app,
+            "confirm cancel focused",
+            &[("Enter/Esc/n", "cancel"), ("y", "apply"), ("←→", "buttons")],
+        );
+
+        app.modal = Some(Modal::confirm_write(
+            "write".into(),
+            vec!["write".into()],
+            Box::new(|_| Ok("done".into())),
+        ));
+        assert_footer_exact(
+            &mut app,
+            "destructive write cancel focused",
+            &[("Enter/Esc/n", "cancel"), ("y", "apply"), ("←→", "buttons")],
+        );
+        key(&mut app, KeyCode::Left);
+        assert_footer_exact(
+            &mut app,
+            "destructive write apply focused",
+            &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")],
+        );
+
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::repositories(&ctx));
+        assert_footer_exact(
+            &mut app,
+            "repository picker input",
+            &[
+                ("type", "filter"),
+                ("↓", "list"),
+                ("Enter", "browse"),
+                ("Esc", "close"),
+            ],
+        );
+        key(&mut app, KeyCode::Down);
+        assert_footer_exact(
+            &mut app,
+            "repository picker list",
+            &[
+                ("Enter", "browse"),
+                ("u", "check repo"),
+                ("U", "update repo"),
+                ("↑↓", "move"),
+                ("/", "filter"),
+                ("Esc", "close"),
+            ],
+        );
+        key(&mut app, KeyCode::Char('/'));
+        assert_footer_exact(
+            &mut app,
+            "repository picker input after list",
+            &[
+                ("type", "filter"),
+                ("↓", "list"),
+                ("Enter", "browse"),
+                ("Esc", "close"),
+            ],
+        );
+
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::preset_members("Office", &ctx));
+        assert_footer_exact(
+            &mut app,
+            "preset skill picker input",
+            &[
+                ("Enter/↓", "results"),
+                ("Tab/Shift+Tab", "list / buttons"),
+                ("Esc", "cancel"),
+            ],
+        );
+        key(&mut app, KeyCode::Down);
+        assert_footer_exact(
+            &mut app,
+            "preset skill picker list",
+            &[
+                ("Enter/Space", "select"),
+                ("Ctrl+A", "select all results"),
+                ("/", "search"),
+                ("o", "preview"),
+                ("Tab/Shift+Tab", "list / buttons"),
+                ("Esc", "cancel"),
+            ],
+        );
+        key(&mut app, KeyCode::Tab);
+        assert_footer_exact(
+            &mut app,
+            "preset skill picker apply button",
+            &[
+                ("←→", "buttons"),
+                ("Tab/Shift+Tab", "next / previous"),
+                ("↑", "list"),
+                ("Enter/Space", "activate"),
+                ("Esc/q", "cancel"),
+            ],
+        );
+        key(&mut app, KeyCode::Tab);
+        assert_footer_exact(
+            &mut app,
+            "preset skill picker cancel button",
+            &[
+                ("←→", "buttons"),
+                ("Tab/Shift+Tab", "next / previous"),
+                ("↑", "list"),
+                ("Enter/Space", "activate"),
+                ("Esc/q", "cancel"),
+            ],
+        );
+        key(&mut app, KeyCode::Up);
+        assert_footer_exact(
+            &mut app,
+            "preset skill picker list after button",
+            &[
+                ("Enter/Space", "select"),
+                ("Ctrl+A", "select all results"),
+                ("/", "search"),
+                ("o", "preview"),
+                ("Tab/Shift+Tab", "list / buttons"),
+                ("Esc", "cancel"),
+            ],
+        );
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::batch_deploy(vec!["sample".into()], &ctx));
+        assert_footer_exact(
+            &mut app,
+            "deployment target modal",
+            &[
+                ("Tab/Shift+Tab", "list / buttons"),
+                ("Enter/Space", "select / activate"),
+                ("↑↓", "move"),
+                ("p", "project path"),
+                ("Esc", "cancel"),
+            ],
+        );
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::batch_tags(vec!["sample".into()], &ctx));
+        assert_footer_exact(
+            &mut app,
+            "batch tag modal",
+            &[
+                ("Enter", "add / create"),
+                ("↑↓", "choose"),
+                ("Tab", "complete"),
+                ("Backspace", "select last · again removes"),
+                ("Esc", "done"),
+            ],
+        );
+
+        app.batch_running = true;
+        app.batch_modal_owned = true;
+        assert_footer_exact(&mut app, "busy batch modal", &[("…", "saving changes")]);
+        app.batch_running = false;
+        app.batch_modal_owned = false;
+
+        let pending = skills::ops::name_choices::Pending {
+            changes: vec![],
+            groups: vec![skills::ops::name_choices::Group {
+                name: "sample".into(),
+                directory: app.ws.root.join("agent"),
+                candidates: vec![skills::ops::name_choices::Candidate {
+                    key: Some("sample".into()),
+                    path: app.ws.root.join("agent/sample"),
+                    archive_hash: None,
+                }],
+            }],
+        };
+        app.modal = Some(Modal::DeploymentChoices(Box::new(
+            crate::tui::name_choices::NameChoices::new(pending),
+        )));
+        assert_footer_exact(
+            &mut app,
+            "name conflict modal",
+            &[
+                ("↑↓", "option"),
+                ("Enter/Space", "choose"),
+                ("←→", "conflict"),
+                ("Tab/Shift+Tab", "list / buttons"),
+                ("Esc", "cancel"),
+            ],
+        );
+
+        app.modal = None;
+        app.quit_prompt = Some(QuitPrompt::default());
+        assert_footer_exact(
+            &mut app,
+            "quit confirmation popup",
+            &[("←→", "buttons"), ("Enter", "confirm"), ("Esc/q", "cancel")],
+        );
+        let footer = footer_line(&mut app, 400, 40);
+        assert!(
+            !footer.contains("F1 help"),
+            "quit popup must not expose help: {footer:?}"
+        );
+        assert!(
+            footer.contains("←→ buttons") && footer.contains("Enter confirm"),
+            "quit popup must expose only its controls: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn context_menu_owns_popup_footer_and_hides_global_page_shortcuts() {
+        let (_root, mut app) = interactive_app();
+        app.apply(Action::SwitchTab(Tab::Search));
+        app.enter_page();
+        open_first_menu(&mut app, 140, 35);
+        let global_footer = footer_line(&mut app, 140, 35);
+        assert_eq!(
+            global_footer.trim(),
+            "",
+            "context menu must clear the global page footer"
+        );
+        assert!(!global_footer.contains("F1") && !global_footer.contains("preview"));
+
+        draw_app(&mut app, 140, 35);
+        let request = app.context_menu.as_ref().unwrap().request.clone();
+        let Some(disabled) = request.items.iter().find(|item| item.disabled.is_some()) else {
+            panic!("fixture should expose a disabled context-menu action");
+        };
+        let disabled_rect = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .hit_rect_for(disabled.command)
+            .unwrap();
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: disabled_rect.x,
+            row: disabled_rect.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let disabled_footer = draw_app(&mut app, 140, 35);
+        assert!(
+            disabled_footer.contains(disabled.disabled.as_deref().unwrap()),
+            "disabled item must explain why it cannot run"
+        );
+        assert!(!disabled_footer.contains("↑↓ select"));
+
+        let Some(enabled) = request.items.iter().find(|item| item.disabled.is_none()) else {
+            panic!("fixture should expose an enabled context-menu action");
+        };
+        let enabled_rect = app
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .hit_rect_for(enabled.command)
+            .unwrap();
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: enabled_rect.x,
+            row: enabled_rect.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let enabled_footer = draw_app(&mut app, 140, 35);
+        assert!(enabled_footer.contains("Left click to run"));
+        assert!(!enabled_footer.contains("F1 help"));
+    }
+
+    #[test]
+    fn matrix_and_hidden_group_popups_replace_the_agents_footer() {
+        let (_root, mut app) = interactive_app();
+        app.apply(Action::SwitchTab(Tab::Agents));
+        app.enter_page();
+        key(&mut app, KeyCode::Char('M'));
+        assert_footer_exact(
+            &mut app,
+            "agents matrix popup",
+            &[
+                ("↑↓←→", "cell"),
+                ("Enter/Space", "toggle"),
+                ("A", "toggle row"),
+                ("Esc", "close"),
+            ],
+        );
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Right);
+        assert_footer_exact(
+            &mut app,
+            "agents matrix after moving cell",
+            &[
+                ("↑↓←→", "cell"),
+                ("Enter/Space", "toggle"),
+                ("A", "toggle row"),
+                ("Esc", "close"),
+            ],
+        );
+        key(&mut app, KeyCode::Esc);
+
+        // Add enough in-memory groups to force the compact group strip to use
+        // a hidden `+N tags` hit target. These tags live only in the temporary
+        // DownloadDir fixture and are never written to the user's config.
+        for i in 0..18 {
+            app.ws.config.tags.push(TagConfig {
+                name: format!("extra-{i}"),
+                skills: vec!["sample".into()],
+                color: None,
+                description: None,
+            });
+        }
+        app.snap = skills::reconcile::scan(&app.ws.root, &app.ws.config).unwrap();
+        app.on_snapshot();
+        app.enter_page();
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        let width: u16 = 60;
+        let height: u16 = 24;
+        let body = Rect::new(0, 1, width, height.saturating_sub(2));
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let Some((column, row)) = (body.y..body.bottom()).find_map(|y| {
+            let line: String = (body.x..body.right())
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect();
+            if !line.contains('+') || !line.contains("tags") {
+                return None;
+            }
+            (body.x..body.right()).find_map(|x| {
+                (terminal.backend().buffer()[(x, y)].symbol() == "+").then_some((x, y))
+            })
+        }) else {
+            panic!("narrow agent fixture should render a hidden group hit");
+        };
+        left_click(&mut app, column, row);
+        assert!(
+            app.agents.group_popup_open(),
+            "hidden group should open popup"
+        );
+        assert_footer_exact(
+            &mut app,
+            "hidden group popup",
+            &[
+                ("↑↓←→", "group"),
+                ("Enter", "install/uninstall / expand"),
+                ("Esc/q", "back"),
+            ],
+        );
+        key(&mut app, KeyCode::Down);
+        assert_footer_exact(
+            &mut app,
+            "hidden group popup after selection",
+            &[
+                ("↑↓←→", "group"),
+                ("Enter", "install/uninstall / expand"),
+                ("Esc/q", "back"),
+            ],
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.agents.group_popup_open());
+    }
+
+    #[test]
+    fn agents_and_health_repair_footers_follow_every_fixture_state() {
+        let (root, mut app) = interactive_app();
+        add_footer_fixture_variants(&root, &mut app);
+
+        app.apply(Action::SwitchTab(Tab::Agents));
+        app.enter_page();
+        key(&mut app, KeyCode::Down); // scopes
+        key(&mut app, KeyCode::Down); // groups
+        key(&mut app, KeyCode::Char('/')); // skill filter
+        key(&mut app, KeyCode::Esc); // entries
+        key(&mut app, KeyCode::Up); // group filters
+        key(&mut app, KeyCode::Down); // first entry
+
+        let mut linked = false;
+        let mut broken = false;
+        let mut relink = false;
+        let mut adopt = false;
+        let mut no_repair = false;
+        for _ in 0..48 {
+            assert_footer_matches_focus(&mut app, "agents repair-state row");
+            let hints = app.footer_hints();
+            linked |= hints
+                .iter()
+                .any(|(key, desc)| *key == "m" && *desc == "multi-uninstall");
+            broken |= hints
+                .iter()
+                .any(|(key, desc)| *key == "x" && *desc == "remove broken link");
+            relink |= hints
+                .iter()
+                .any(|(key, desc)| *key == "r" && *desc == "relink");
+            adopt |= hints
+                .iter()
+                .any(|(key, desc)| *key == "a" && *desc == "adopt");
+            no_repair |= hints
+                .iter()
+                .all(|(key, _)| !matches!(*key, "x" | "r" | "a"));
+            key(&mut app, KeyCode::Right);
+        }
+        assert!(linked, "deployed entry should expose multi-uninstall");
+        assert!(broken, "broken entry should expose remove broken link");
+        assert!(relink, "identical shadow should expose relink");
+        assert!(adopt, "agent-only entry should expose adopt");
+        assert!(
+            no_repair,
+            "different shadow must not expose a repair shortcut"
+        );
+
+        app.apply(Action::SwitchTab(Tab::Health));
+        app.enter_page();
+        let mut remove_link = false;
+        let mut adopt_copy = false;
+        let mut health_relink = false;
+        let mut health_adopt = false;
+        for _ in 0..64 {
+            assert_footer_matches_focus(&mut app, "health repair-state row");
+            let hints = app.footer_hints();
+            remove_link |= hints
+                .iter()
+                .any(|(key, desc)| *key == "x" && *desc == "remove link");
+            adopt_copy |= hints
+                .iter()
+                .any(|(key, desc)| *key == "a" && *desc == "adopt copy");
+            health_relink |= hints
+                .iter()
+                .any(|(key, desc)| *key == "r" && *desc == "relink");
+            health_adopt |= hints
+                .iter()
+                .any(|(key, desc)| *key == "a" && *desc == "adopt");
+            key(&mut app, KeyCode::Down);
+        }
+        assert!(
+            remove_link,
+            "broken or foreign health row should expose remove link"
+        );
+        assert!(adopt_copy, "foreign health row should expose adopt copy");
+        assert!(
+            health_relink,
+            "identical shadow health row should expose relink"
+        );
+        assert!(health_adopt, "agent-only health row should expose adopt");
     }
 
     #[test]
