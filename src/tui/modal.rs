@@ -1762,9 +1762,11 @@ const HELP: &str = "Startup
   Unique repository moves are repaired automatically. Missing records and tag/preset references
   are removed after a metadata backup; skill files and sync bindings are preserved.
 Global
-  F5                rescan
-  F6                preview health repairs
-  F7                sync destinations, bindings, push / pull
+  Ctrl-G            help (? outside text inputs)
+  Ctrl-O            settings
+  Ctrl-R            rescan
+  Ctrl-P            preview health repairs
+  Ctrl-B            sync destinations, bindings, push / pull
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-6               select a tab outside text inputs; focus stays on the tab strip
   Tab / Shift-Tab   select next / previous tab (close editing dialogs first)
@@ -1775,7 +1777,6 @@ Global
   /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit
 
 Library
-  F2                settings
   type              fuzzy search over name, tags, description, note
   tag:x preset:y    filters; also agent:codex  status:modified  source:repository  untagged
   Enter             accept a suggestion / open results / preview

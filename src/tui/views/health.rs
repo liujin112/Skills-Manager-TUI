@@ -531,7 +531,7 @@ impl HealthView {
                 meta_lines(&mut lines);
                 actions.push(action(
                     "x",
-                    "F6: restore or archive missing records in bulk; m: locate a moved skill"
+                    "Ctrl-P: restore or archive missing records in bulk; m: locate a moved skill"
                         .into(),
                 ));
                 match &r.source {
@@ -878,7 +878,7 @@ impl View for HealthView {
         let area = self.filter.draw(
             f,
             area,
-            "F5 rescan · F6 batch repair · Filter health entries",
+            "Ctrl-R rescan · Ctrl-P batch repair · Filter health entries",
             &format!(
                 "health · {} faults · {} review · {} independent",
                 self.issue_count(),
@@ -1064,14 +1064,14 @@ impl View for HealthView {
                 &[
                     ("x", "archive record"),
                     ("m", "locate move"),
-                    ("F6", "batch repair"),
+                    ("Ctrl-P", "batch repair"),
                     ("Esc", "clear/back"),
                 ]
             } else {
                 &[
                     ("x", "delete folder"),
                     ("Enter", "details"),
-                    ("F6", "batch repair"),
+                    ("Ctrl-P", "batch repair"),
                     ("Esc", "clear/back"),
                 ]
             };

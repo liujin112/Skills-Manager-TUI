@@ -304,7 +304,10 @@ impl SyncPicker {
             area.height.saturating_sub(2),
         );
         f.render_widget(OverlayClear, rect);
-        let block = ctx.settings.theme.block(" Sync destinations · F7 ", true);
+        let block = ctx
+            .settings
+            .theme
+            .block(" Sync destinations · Ctrl-B ", true);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         if let Some((fields, at)) = &mut self.adding {

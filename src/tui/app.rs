@@ -857,6 +857,31 @@ impl App {
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
         }
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                return vec![Action::Rescan, Action::Toast("rescanning".into())];
+            }
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                let enabled = !self.settings.tags_enabled;
+                return vec![Action::OpenModal(Box::new(Modal::confirm_write(
+                    "Settings · Tags".into(),
+                    vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
+                    Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
+                )))];
+            }
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                return vec![Action::OpenModal(Box::new(Modal::HealthRepair(
+                    Box::default(),
+                )))];
+            }
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                return vec![Action::OpenModal(Box::new(super::sync_picker::open(&ctx)))];
+            }
+            (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+                return vec![Action::OpenModal(Box::new(Modal::help()))];
+            }
+            _ => {}
+        }
         if self.focus == AppFocus::Tabs {
             let tabs = Tab::visible(self.settings.tags_enabled);
             let index = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
@@ -890,7 +915,7 @@ impl App {
                         .map(|t| vec![Action::SwitchTab(*t)])
                         .unwrap_or_default();
                 }
-                KeyCode::F(1) | KeyCode::Char('?') => {
+                KeyCode::Char('?') => {
                     return vec![Action::OpenModal(Box::new(Modal::help()))];
                 }
                 _ => return vec![],
@@ -941,30 +966,9 @@ impl App {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return vec![Action::Quit],
             (KeyCode::Char('z'), KeyModifiers::CONTROL) => return self.step(Step::Undo),
             (KeyCode::Char('y'), KeyModifiers::CONTROL) => return self.step(Step::Redo),
-            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                return vec![Action::Rescan, Action::Toast("rescanning".into())];
-            }
             (KeyCode::Char('R'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))];
             }
-            (KeyCode::F(2), _) => {
-                let enabled = !self.settings.tags_enabled;
-                return vec![Action::OpenModal(Box::new(Modal::confirm_write(
-                    "Settings · Tags".into(),
-                    vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
-                    Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
-                )))];
-            }
-            (KeyCode::F(5), _) => return vec![Action::Rescan, Action::Toast("rescanning".into())],
-            (KeyCode::F(6), _) => {
-                return vec![Action::OpenModal(Box::new(Modal::HealthRepair(
-                    Box::default(),
-                )))];
-            }
-            (KeyCode::F(7), _) => {
-                return vec![Action::OpenModal(Box::new(super::sync_picker::open(&ctx)))];
-            }
-            (KeyCode::F(1), _) => return vec![Action::OpenModal(Box::new(Modal::help()))],
             (KeyCode::Char('?'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
@@ -1703,14 +1707,14 @@ impl App {
         let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
         let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3)
             + if self.modal.is_none() && self.quit_prompt.is_none() {
-                9
+                13
             } else {
                 0
             };
         for (key, desc) in hints {
             if (!self.settings.tags_enabled && *key == "t")
                 || key.contains("Esc")
-                || (*key == "F1" && self.modal.is_none() && self.quit_prompt.is_none())
+                || (*key == "Ctrl-G" && self.modal.is_none() && self.quit_prompt.is_none())
             {
                 continue;
             }
@@ -1736,10 +1740,10 @@ impl App {
                 hint_w += piece_w;
             }
         }
-        if self.modal.is_none() && self.quit_prompt.is_none() && hint_w + 9 <= budget {
-            spans.push(Span::styled("F1", th.key_hint()));
+        if self.modal.is_none() && self.quit_prompt.is_none() && hint_w + 13 <= budget {
+            spans.push(Span::styled("Ctrl-G", th.key_hint()));
             spans.push(Span::styled(" help  ", Style::default().fg(th.placeholder)));
-            hint_w += 9;
+            hint_w += 13;
         }
         let pad = budget.saturating_sub(hint_w);
         let mut line = vec![
@@ -2606,7 +2610,10 @@ mod scope_tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
-        app.handle(Msg::Key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )));
         assert_eq!(app.ws.root, root);
         assert!(!app.history.is_empty());
         assert!(!base.join("project/.agents").exists());
@@ -2717,6 +2724,46 @@ mod panel_navigation_tests {
 #[cfg(test)]
 mod escape_hierarchy_tests {
     use super::*;
+
+    #[test]
+    fn control_shortcuts_work_in_tabs_and_text_input_without_function_keys() {
+        let (_root, mut app) = app();
+        for focus in [AppFocus::Tabs, AppFocus::Page] {
+            app.focus = focus;
+            let query = app.search.query().to_owned();
+            for key in ['g', 'o', 'p', 'b'] {
+                let actions = app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL));
+                assert!(
+                    matches!(actions.as_slice(), [Action::OpenModal(_)]),
+                    "{key}"
+                );
+                if key == 'p' {
+                    assert!(
+                        matches!(&actions[0], Action::OpenModal(modal) if matches!(modal.as_ref(), Modal::HealthRepair(_)))
+                    );
+                }
+            }
+            assert!(matches!(
+                app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+                    .as_slice(),
+                [Action::Rescan, Action::Toast(_)]
+            ));
+            for number in 1..=12 {
+                assert!(
+                    app.on_key(KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE))
+                        .is_empty()
+                );
+            }
+            assert_eq!(app.search.query(), query);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.search.query(), "g");
+        app.modal = Some(Modal::help());
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                .is_empty()
+        );
+    }
 
     #[test]
     fn mouse_tab_selection_keeps_the_page_active() {
@@ -3152,7 +3199,7 @@ mod context_menu_tests {
         for (key, desc) in hints {
             if (!app.settings.tags_enabled && *key == "t")
                 || key.contains("Esc")
-                || (*key == "F1" && app.modal.is_none() && app.quit_prompt.is_none())
+                || (*key == "Ctrl-G" && app.modal.is_none() && app.quit_prompt.is_none())
             {
                 continue;
             }
@@ -3162,7 +3209,7 @@ mod context_menu_tests {
             expected.push(((*key).to_owned(), (*desc).to_owned()));
         }
         if app.modal.is_none() && app.quit_prompt.is_none() {
-            expected.push(("F1".into(), "help".into()));
+            expected.push(("Ctrl-G".into(), "help".into()));
         }
         expected
     }
@@ -3313,7 +3360,7 @@ mod context_menu_tests {
                 ("↓", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/results"),
-                ("F1", "help"),
+                ("Ctrl-G", "help"),
             ],
         );
         key(&mut app, KeyCode::Esc);
@@ -3903,7 +3950,7 @@ mod context_menu_tests {
         );
         let footer = footer_line(&mut app, 400, 40);
         assert!(
-            !footer.contains("F1 help"),
+            !footer.contains("Ctrl-G help"),
             "quit popup must not expose help: {footer:?}"
         );
         assert!(
@@ -3924,7 +3971,7 @@ mod context_menu_tests {
             "",
             "context menu must clear the global page footer"
         );
-        assert!(!global_footer.contains("F1") && !global_footer.contains("preview"));
+        assert!(!global_footer.contains("Ctrl-G") && !global_footer.contains("preview"));
 
         draw_app(&mut app, 140, 35);
         let request = app.context_menu.as_ref().unwrap().request.clone();
@@ -3967,7 +4014,7 @@ mod context_menu_tests {
         }));
         let enabled_footer = draw_app(&mut app, 140, 35);
         assert!(enabled_footer.contains("Left click to run"));
-        assert!(!enabled_footer.contains("F1 help"));
+        assert!(!enabled_footer.contains("Ctrl-G help"));
     }
 
     #[test]
