@@ -124,7 +124,10 @@ pub enum Command {
     Deploy(DeployArgs),
     /// Remove links from agent directories
     Undeploy(DeployArgs),
-    /// Sync skill backups with Git remotes
+    /// Synchronize the entire root with its Git remote
+    #[command(
+        long_about = "Synchronize the root as a Git working tree. Configure URL [--branch main] explicitly enables automatic backup at TUI startup and around modifying CLI commands, and after TUI changes. Read-only CLI commands and previews do not sync. Skills, metadata, notes, presets and configuration are shared, including machine-specific paths; deletions propagate. Runtime files stay local and normal Git ignore rules apply. Sync saves local changes, merges remote updates, then pushes without force. Conflicts stop synchronization and retain the local backup commit. Use an empty remote or clone an existing root repository first. Legacy per-skill backup repositories are not automatically converted."
+    )]
     Sync {
         #[arg(long, global = true)]
         dry_run: bool,
@@ -139,44 +142,22 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum SyncCommand {
-    /// Register a sync destination for this root (no upload)
-    Add {
-        name: String,
+    /// Make root a Git working tree and enable automatic commit/pull/push
+    Configure {
         url: String,
         #[arg(long, default_value = "main")]
         branch: String,
     },
-    /// Remove an unused destination (does not delete remote content)
-    Remove { name: String },
-    /// Show destinations and per-skill bindings
+    /// Disable automatic sync without deleting Git history
+    Disable,
+    /// Show root sync configuration
     Status,
-    /// Bind or switch skills; install sources remain unchanged
-    Bind {
-        skills: Vec<String>,
-        #[arg(long)]
-        repo: String,
-        /// Bind all currently installed skills of this source kind
-        #[arg(long, value_parser = ["git", "archive", "local"], conflicts_with = "skills")]
-        source: Option<String>,
-    },
-    /// Stop future sync; existing remote copies and history remain
-    Unbind {
-        #[arg(required = true)]
-        skills: Vec<String>,
-    },
-    /// Upload bound skills (or all bound skills when none are specified)
-    Push(SyncTransfer),
-    /// Download new/changed skills, preserving conflicting local changes
-    Pull(SyncTransfer),
-}
-#[derive(Args, Debug)]
-pub struct SyncTransfer {
-    pub skills: Vec<String>,
-    #[arg(long, required_unless_present = "all", conflicts_with = "all")]
-    pub repo: Option<String>,
-    /// Sync every configured destination
-    #[arg(long, conflicts_with = "skills")]
-    pub all: bool,
+    /// Save local changes and push without pulling
+    Push,
+    /// Save local changes and merge remote updates without pushing
+    Pull,
+    /// Save local changes, merge remote updates and push
+    Run,
 }
 
 #[derive(Args, Debug)]
@@ -507,6 +488,73 @@ impl Cli {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    let auto = match &cli.command {
+        Some(
+            Command::Init
+            | Command::Accept { .. }
+            | Command::Migrate { .. }
+            | Command::Adopt { .. }
+            | Command::Rename { .. }
+            | Command::SetSource(_),
+        ) => true,
+        Some(Command::Tag(a)) => !matches!(a.command, TagCommand::List { .. }),
+        Some(Command::Note(a)) => !matches!(a.command, NoteCommand::Get { .. }),
+        Some(Command::Remove { yes, .. }) => *yes,
+        Some(Command::Install(a)) => !a.list,
+        Some(Command::Update(a)) => !a.dry_run,
+        Some(Command::Deploy(a) | Command::Undeploy(a)) => !a.dry_run,
+        Some(Command::Repair { apply, .. }) => *apply,
+        Some(Command::Repos { command: Some(_) }) => true,
+        Some(Command::Preset(a)) => match &a.command {
+            PresetCommand::List | PresetCommand::Show { .. } => false,
+            PresetCommand::Deploy { dry_run, .. } | PresetCommand::Undeploy { dry_run, .. } => {
+                !dry_run
+            }
+            _ => true,
+        },
+        Some(Command::Agents(a)) => match &a.command {
+            Some(AgentsCommand::Add { .. }) => true,
+            Some(
+                AgentsCommand::Convert { dry_run, yes, .. }
+                | AgentsCommand::Clean { dry_run, yes, .. }
+                | AgentsCommand::RemoveLink { dry_run, yes, .. }
+                | AgentsCommand::AdoptLink { dry_run, yes, .. }
+                | AgentsCommand::Relink { dry_run, yes, .. },
+            ) => !dry_run && *yes,
+            _ => false,
+        },
+        _ => false,
+    };
+    let create = matches!(
+        &cli.command,
+        Some(
+            Command::Init
+                | Command::Install(_)
+                | Command::Agents(AgentsArgs {
+                    command: Some(AgentsCommand::Add { .. })
+                })
+        )
+    );
+    let ws = if auto {
+        Some(cli.workspace(create)?)
+    } else {
+        None
+    };
+    if let Some(ws) = &ws
+        && let Err(e) = skills::ops::sync::automatic(ws)
+    {
+        eprintln!("Root sync: {e:#}; continuing with local data");
+    }
+    let result = run_command(cli);
+    if let Some(ws) = &ws
+        && let Err(e) = skills::ops::sync::automatic(ws)
+    {
+        eprintln!("Root backup pending: {e:#}; local changes retained");
+    }
+    result
+}
+
+fn run_command(cli: Cli) -> Result<()> {
     if matches!(
         &cli.command,
         Some(Command::Agents(AgentsArgs {
@@ -714,9 +762,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Deploy(a) => cmd_deploy(&ctx, a, true),
         Command::Undeploy(a) => cmd_deploy(&ctx, a, false),
         Command::Sync { dry_run, command } => {
-            let command = command.context(
-                "choose a sync subcommand; use deploy/undeploy or a preset for agent links",
-            )?;
+            let command = command.unwrap_or(SyncCommand::Run);
             cmd_sync(&ctx, command, dry_run)
         }
         Command::Agents(a) => cmd_agents(&ctx, a.command),
@@ -725,137 +771,41 @@ pub fn run(cli: Cli) -> Result<()> {
 }
 
 fn cmd_sync(ctx: &Ctx, command: SyncCommand, dry_run: bool) -> Result<()> {
-    use skills::ops::sync::{self, Settings};
-    let mut settings = Settings::load(&ctx.ws)?;
+    use skills::ops::sync::{self, Mode, Settings};
     anyhow::ensure!(
         !dry_run
-            || matches!(
-                &command,
-                SyncCommand::Push(_) | SyncCommand::Pull(_) | SyncCommand::Status
+            || !matches!(
+                command,
+                SyncCommand::Configure { .. } | SyncCommand::Disable
             ),
-        "--dry-run is supported for sync push/pull/status"
+        "configuration commands do not support --dry-run"
     );
     match command {
-        SyncCommand::Status => ctx.out(&settings, || {
-            for (name, remote) in &settings.remotes {
-                println!("{name}  {}  {}", remote.url, remote.branch);
-            }
-            for (key, binding) in &settings.bindings {
-                println!("{key} -> {}", binding.remote);
-            }
-            println!("Unbound skills stay local. Bindings do not change install sources.");
-        }),
-        SyncCommand::Add { name, url, branch } => {
-            if !dry_run {
-                settings.add(&ctx.ws, &name, &url, &branch)?;
-            }
-            ctx.out(
-                &serde_json::json!({"remote": name, "dry_run": dry_run}),
-                || {
-                    println!(
-                        "{} remote {name}",
-                        if dry_run {
-                            "Would register"
-                        } else {
-                            "Registered"
-                        }
-                    )
-                },
-            )
+        SyncCommand::Configure { url, branch } => {
+            sync::configure(&ctx.ws, &url, &branch)?;
+            let report = sync::run(&ctx.ws, Mode::Sync, false, &mut |s| eprintln!("{s}"))?;
+            ctx.out(&report, || println!("Root auto-sync enabled: {report:?}"))
         }
-        SyncCommand::Remove { name } => {
-            if !dry_run {
-                settings.remove(&ctx.ws, &name)?;
-            }
-            ctx.out(
-                &serde_json::json!({"remote": name, "dry_run": dry_run}),
-                || {
-                    println!(
-                        "{} remote {name}",
-                        if dry_run { "Would remove" } else { "Removed" }
-                    )
-                },
-            )
-        }
-        SyncCommand::Bind {
-            skills,
-            repo,
-            source,
-        } => {
-            let keys = if let Some(source) = source {
-                ctx.ws
-                    .scan()?
-                    .skills
-                    .into_iter()
-                    .filter(|r| r.source.as_ref().map(|s| s.kind()).unwrap_or("local") == source)
-                    .map(|r| r.key)
-                    .collect()
-            } else {
-                skills
-            };
-            anyhow::ensure!(
-                !keys.is_empty(),
-                "select skills or --source git|archive|local"
-            );
-            if !dry_run {
-                settings.bind(&ctx.ws, &keys, Some(&repo))?;
-            }
-            ctx.out(&serde_json::json!({"skills": keys, "repo": repo, "dry_run": dry_run}), || {
-                println!("{} {} skills to {repo}", if dry_run { "Would bind" } else { "Bound" }, keys.len());
-                println!("Previous remote copies and Git history remain. Nothing is uploaded until sync push.");
+        SyncCommand::Disable => {
+            sync::disable(&ctx.ws)?;
+            ctx.out(&serde_json::json!({"enabled": false}), || {
+                println!("Automatic root sync disabled")
             })
         }
-        SyncCommand::Unbind { skills } => {
-            if !dry_run {
-                settings.bind(&ctx.ws, &skills, None)?;
-            }
-            ctx.out(
-                &serde_json::json!({"skills": skills, "dry_run": dry_run}),
-                || {
-                    println!(
-                        "{} bindings; remote copies and Git history remain",
-                        if dry_run { "Would remove" } else { "Removed" }
-                    )
-                },
-            )
+        SyncCommand::Status => {
+            let settings = Settings::load(&ctx.ws)?;
+            ctx.out(&settings, || {
+                println!("{}", serde_json::to_string_pretty(&settings).unwrap())
+            })
         }
-        command @ (SyncCommand::Push(_) | SyncCommand::Pull(_)) => {
-            let push = matches!(command, SyncCommand::Push(_));
-            let (SyncCommand::Push(args) | SyncCommand::Pull(args)) = command else {
-                unreachable!()
+        command => {
+            let mode = match command {
+                SyncCommand::Push => Mode::Push,
+                SyncCommand::Pull => Mode::Pull,
+                _ => Mode::Sync,
             };
-            let remotes = if args.all {
-                settings.remotes.keys().cloned().collect::<Vec<_>>()
-            } else {
-                vec![args.repo.context("pass --repo or --all")?]
-            };
-            anyhow::ensure!(
-                !remotes.is_empty(),
-                "no sync remotes configured; use skills sync add"
-            );
-            let mut report = Vec::new();
-            let mut failed = 0;
-            for name in remotes {
-                eprintln!("Syncing {name} …");
-                match sync::run(&ctx.ws, &name, push, &args.skills, dry_run, &mut |s| {
-                    eprintln!("  {s}")
-                }) {
-                    Ok(changes) => report.push(
-                        serde_json::json!({"remote": name, "changes": changes, "dry_run": dry_run}),
-                    ),
-                    Err(e) => {
-                        failed += 1;
-                        report.push(serde_json::json!({"remote": name, "error": format!("{e:#}")}));
-                    }
-                }
-            }
-            ctx.out(&report, || {
-                for item in &report {
-                    println!("{}", serde_json::to_string_pretty(item).unwrap());
-                }
-            })?;
-            anyhow::ensure!(failed == 0, "{failed} sync remote(s) failed");
-            Ok(())
+            let report = sync::run(&ctx.ws, mode, dry_run, &mut |s| eprintln!("{s}"))?;
+            ctx.out(&report, || println!("{report:?}"))
         }
     }
 }

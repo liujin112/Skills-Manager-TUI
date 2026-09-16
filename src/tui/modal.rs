@@ -1760,13 +1760,13 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
 
 const HELP: &str = "Startup
   Unique repository moves are repaired automatically. Missing records and tag/preset references
-  are removed after a metadata backup; skill files and sync bindings are preserved.
+  are removed after a metadata backup; skill files are preserved.
 Global
   Ctrl-G            help (? outside text inputs)
   Ctrl-O            settings
   Ctrl-R            rescan
   Ctrl-P            preview health repairs
-  Ctrl-B            sync destinations, bindings, push / pull
+  Ctrl-B            root Git sync: configure, sync, push / pull
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-6               select a tab outside text inputs; focus stays on the tab strip
   Tab / Shift-Tab   select next / previous tab (close editing dialogs first)

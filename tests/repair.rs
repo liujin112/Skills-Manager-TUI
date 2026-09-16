@@ -228,7 +228,7 @@ fn deployment_registry_is_not_a_missing_skill_and_repairs_preserve_it() {
 }
 
 #[test]
-fn sync_bound_move_is_reported_without_stranding_its_binding() {
+fn legacy_sync_bindings_do_not_block_root_wide_move_repair() {
     let f = Fixture::new();
     f.moved("repos/demo/bound", "repos/demo/moved");
     let path = f.ws.meta.dir.join(".sync/settings.json");
@@ -237,15 +237,9 @@ fn sync_bound_move_is_reported_without_stranding_its_binding() {
         r#"{"remotes":{},"bindings":{"repos/demo/bound":{"remote":"backup","baseline":null}}}"#;
     fs::write(&path, settings).unwrap();
     let report = repair::run(&f.ws, true).unwrap();
-    assert_eq!(report.repaired, 0);
-    assert!(
-        report
-            .items
-            .iter()
-            .any(|i| i.skill == "repos/demo/bound" && i.detail.contains("sync binding"))
-    );
-    assert!(f.ws.meta.exists("repos/demo/bound"));
-    assert!(!f.ws.meta.exists("repos/demo/moved"));
+    assert_eq!(report.repaired, 1);
+    assert!(!f.ws.meta.exists("repos/demo/bound"));
+    assert!(f.ws.meta.exists("repos/demo/moved"));
     assert_eq!(fs::read_to_string(path).unwrap(), settings);
 }
 

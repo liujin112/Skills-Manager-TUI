@@ -45,7 +45,7 @@ pub enum TaskOutput {
     RepairApplied(Result<skills::ops::repair::Report>),
     Sync(
         super::sync_picker::Request,
-        Result<Vec<skills::ops::sync::Change>>,
+        Result<skills::ops::sync::Report>,
     ),
     Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
@@ -170,14 +170,8 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::RepairApplied(skills::ops::repair::apply(&ws, &plan))
                 }
                 Task::Sync(request) => {
-                    let result = skills::ops::sync::run(
-                        &ws,
-                        &request.remote,
-                        request.push,
-                        &request.keys,
-                        request.dry_run,
-                        &mut progress,
-                    );
+                    let result =
+                        skills::ops::sync::run(&ws, request.mode, request.dry_run, &mut progress);
                     TaskOutput::Sync(request, result)
                 }
                 Task::DiscoverRepository(reference) => {

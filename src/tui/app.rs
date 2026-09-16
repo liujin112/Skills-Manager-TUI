@@ -198,6 +198,8 @@ pub struct App {
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
+    root_sync_pending: bool,
+    root_sync_running: bool,
     next_task_id: u64,
     spinner: usize,
     last_root_poll: std::time::Instant,
@@ -348,6 +350,8 @@ impl App {
             batch_modal_owned: false,
             history: History::default(),
             tasks_running: 0,
+            root_sync_pending: true,
+            root_sync_running: false,
             next_task_id: 0,
             spinner: 0,
             last_root_poll: std::time::Instant::now(),
@@ -530,6 +534,31 @@ impl App {
             };
             self.apply(action);
         }
+        if !self.quit {
+            self.sync_if_ready();
+        }
+    }
+
+    pub fn sync_if_ready(&mut self) {
+        if self.root_sync_pending
+            && self.tasks_running == 0
+            && !self.batch_running
+            && !self.task_ui_blocked()
+            && self.context_menu.is_none()
+            && self.external.is_none()
+        {
+            self.root_sync_pending = false;
+            match skills::ops::sync::Settings::load(&self.ws) {
+                Ok(settings) if settings.enabled => {
+                    self.spawn(Task::Sync(super::sync_picker::Request {
+                        mode: skills::ops::sync::Mode::Sync,
+                        dry_run: false,
+                    }))
+                }
+                Err(e) => self.toast(format!("Root sync: {e:#}"), Level::Error),
+                _ => {}
+            }
+        }
     }
 
     fn task_ui_blocked(&self) -> bool {
@@ -564,28 +593,41 @@ impl App {
                     ],
                 }
             }
-            TaskOutput::Sync(request, result) => match result {
-                Err(e) => vec![Action::Error(format!("Sync {}: {e:#}", request.remote))],
-                Ok(changes) if request.dry_run => {
-                    let ctx = Ctx {
-                        ws: &self.ws,
-                        snap: &self.snap,
-                        settings: &self.settings,
-                    };
-                    match super::sync_picker::SyncPicker::preview(&ctx, request, changes) {
-                        Ok(p) => vec![Action::OpenModal(Box::new(Modal::Sync(Box::new(p))))],
-                        Err(e) => vec![Action::Error(format!("{e:#}"))],
+            TaskOutput::Sync(request, result) => {
+                self.root_sync_running = false;
+                self.batch_running = false;
+                match result {
+                    Ok(report) if request.dry_run => {
+                        let ctx = Ctx {
+                            ws: &self.ws,
+                            snap: &self.snap,
+                            settings: &self.settings,
+                        };
+                        match super::sync_picker::SyncPicker::preview(&ctx, request, report) {
+                            Ok(p) => vec![Action::OpenModal(Box::new(Modal::Sync(Box::new(p))))],
+                            Err(e) => vec![Action::Error(format!("{e:#}"))],
+                        }
+                    }
+                    result => {
+                        self.rescan();
+                        self.root_sync_pending = false;
+                        match result {
+                            Ok(report) => {
+                                if report.pulled {
+                                    self.history = History::default();
+                                }
+                                vec![Action::Toast(format!(
+                                    "Root synced: backup {}, pull {}, push {}",
+                                    report.committed, report.pulled, report.pushed
+                                ))]
+                            }
+                            Err(e) => vec![Action::Error(format!(
+                                "Root sync pending: {e:#}; local changes retained"
+                            ))],
+                        }
                     }
                 }
-                Ok(changes) => vec![
-                    Action::Toast(format!(
-                        "Synced {} skills with {}",
-                        changes.len(),
-                        request.remote
-                    )),
-                    Action::Rescan,
-                ],
-            },
+            }
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
                 let return_to = if self.batch_modal_owned
@@ -791,6 +833,9 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
+        if self.root_sync_running {
+            return vec![];
+        }
         if self.context_menu.is_some() {
             return vec![];
         }
@@ -839,6 +884,9 @@ impl App {
         }
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
+        }
+        if self.root_sync_running {
+            return vec![];
         }
         if let Some(menu) = self.context_menu.as_mut() {
             let event = menu.key(k);
@@ -1020,6 +1068,9 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
+        if self.root_sync_running {
+            return vec![];
+        }
         if let Some(prompt) = self.quit_prompt.as_ref() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 let point = (m.column, m.row).into();
@@ -1138,6 +1189,7 @@ impl App {
                 self.search.restrict_agent(agent);
             }
             Action::Quit => {
+                self.sync_if_ready();
                 if self.tasks_running == 0 {
                     self.quit = true;
                 } else {
@@ -1482,6 +1534,18 @@ impl App {
     }
 
     fn spawn(&mut self, task: Task) {
+        if matches!(task, Task::Sync(_)) {
+            if self.tasks_running > 0 {
+                self.toast(
+                    "Wait for the current operation before syncing the root",
+                    Level::Info,
+                );
+                return;
+            }
+            self.root_sync_pending = false;
+            self.root_sync_running = true;
+            self.batch_running = true;
+        }
         if matches!(task, Task::RepairApply(_)) {
             self.batch_running = true;
         }
@@ -1500,8 +1564,8 @@ impl App {
             Task::Install { reference, .. } => Some(format!("Install {reference}")),
             Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
             Task::Sync(r) => Some(format!(
-                "Sync {}{}",
-                r.remote,
+                "Root sync {:?}{}",
+                r.mode,
                 if r.dry_run { " (preview)" } else { "" }
             )),
             Task::Prepare(key) => Some(format!("Prepare update: {key}")),
@@ -1513,6 +1577,7 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
+        self.root_sync_pending = true;
         // Refresh one configuration snapshot for every view. Invalid edits keep
         // the last valid settings and report the error without disrupting input.
         match self.ws.load_config() {
@@ -4409,5 +4474,75 @@ mod startup_repair_tests {
         assert!(!app.ws.meta.exists("gone"));
         assert!(app.snap.get("gone").is_none());
         assert!(app.ws.meta.dir.join(".repair-backups").is_dir());
+    }
+}
+
+#[cfg(test)]
+mod root_sync_tests {
+    use super::*;
+    #[test]
+    fn metadata_write_schedules_one_root_backup_and_blocks_overlapping_writes() {
+        let temp = skills::ops::DownloadDir::new("tui-root-sync").unwrap();
+        let root = temp.path().join("root");
+        let remote = temp.path().join("remote.git");
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        skills::ops::git(
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        skills::ops::sync::configure(&ws, remote.to_str().unwrap(), "main").unwrap();
+        skills::ops::sync::automatic(&ws).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
+        app.root_sync_running = true;
+        app.batch_running = true;
+        app.apply(Action::Write(Box::new(|_| {
+            panic!("must not write during checkout")
+        })));
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+                .is_empty()
+        );
+        app.root_sync_running = false;
+        app.batch_running = false;
+        app.apply(Action::Write(Box::new(|ws| {
+            std::fs::write(ws.root.join("saved.txt"), "automatically backed up")?;
+            Ok("saved".into())
+        })));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.tasks_running > 0 || app.root_sync_pending {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto-sync did not settle"
+            );
+            app.sync_if_ready();
+            if app.tasks_running > 0 {
+                app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            }
+        }
+        assert_eq!(
+            skills::ops::git(&["show", "HEAD:saved.txt"], Some(&remote)).unwrap(),
+            "automatically backed up"
+        );
+        let before = skills::ops::git(&["rev-parse", "HEAD"], Some(&root)).unwrap();
+        app.sync_if_ready();
+        assert_eq!(app.tasks_running, 0);
+        assert_eq!(
+            before,
+            skills::ops::git(&["rev-parse", "HEAD"], Some(&root)).unwrap()
+        );
     }
 }

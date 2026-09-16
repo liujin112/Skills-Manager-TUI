@@ -1,159 +1,110 @@
-//! Root sync destinations and explicit skill bindings.
+//! Configure and run root-wide Git synchronization.
 use super::{
     app::{Action, Ctx, Hints},
     event::Task,
     modal::Modal,
     widgets::{Input, OverlayClear},
 };
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::Rect,
-    text::Line,
-    widgets::{List, ListItem, ListState, Paragraph},
+    widgets::{Paragraph, Wrap},
 };
-use skills::ops::sync::{Change, Settings};
-use std::collections::BTreeSet;
+use skills::ops::sync::{self, Mode, Report, Settings};
 
 #[derive(Debug, Clone)]
 pub struct Request {
-    pub remote: String,
-    pub push: bool,
-    pub keys: Vec<String>,
+    pub mode: Mode,
     pub dry_run: bool,
 }
 pub struct SyncPicker {
     settings: Settings,
-    remote: usize,
-    filter: Input,
-    editing: bool,
-    adding: Option<([Input; 3], usize)>,
-    keys: Vec<String>,
-    selected: BTreeSet<String>,
-    cursor: usize,
-    list_area: Rect,
-    offset: usize,
-    preview: Option<(Request, Vec<Change>)>,
+    scroll: u16,
+    adding: Option<([Input; 2], usize)>,
+    preview: Option<(Request, Report)>,
 }
 impl SyncPicker {
     pub fn new(ctx: &Ctx) -> anyhow::Result<Self> {
         Ok(Self {
             settings: Settings::load(ctx.ws)?,
-            remote: 0,
-            filter: Input::default(),
-            editing: false,
+            scroll: 0,
             adding: None,
-            keys: ctx.snap.skills.iter().map(|s| s.key.clone()).collect(),
-            selected: BTreeSet::new(),
-            cursor: 0,
-            list_area: Rect::default(),
-            offset: 0,
             preview: None,
         })
     }
-    pub fn preview(ctx: &Ctx, mut request: Request, changes: Vec<Change>) -> anyhow::Result<Self> {
-        let mut picker = Self::new(ctx)?;
-        request.keys = changes.iter().map(|c| c.skill.clone()).collect();
-        picker.preview = Some((request, changes));
-        Ok(picker)
-    }
-    fn remote(&self) -> Option<String> {
-        self.settings.remotes.keys().nth(self.remote).cloned()
-    }
-    fn visible(&self) -> Vec<String> {
-        self.keys
-            .iter()
-            .filter(|k| {
-                k.to_lowercase()
-                    .contains(&self.filter.value().to_lowercase())
-            })
-            .cloned()
-            .collect()
-    }
-    fn targets(&self) -> Vec<String> {
-        let visible = self.visible();
-        if self.selected.is_empty() {
-            visible.get(self.cursor).cloned().into_iter().collect()
-        } else {
-            visible
-                .into_iter()
-                .filter(|k| self.selected.contains(k))
-                .collect()
-        }
+    pub fn preview(ctx: &Ctx, request: Request, report: Report) -> anyhow::Result<Self> {
+        Ok(Self {
+            preview: Some((request, report)),
+            ..Self::new(ctx)?
+        })
     }
     pub fn hints(&self) -> Hints {
-        if self.preview.is_some() {
-            return &[("y", "apply sync"), ("Esc", "cancel")];
-        }
         if self.adding.is_some() {
-            return &[
+            &[
                 ("Tab", "next field"),
-                ("Enter", "register"),
+                ("Enter", "enable"),
                 ("Esc", "cancel"),
-            ];
+            ]
+        } else if self.preview.is_some() {
+            &[("y", "sync root"), ("↑↓", "scroll"), ("Esc", "cancel")]
+        } else {
+            &[
+                ("s", "sync"),
+                ("p/P", "push/pull"),
+                ("a", "configure"),
+                ("d", "disable auto"),
+                ("Esc", "close"),
+            ]
         }
-        &[
-            ("←→", "remote"),
-            ("Space", "select"),
-            ("b", "bind"),
-            ("x", "unbind"),
-            ("p/P", "push/pull"),
-            ("a", "add"),
-            ("/", "filter"),
-            ("Esc", "close"),
-        ]
     }
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
-        let result = if let Some((fields, at)) = &mut self.adding {
-            fields[*at].paste(text)
-        } else if self.editing {
-            self.filter.paste(text)
-        } else {
-            return vec![];
-        };
-        match result {
-            Ok(_) => vec![],
-            Err(e) => vec![Action::Error(e.into())],
+        if let Some((fields, at)) = &mut self.adding
+            && let Err(e) = fields[*at].paste(text)
+        {
+            return vec![Action::Error(e.into())];
         }
+        vec![]
     }
     pub fn key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if let Some((request, changes)) = &self.preview {
+        if self.adding.is_none() {
+            match key.code {
+                KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
+                KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+                KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+                KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+                _ => {}
+            }
+        }
+        if let Some((request, _)) = &self.preview {
             return match key.code {
                 KeyCode::Esc => vec![Action::CloseModal],
-                KeyCode::Char('y') if !changes.is_empty() => {
-                    let mut request = request.clone();
-                    request.dry_run = false;
-                    vec![Action::CloseModal, Action::Spawn(Task::Sync(request))]
-                }
-                KeyCode::Down => {
-                    self.cursor = self.cursor.saturating_add(1);
-                    vec![]
-                }
-                KeyCode::Up => {
-                    self.cursor = self.cursor.saturating_sub(1);
-                    vec![]
-                }
+                KeyCode::Char('y') => vec![
+                    Action::CloseModal,
+                    Action::Spawn(Task::Sync(Request {
+                        dry_run: false,
+                        ..request.clone()
+                    })),
+                ],
                 _ => vec![],
             };
         }
         if let Some((fields, at)) = &mut self.adding {
             match key.code {
                 KeyCode::Esc => self.adding = None,
-                KeyCode::Tab => *at = (*at + 1) % 3,
-                KeyCode::BackTab => *at = (*at + 2) % 3,
+                KeyCode::Tab | KeyCode::BackTab => *at = 1 - *at,
                 KeyCode::Enter => {
-                    let result = self.settings.add(
+                    match sync::configure(
                         ctx.ws,
                         fields[0].value().trim(),
                         fields[1].value().trim(),
-                        fields[2].value().trim(),
-                    );
-                    match result {
+                    ) {
                         Ok(()) => {
-                            self.adding = None;
-                            return vec![Action::Toast(
-                                "Sync destination registered; nothing uploaded".into(),
-                            )];
+                            return vec![
+                                Action::CloseModal,
+                                Action::Rescan,
+                                Action::Toast("Root auto-sync enabled".into()),
+                            ];
                         }
                         Err(e) => return vec![Action::Error(format!("{e:#}"))],
                     }
@@ -164,334 +115,170 @@ impl SyncPicker {
             }
             return vec![];
         }
-        if self.editing {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Down => self.editing = false,
-                _ => {
-                    self.filter.handle_key(key);
-                    self.cursor = 0;
-                }
-            }
-            return vec![];
-        }
-        let visible = self.visible();
         match key.code {
-            KeyCode::Esc => return vec![Action::CloseModal],
-            KeyCode::Char('/') => self.editing = true,
+            KeyCode::Esc => vec![Action::CloseModal],
             KeyCode::Char('a') => {
+                self.scroll = 0;
                 self.adding = Some((
                     [
-                        Input::default(),
-                        Input::default(),
-                        Input::with_value("main"),
+                        Input::with_value(self.settings.url.as_deref().unwrap_or("")),
+                        Input::with_value(self.settings.branch.as_deref().unwrap_or("main")),
                     ],
                     0,
-                ))
+                ));
+                vec![]
             }
-            KeyCode::Left => self.remote = self.remote.saturating_sub(1),
-            KeyCode::Right => {
-                self.remote = (self.remote + 1).min(self.settings.remotes.len().saturating_sub(1))
-            }
-            KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down => self.cursor = (self.cursor + 1).min(visible.len().saturating_sub(1)),
-            KeyCode::Char(' ') => {
-                if let Some(k) = visible.get(self.cursor)
-                    && !self.selected.remove(k)
-                {
-                    self.selected.insert(k.clone());
+            KeyCode::Char('d') => match sync::disable(ctx.ws) {
+                Ok(()) => {
+                    self.settings.enabled = false;
+                    vec![Action::Toast(
+                        "Automatic root sync disabled; Git history retained".into(),
+                    )]
                 }
-            }
-            KeyCode::Char('g' | 'l') => {
-                let git = key.code == KeyCode::Char('g');
-                self.selected = ctx
-                    .snap
-                    .skills
-                    .iter()
-                    .filter(|s| {
-                        visible.contains(&s.key)
-                            && s.source
-                                .as_ref()
-                                .map(|source| source.kind())
-                                .unwrap_or("local")
-                                == if git { "git" } else { "local" }
-                    })
-                    .map(|s| s.key.clone())
-                    .collect();
-            }
-            KeyCode::Char('b' | 'x') => {
-                let targets = self.targets();
-                if targets.is_empty() {
-                    return vec![Action::Error("Select skills first".into())];
-                }
-                let remote = if key.code == KeyCode::Char('b') {
-                    match self.remote() {
-                        Some(r) => Some(r),
-                        None => return vec![Action::Error("Add a sync destination first".into())],
-                    }
-                } else {
-                    None
-                };
-                match self.settings.bind(ctx.ws, &targets, remote.as_deref()) {
-                    Ok(()) => {
-                        return vec![Action::Toast(format!(
-                            "{} bindings changed. Previous remote copies/history remain; nothing uploaded.",
-                            targets.len()
-                        ))];
-                    }
-                    Err(e) => return vec![Action::Error(format!("{e:#}"))],
-                }
-            }
-            KeyCode::Char('p' | 'P') => {
-                let Some(remote) = self.remote() else {
-                    return vec![Action::Error("Add a sync destination first".into())];
-                };
-                let keys = if self.selected.is_empty() {
-                    vec![]
-                } else {
-                    self.targets()
-                };
-                if !self.selected.is_empty() && keys.is_empty() {
-                    return vec![Action::Error(
-                        "No selected skills match the current filter".into(),
-                    )];
-                }
-                return vec![
-                    Action::CloseModal,
-                    Action::Spawn(Task::Sync(Request {
-                        remote,
-                        push: key.code == KeyCode::Char('p'),
-                        keys,
-                        dry_run: true,
-                    })),
-                ];
-            }
-            _ => {}
+                Err(e) => vec![Action::Error(format!("{e:#}"))],
+            },
+            KeyCode::Char('s' | 'p' | 'P') => vec![
+                Action::CloseModal,
+                Action::Spawn(Task::Sync(Request {
+                    mode: match key.code {
+                        KeyCode::Char('p') => Mode::Push,
+                        KeyCode::Char('P') => Mode::Pull,
+                        _ => Mode::Sync,
+                    },
+                    dry_run: true,
+                })),
+            ],
+            _ => vec![],
         }
-        vec![]
     }
-    pub fn mouse(&mut self, event: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.list_area.contains((event.column, event.row).into())
-            && self.preview.is_none()
-            && self.adding.is_none()
-        {
+    pub fn mouse(&mut self, event: MouseEvent, _: &Ctx) -> Vec<Action> {
+        if self.adding.is_none() {
             match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    self.cursor = self.offset + usize::from(event.row - self.list_area.y);
-                    self.cursor = self.cursor.min(self.visible().len().saturating_sub(1));
-                }
-                MouseEventKind::ScrollDown => {
-                    return self.key(
-                        KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE),
-                        ctx,
-                    );
-                }
-                MouseEventKind::ScrollUp => {
-                    return self.key(
-                        KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE),
-                        ctx,
-                    );
-                }
+                MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_add(3),
+                MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
                 _ => {}
             }
         }
         vec![]
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let rect = Rect::new(
+        let area = Rect::new(
             area.x + 1,
             area.y + 1,
             area.width.saturating_sub(2),
             area.height.saturating_sub(2),
         );
-        f.render_widget(OverlayClear, rect);
-        let block = ctx
-            .settings
-            .theme
-            .block(" Sync destinations · Ctrl-B ", true);
-        let inner = block.inner(rect);
-        f.render_widget(block, rect);
-        if let Some((fields, at)) = &mut self.adding {
-            let mut lines = vec![Line::from(
-                "Register a destination (does not upload anything)",
-            )];
-            for (i, label) in ["Name", "Git URL / path", "Branch"].iter().enumerate() {
-                lines.push(Line::from(format!(
-                    "{} {label}: {}",
-                    if i == *at { ">" } else { " " },
-                    fields[i].value()
-                )));
-            }
-            lines.push(Line::from(
-                "Tab: next field · Enter: register · Esc: cancel",
-            ));
-            f.render_widget(Paragraph::new(lines), inner);
-            return;
-        }
-        if let Some((request, changes)) = &self.preview {
-            let mut lines = vec![
-                Line::from(format!(
-                    "Preview: {} {}",
-                    if request.push { "push to" } else { "pull from" },
-                    request.remote
-                )),
-                Line::from("y: apply · Esc: cancel · ↑↓: scroll"),
-            ];
-            lines.extend(
-                changes
-                    .iter()
-                    .map(|c| Line::from(format!("{}  {}", c.action, c.skill))),
-            );
-            if changes.is_empty() {
-                lines.push(Line::from("No skills to sync."));
-            }
-            f.render_widget(
-                Paragraph::new(lines).scroll((self.cursor.min(u16::MAX as usize) as u16, 0)),
-                inner,
-            );
-            return;
-        }
-        let remote = self
-            .remote()
-            .unwrap_or_else(|| "(none — press a to add)".into());
-        let url = self
-            .settings
-            .remotes
-            .get(&remote)
-            .map(|r| format!("{} [{}]", r.url, r.branch))
-            .unwrap_or_default();
-        let header = vec![
-            Line::from(format!("←→ Destination: {remote}  {url}")),
-            Line::from("Unbound stays local · g/l: select Git/local · b: bind/switch · x: unbind"),
-            Line::from("p: preview push · P: preview pull · no selection = all for destination"),
-            Line::from(format!(
-                "{} Filter: {}",
-                if self.editing { ">" } else { "/" },
-                self.filter.value()
-            )),
-        ];
-        f.render_widget(
-            Paragraph::new(header),
-            Rect::new(inner.x, inner.y, inner.width, 4.min(inner.height)),
-        );
-        self.list_area = Rect::new(
-            inner.x,
-            inner.y + 4.min(inner.height),
-            inner.width,
-            inner.height.saturating_sub(4),
-        );
-        let visible = self.visible();
-        let items: Vec<_> = visible
-            .iter()
-            .map(|k| {
-                ListItem::new(format!(
-                    "{} {k}  → {}",
-                    if self.selected.contains(k) {
-                        "[x]"
-                    } else {
-                        "[ ]"
-                    },
-                    self.settings
-                        .bindings
-                        .get(k)
-                        .map(|b| b.remote.as_str())
-                        .unwrap_or("local only")
-                ))
+        f.render_widget(OverlayClear, area);
+        let block = ctx.settings.theme.block(" Root Git sync · Ctrl-B ", true);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let text = if let Some((fields, at)) = &self.adding {
+            format!(
+                "Configure whole-root automatic backup\n\n{} URL: {}\n{} Branch: {}\n\nEnter enables automatic commit, pull and push. Skills, notes, presets and configuration (including machine paths) are shared. Deletions propagate. Runtime files stay local. Use an empty remote or a clone of an existing root repository.",
+                if *at == 0 { ">" } else { " " },
+                fields[0].value(),
+                if *at == 1 { ">" } else { " " },
+                fields[1].value()
+            )
+        } else if let Some((request, report)) = &self.preview {
+            format!(
+                "Root: {}\nMode: {:?}\n\nLocal Git status:\n{}\n\ny: save local changes and execute; remote state is checked again. Conflicts stop sync and preserve the local commit.",
+                ctx.ws.root.display(),
+                request.mode,
+                if report.status.is_empty() {
+                    "Clean"
+                } else {
+                    &report.status
+                }
+            )
+        } else {
+            format!(
+                "Root: {}\nRemote: {}\nBranch: {}\nAutomatic sync: {}\n\nThe root is the Git working tree. After changes and on startup, save local work, merge remote updates and push.\n\nSkills, metadata, tags, notes and presets are included. Runtime locks, staging and backups are excluded.\n\ns: preview sync · p: push · P: pull\na: configure/enable · d: disable automatic sync\n\nConflicts require Git resolution; no force push or reset is performed.",
+                ctx.ws.root.display(),
+                self.settings.url.as_deref().unwrap_or("Not configured"),
+                self.settings.branch.as_deref().unwrap_or("—"),
+                self.settings.enabled
+            )
+        };
+        let rows = text
+            .lines()
+            .map(|line| {
+                super::widgets::width(line)
+                    .div_ceil(usize::from(inner.width.max(1)))
+                    .max(1)
             })
-            .collect();
-        let mut state = ListState::default()
-            .with_selected(Some(self.cursor))
-            .with_offset(self.offset);
-        f.render_stateful_widget(
-            List::new(items)
-                .highlight_style(
-                    ratatui::style::Style::default().bg(ctx.settings.theme.selection_bg),
-                )
-                .highlight_symbol("› "),
-            self.list_area,
-            &mut state,
+            .sum::<usize>();
+        self.scroll = self.scroll.min(
+            rows.saturating_sub(usize::from(inner.height))
+                .min(u16::MAX as usize) as u16,
         );
-        self.offset = state.offset();
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll, 0)),
+            inner,
+        );
     }
 }
 pub fn open(ctx: &Ctx) -> Modal {
     match SyncPicker::new(ctx) {
         Ok(p) => Modal::Sync(Box::new(p)),
-        Err(e) => Modal::message("Sync error", vec![format!("{e:#}")]),
+        Err(e) => Modal::message("Root sync", vec![format!("{e:#}")]),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
     #[test]
-    fn filtered_bindings_and_transfer_preview_require_explicit_execution() {
-        let tmp = skills::ops::DownloadDir::new("sync-picker-test").unwrap();
-        let mut ws = skills::Workspace::open(tmp.path()).unwrap();
-        ws.config.agents.clear();
-        for key in ["open", "secret"] {
-            std::fs::create_dir_all(ws.skill_path(key)).unwrap();
-            std::fs::write(
-                ws.skill_path(key).join("SKILL.md"),
-                "---\nname: test\ndescription: test\n---\ncontent",
-            )
-            .unwrap();
-        }
-        Settings::load(&ws)
-            .unwrap()
-            .add(&ws, "public", "https://example.com/backup.git", "main")
-            .unwrap();
+    fn root_sync_preview_requires_confirmation_and_renders_without_skill_bindings() {
+        let temp = skills::ops::DownloadDir::new("root-sync-dialog").unwrap();
+        let ws = skills::Workspace::open(temp.path()).unwrap();
         let snap = ws.scan().unwrap();
-        let settings = super::super::settings::RuntimeSettings::new(&ws.config);
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
         let ctx = Ctx {
             ws: &ws,
             snap: &snap,
             settings: &settings,
         };
         let mut picker = SyncPicker::new(&ctx).unwrap();
-        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
-        picker.key(key(KeyCode::Char('l')), &ctx);
-        picker.filter.set("open");
-        picker.key(key(KeyCode::Char('b')), &ctx);
-        let settings = Settings::load(&ws).unwrap();
-        assert!(settings.bindings.contains_key("open"));
-        assert!(!settings.bindings.contains_key("secret"));
-        let actions = picker.key(key(KeyCode::Char('p')), &ctx);
-        assert!(actions.iter().any(
-            |a| matches!(a, Action::Spawn(Task::Sync(r)) if r.dry_run && r.keys == vec!["open"])
+        assert!(matches!(
+            picker.key(KeyCode::Char('s').into(), &ctx).as_slice(),
+            [
+                Action::CloseModal,
+                Action::Spawn(Task::Sync(Request { dry_run: true, .. }))
+            ]
         ));
-        picker.filter.set("no matches");
-        assert!(
-            picker
-                .key(key(KeyCode::Char('p')), &ctx)
-                .iter()
-                .all(|a| !matches!(a, Action::Spawn(_)))
-        );
-        picker.filter.set("open");
-        let request = Request {
-            remote: "public".into(),
-            push: true,
-            keys: vec![],
-            dry_run: true,
-        };
-        let mut preview = SyncPicker::preview(
+        let mut picker = SyncPicker::preview(
             &ctx,
-            request,
-            vec![Change {
-                skill: "open".into(),
-                action: "push".into(),
-            }],
+            Request {
+                mode: Mode::Sync,
+                dry_run: true,
+            },
+            Report::default(),
         )
         .unwrap();
-        assert!(preview.key(key(KeyCode::Enter), &ctx).is_empty());
-        assert!(preview.key(key(KeyCode::Char('y')), &ctx).iter().any(
-            |a| matches!(a, Action::Spawn(Task::Sync(r)) if !r.dry_run && r.keys == vec!["open"])
+        assert!(picker.key(KeyCode::Enter.into(), &ctx).is_empty());
+        assert!(matches!(
+            picker.key(KeyCode::Char('y').into(), &ctx).as_slice(),
+            [
+                Action::CloseModal,
+                Action::Spawn(Task::Sync(Request { dry_run: false, .. }))
+            ]
         ));
-        for (width, height) in [(100, 26), (40, 12), (12, 5)] {
+        for (width, height) in [(80, 24), (48, 12)] {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
-            terminal.draw(|f| preview.draw(f, f.area(), &ctx)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("Root Git sync"));
         }
+        assert!(!ws.root.join(".git").exists());
     }
 }

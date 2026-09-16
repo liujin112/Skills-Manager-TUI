@@ -113,16 +113,6 @@ impl Report {
         lines
     }
 }
-fn unbound(ws: &Workspace, old: &str, new: Option<&str>) -> Result<()> {
-    let settings = super::sync::Settings::load(ws)?;
-    for key in std::iter::once(old).chain(new) {
-        ensure!(
-            !settings.bindings.contains_key(key) && !settings.excluded.contains(key),
-            "sync binding/exclusion needs manual migration"
-        );
-    }
-    Ok(())
-}
 fn validate(ws: &Workspace, item: &Item, snap: &Snapshot) -> Result<()> {
     let Some(action) = &item.action else {
         return Ok(());
@@ -137,7 +127,6 @@ fn validate(ws: &Workspace, item: &Item, snap: &Snapshot) -> Result<()> {
     }
     match action {
         Repair::Migrate { to, explicit } => {
-            unbound(ws, &item.skill, Some(to))?;
             if !explicit {
                 ensure!(
                     matches!(snap.get(&item.skill).map(|s| &s.status), Some(SkillStatus::Renamed { to: current }) if current == to),
@@ -535,7 +524,7 @@ pub fn run_with_options(ws: &Workspace, apply_changes: bool, options: &Options) 
 }
 
 /// Reconcile on interactive startup: migrate unique moves, then archive absent records.
-/// Preserve skill contents, sync bindings, and external/broken links for explicit review.
+/// Preserve skill contents, external/broken links for explicit review.
 pub fn startup(ws: &Workspace) -> Result<Report> {
     let preview = plan(
         ws,

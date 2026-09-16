@@ -1,27 +1,24 @@
 use skills::{
     Workspace,
     ops::{
-        DownloadDir, git, install,
-        sync::{self, Settings},
+        DownloadDir, git,
+        sync::{self, Mode},
     },
 };
-use std::path::Path;
-fn workspace(path: &Path) -> Workspace {
-    std::fs::create_dir_all(path).unwrap();
-    let mut ws = Workspace::open(path).unwrap();
-    ws.config.agents.clear();
-    ws
+use std::{fs, path::Path, process::Command};
+fn ws(path: &Path) -> Workspace {
+    fs::create_dir_all(path).unwrap();
+    Workspace::open(path).unwrap()
 }
-fn skill(ws: &Workspace, key: &str, text: &str) {
-    let path = ws.skill_path(key);
-    std::fs::create_dir_all(&path).unwrap();
-    std::fs::write(
-        path.join("SKILL.md"),
-        format!("---\nname: test\ndescription: test\n---\n{text}"),
-    )
-    .unwrap();
+fn write(ws: &Workspace, name: &str, text: &str) {
+    let path = ws.root.join(name);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, text).unwrap();
 }
-fn remote(ws: &Workspace, name: &str, path: &Path) {
+fn run(ws: &Workspace) -> anyhow::Result<sync::Report> {
+    sync::run(ws, Mode::Sync, false, &mut |_| {})
+}
+fn remote(path: &Path) {
     git(
         &[
             "init",
@@ -32,401 +29,397 @@ fn remote(ws: &Workspace, name: &str, path: &Path) {
         None,
     )
     .unwrap();
-    Settings::load(ws)
-        .unwrap()
-        .add(ws, name, path.to_str().unwrap(), "main")
-        .unwrap();
 }
-fn run(ws: &Workspace, name: &str, push: bool) -> anyhow::Result<Vec<sync::Change>> {
-    sync::run(ws, name, push, &[], false, &mut |_| {})
+fn configure(ws: &Workspace, path: &Path) {
+    sync::configure(ws, path.to_str().unwrap(), "main").unwrap();
 }
-#[test]
-fn multiple_remotes_roundtrip_binding_switch_and_conflicts() {
-    let tmp = DownloadDir::new("sync-test").unwrap();
-    let ws = workspace(&tmp.path().join("one"));
-    let public = tmp.path().join("public.git");
-    let private = tmp.path().join("private.git");
-    remote(&ws, "public", &public);
-    remote(&ws, "private", &private);
-    skill(&ws, "local/open", "public skill");
-    skill(&ws, "local/secret", "private skill");
-    skill(&ws, "local/unbound", "never upload");
-    let mut settings = Settings::load(&ws).unwrap();
-    settings
-        .bind(&ws, &["local/open".into()], Some("public"))
-        .unwrap();
-    settings
-        .bind(&ws, &["local/secret".into()], Some("private"))
-        .unwrap();
-    run(&ws, "public", true).unwrap();
-    run(&ws, "private", true).unwrap();
-    let tree = git(&["ls-tree", "-r", "--name-only", "main"], Some(&public)).unwrap();
-    assert!(tree.contains("skills/local/open/SKILL.md"));
-    assert!(
-        !tree.contains("secret") && !tree.contains("unbound") && !tree.contains(".skills-meta")
-    );
-    let two = workspace(&tmp.path().join("two"));
-    Settings::load(&two)
-        .unwrap()
-        .add(&two, "public", public.to_str().unwrap(), "main")
-        .unwrap();
-    run(&two, "public", false).unwrap();
-    assert!(two.skill_path("local/open/SKILL.md").exists());
-    assert!(!two.skill_path("local/secret").exists());
-    skill(&two, "local/open", "second machine edit");
-    run(&two, "public", true).unwrap();
-    skill(&ws, "local/open", "first machine conflict");
-    assert!(
-        run(&ws, "public", false)
-            .unwrap_err()
-            .to_string()
-            .contains("conflict")
-    );
-    assert!(
-        run(&ws, "public", true)
-            .unwrap_err()
-            .to_string()
-            .contains("conflict")
-    );
-    assert!(
-        std::fs::read_to_string(ws.skill_path("local/open/SKILL.md"))
-            .unwrap()
-            .contains("first machine")
-    );
-    // Switching a destination preserves source/content and leaves previous remote history.
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["local/open".into()], Some("private"))
-        .unwrap();
-    run(&ws, "private", true).unwrap();
-    assert!(
-        git(&["show", "main:skills/local/open/SKILL.md"], Some(&public))
-            .unwrap()
-            .contains("second machine")
-    );
-    assert!(
-        git(&["show", "main:skills/local/open/SKILL.md"], Some(&private))
-            .unwrap()
-            .contains("first machine")
-    );
+fn head(ws: &Workspace) -> String {
+    git(&["rev-parse", "HEAD"], Some(&ws.root)).unwrap()
 }
 #[test]
-fn dry_run_symlinks_unbound_and_remote_races_are_safe() {
-    let tmp = DownloadDir::new("sync-safe").unwrap();
-    let ws = workspace(&tmp.path().join("root"));
-    let bare = tmp.path().join("remote.git");
-    remote(&ws, "backup", &bare);
-    skill(&ws, "safe", "content");
-    assert!(sync::run(&ws, "backup", true, &["safe".into()], false, &mut |_| {}).is_err());
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["safe".into()], Some("backup"))
-        .unwrap();
-    sync::run(&ws, "backup", true, &[], true, &mut |_| {}).unwrap();
+fn whole_root_roundtrip_includes_metadata_deletions_and_merges_independent_edits() {
+    let tmp = DownloadDir::new("root-sync").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "local/a/SKILL.md", "initial");
+    write(&one, ".skills-meta/notes.toml", "note = 'shared'");
+    write(
+        &one,
+        ".skills-meta/presets/sample.toml",
+        "name = 'sample'\nskills = []",
+    );
+    for name in [
+        ".skills-meta/.staging/tmp",
+        ".skills-meta/.repair-backups/old.toml",
+        ".skills-meta/backups/old.toml",
+        ".skills-meta/.sync/settings.json",
+        ".skills-meta/.metadata.lock",
+    ] {
+        write(&one, name, "runtime");
+    }
+    assert!(run(&one).unwrap().committed);
+    let tree = git(&["ls-tree", "-r", "--name-only", "HEAD"], Some(&one.root)).unwrap();
     assert!(
-        git(&["ls-remote", bare.to_str().unwrap()], None)
+        tree.contains("local/a/SKILL.md")
+            && tree.contains(".skills-meta/notes.toml")
+            && tree.contains(".skills-meta/presets/sample.toml")
+    );
+    assert!(
+        !tree.contains(".staging")
+            && !tree.contains(".repair-backups")
+            && !tree.contains("backups/")
+            && !tree.contains(".sync/")
+            && !tree.contains(".lock")
+    );
+    let before = head(&one);
+    assert!(!run(&one).unwrap().committed);
+    assert_eq!(before, head(&one));
+    let two = ws(&tmp.path().join("two"));
+    configure(&two, &repo);
+    assert!(run(&two).unwrap().pulled);
+    assert_eq!(
+        fs::read_to_string(two.root.join(".skills-meta/notes.toml")).unwrap(),
+        "note = 'shared'"
+    );
+    write(&one, "first.txt", "first machine");
+    run(&one).unwrap();
+    write(&two, "second.txt", "second machine");
+    let report = run(&two).unwrap();
+    assert!(report.committed && report.pulled && report.pushed);
+    run(&one).unwrap();
+    assert!(one.root.join("second.txt").exists());
+    fs::remove_dir_all(one.root.join("local/a")).unwrap();
+    run(&one).unwrap();
+    run(&two).unwrap();
+    assert!(!two.root.join("local/a").exists());
+}
+#[test]
+fn conflicts_abort_merge_and_retain_local_backup_then_allow_retry() {
+    let tmp = DownloadDir::new("root-conflict").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "shared", "base\n");
+    run(&one).unwrap();
+    let two = ws(&tmp.path().join("two"));
+    configure(&two, &repo);
+    run(&two).unwrap();
+    write(&one, "shared", "remote\n");
+    run(&one).unwrap();
+    write(&two, "shared", "local\n");
+    assert!(
+        run(&two)
+            .unwrap_err()
+            .to_string()
+            .contains("local backup retained")
+    );
+    assert_eq!(
+        fs::read_to_string(two.root.join("shared")).unwrap(),
+        "local\n"
+    );
+    assert!(!two.root.join(".git/MERGE_HEAD").exists());
+    assert!(
+        git(&["status", "--porcelain"], Some(&two.root))
             .unwrap()
             .is_empty()
     );
-    assert!(
-        Settings::load(&ws).unwrap().bindings["safe"]
-            .baseline
-            .is_none()
-    );
-    std::os::unix::fs::symlink(tmp.path(), ws.skill_path("safe/escape")).unwrap();
-    assert!(run(&ws, "backup", true).is_err());
-    std::fs::remove_file(ws.skill_path("safe/escape")).unwrap();
-    run(&ws, "backup", true).unwrap();
-    assert_eq!(run(&ws, "backup", true).unwrap()[0].action, "unchanged");
-}
-#[test]
-fn imported_git_skill_keeps_source_and_modified_baseline_without_local_paths_or_notes() {
-    let tmp = DownloadDir::new("sync-source").unwrap();
-    let ws = workspace(&tmp.path().join("root"));
-    let source = tmp.path().join("source");
-    std::fs::create_dir_all(&source).unwrap();
-    std::fs::write(
-        source.join("SKILL.md"),
-        "---\nname: example\ndescription: test\n---\noriginal",
-    )
-    .unwrap();
-    git(&["init", "--initial-branch=main"], Some(&source)).unwrap();
-    git(&["add", "."], Some(&source)).unwrap();
-    git(
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "initial",
-        ],
-        Some(&source),
-    )
-    .unwrap();
-    let key = install::install(
-        &ws,
-        &install::InstallRef::Git {
-            url: source.to_string_lossy().into_owned(),
-            branch: Some("main".into()),
-            subpath: None,
-        },
-        Some("example"),
-    )
-    .unwrap();
-    skill(&ws, &key, "local modification");
-    let bare = tmp.path().join("remote.git");
-    remote(&ws, "backup", &bare);
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, std::slice::from_ref(&key), Some("backup"))
-        .unwrap();
-    run(&ws, "backup", true).unwrap();
-    let two = workspace(&tmp.path().join("two"));
-    Settings::load(&two)
-        .unwrap()
-        .add(&two, "backup", bare.to_str().unwrap(), "main")
-        .unwrap();
-    run(&two, "backup", false).unwrap();
     assert_eq!(
-        two.meta.load(&key).unwrap().unwrap().source,
-        ws.meta.load(&key).unwrap().unwrap().source
+        git(&["show", "HEAD:shared"], Some(&repo)).unwrap(),
+        "remote\n"
     );
+    git(
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgSign=false",
+            "merge",
+            "--no-edit",
+            "-X",
+            "ours",
+            "refs/remotes/origin/skills-root-sync",
+        ],
+        Some(&two.root),
+    )
+    .unwrap();
+    run(&two).unwrap();
+    run(&one).unwrap();
     assert_eq!(
-        two.scan().unwrap().get(&key).unwrap().status,
-        skills::reconcile::SkillStatus::Modified
+        fs::read_to_string(one.root.join("shared")).unwrap(),
+        "local\n"
     );
 }
 #[test]
-fn pull_rejects_manifest_traversal_and_symlink_ancestors() {
-    let tmp = DownloadDir::new("sync-hostile").unwrap();
-    let ws = workspace(&tmp.path().join("root"));
-    let bare = tmp.path().join("remote.git");
-    remote(&ws, "backup", &bare);
-    skill(&ws, "local/example", "content");
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["local/example".into()], Some("backup"))
-        .unwrap();
-    run(&ws, "backup", true).unwrap();
-    let two = workspace(&tmp.path().join("two"));
-    Settings::load(&two)
-        .unwrap()
-        .add(&two, "backup", bare.to_str().unwrap(), "main")
-        .unwrap();
-    let outside = tmp.path().join("outside");
-    std::fs::create_dir_all(&outside).unwrap();
-    std::os::unix::fs::symlink(&outside, two.root.join("local")).unwrap();
-    assert!(run(&two, "backup", false).is_err());
-    assert!(!outside.join("example").exists());
-    std::fs::remove_file(two.root.join("local")).unwrap();
-    let checkout = tmp.path().join("hostile");
-    git(
-        &["clone", bare.to_str().unwrap(), checkout.to_str().unwrap()],
-        None,
-    )
-    .unwrap();
-    std::fs::write(
-        checkout.join(".skills-sync.json"),
-        r#"{"skills":{"../outside":{"hash":"bad","source":null}}}"#,
-    )
-    .unwrap();
-    git(&["add", "."], Some(&checkout)).unwrap();
-    git(
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "hostile",
-        ],
-        Some(&checkout),
-    )
-    .unwrap();
-    git(&["push"], Some(&checkout)).unwrap();
-    assert!(
-        run(&two, "backup", false)
-            .unwrap_err()
-            .to_string()
-            .contains("invalid skill")
+fn preview_disable_offline_and_lock_preserve_work() {
+    let tmp = DownloadDir::new("root-offline").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "file", "first");
+    run(&one).unwrap();
+    let before = head(&one);
+    write(&one, "file", "next");
+    let preview = sync::run(&one, Mode::Sync, true, &mut |_| {}).unwrap();
+    assert!(preview.preview);
+    assert_eq!(before, head(&one));
+    sync::disable(&one).unwrap();
+    assert!(sync::automatic(&one).unwrap().is_none());
+    assert_eq!(before, head(&one));
+    configure(&one, &repo);
+    fs::write(one.root.join(".git/skills-sync.lock"), "").unwrap();
+    assert!(run(&one).is_err());
+    fs::remove_file(one.root.join(".git/skills-sync.lock")).unwrap();
+    fs::rename(&repo, tmp.path().join("offline.git")).unwrap();
+    assert!(run(&one).is_err());
+    assert_ne!(before, head(&one));
+    assert_eq!(
+        git(&["show", "HEAD:file"], Some(&one.root)).unwrap(),
+        "next"
     );
+    assert!(!one.root.join(".git/skills-sync.lock").exists());
+    fs::rename(tmp.path().join("offline.git"), &repo).unwrap();
+    run(&one).unwrap();
 }
 #[test]
-fn direct_remote_edits_and_new_skills_pull_without_republishing_unbound_skills() {
-    let tmp = DownloadDir::new("sync-direct").unwrap();
-    let ws = workspace(&tmp.path().join("root"));
-    let bare = tmp.path().join("remote.git");
-    remote(&ws, "backup", &bare);
-    skill(&ws, "example", "before");
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["example".into()], Some("backup"))
-        .unwrap();
-    run(&ws, "backup", true).unwrap();
-    let checkout = tmp.path().join("editor");
-    git(
-        &["clone", bare.to_str().unwrap(), checkout.to_str().unwrap()],
-        None,
-    )
-    .unwrap();
-    std::fs::write(
-        checkout.join("skills/example/SKILL.md"),
-        "---\nname: example\ndescription: test\n---\nremote edit",
-    )
-    .unwrap();
-    std::fs::create_dir_all(checkout.join("skills/new")).unwrap();
-    std::fs::write(
-        checkout.join("skills/new/SKILL.md"),
-        "---\nname: new\ndescription: test\n---\nnew skill",
-    )
-    .unwrap();
-    git(&["add", "."], Some(&checkout)).unwrap();
-    git(
-        &[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-m",
-            "manual edits",
-        ],
-        Some(&checkout),
-    )
-    .unwrap();
-    git(&["push"], Some(&checkout)).unwrap();
-    run(&ws, "backup", false).unwrap();
-    assert!(
-        std::fs::read_to_string(ws.skill_path("example/SKILL.md"))
-            .unwrap()
-            .contains("remote edit")
-    );
-    assert!(ws.skill_path("new/SKILL.md").is_file());
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["example".into()], None)
-        .unwrap();
-    run(&ws, "backup", false).unwrap();
-    assert!(
-        !Settings::load(&ws)
-            .unwrap()
-            .bindings
-            .contains_key("example")
-    );
-}
-
-#[test]
-fn cli_keeps_json_clean_and_dry_run_does_not_publish() {
-    let tmp = DownloadDir::new("sync-cli").unwrap();
-    let ws = workspace(&tmp.path().join("root"));
-    let bare = tmp.path().join("remote.git");
-    remote(&ws, "backup", &bare);
-    skill(&ws, "example", "content");
-    let command = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_skills"))
-            .arg("--root")
-            .arg(&ws.root)
-            .arg("--json")
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    let bound = command(&["sync", "bind", "example", "--repo", "backup"]);
-    assert!(
-        bound.status.success(),
-        "{}",
-        String::from_utf8_lossy(&bound.stderr)
-    );
-    let preview = command(&["sync", "push", "--repo", "backup", "--dry-run"]);
-    assert!(
-        preview.status.success(),
-        "{}",
-        String::from_utf8_lossy(&preview.stderr)
-    );
-    let json: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
-    assert_eq!(json[0]["changes"][0]["action"], "push");
-    assert!(
-        git(&["ls-remote", bare.to_str().unwrap()], None)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(!command(&["sync", "push"]).status.success());
-    assert!(!command(&["sync", "--dry-run"]).status.success());
+fn rejects_nested_repos_wrong_branch_and_unrelated_remote_without_overwrite() {
+    let tmp = DownloadDir::new("root-guards").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "file", "remote");
+    run(&one).unwrap();
+    let two = ws(&tmp.path().join("two"));
+    write(&two, "file", "local");
+    configure(&two, &repo);
+    assert!(run(&two).is_err());
+    assert_eq!(fs::read_to_string(two.root.join("file")).unwrap(), "local");
+    git(&["checkout", "-b", "other"], Some(&one.root)).unwrap();
+    assert!(run(&one).is_err());
+    git(&["checkout", "main"], Some(&one.root)).unwrap();
+    let nested = one.root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    git(&["init"], Some(&nested)).unwrap();
+    assert!(run(&one).unwrap_err().to_string().contains("nested Git"));
 }
 #[test]
-fn switching_back_reuses_the_previous_remote_checkpoint() {
-    let tmp = DownloadDir::new("sync-switch-back").unwrap();
-    let ws = workspace(&tmp.path().join("root"));
-    remote(&ws, "public", &tmp.path().join("public.git"));
-    remote(&ws, "private", &tmp.path().join("private.git"));
-    skill(&ws, "example", "first");
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["example".into()], Some("public"))
-        .unwrap();
-    run(&ws, "public", true).unwrap();
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["example".into()], Some("private"))
-        .unwrap();
-    skill(&ws, "example", "second");
-    run(&ws, "private", true).unwrap();
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &["example".into()], Some("public"))
-        .unwrap();
-    run(&ws, "public", true).unwrap();
-    assert!(
-        git(
-            &["show", "main:skills/example/SKILL.md"],
-            Some(&tmp.path().join("public.git"))
+fn cli_operations_back_up_automatically_but_preview_is_read_only() {
+    let tmp = DownloadDir::new("root-cli").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(
+        &one,
+        "a/SKILL.md",
+        "---\nname: a\ndescription: sample\n---\nBody",
+    );
+    one.meta
+        .save(
+            "a",
+            &skills::meta::SkillMeta {
+                source: Some(skills::meta::Source::Git {
+                    url: "https://example.invalid/skills.git".into(),
+                    branch: None,
+                    subpath: None,
+                    revision: None,
+                }),
+                ..Default::default()
+            },
         )
-        .unwrap()
-        .contains("second")
+        .unwrap();
+    run(&one).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_skills"))
+        .args([
+            "--root",
+            one.root.to_str().unwrap(),
+            "note",
+            "set",
+            "a",
+            "backed up note",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let remote_files = git(&["ls-tree", "-r", "--name-only", "HEAD"], Some(&repo)).unwrap();
+    assert!(remote_files.contains(".skills-meta/"));
+    assert_eq!(
+        head(&one),
+        git(&["rev-parse", "HEAD"], Some(&repo)).unwrap()
+    );
+    let before = head(&one);
+    write(&one, "unsaved", "change");
+    let output = Command::new(env!("CARGO_BIN_EXE_skills"))
+        .args(["--root", one.root.to_str().unwrap(), "repair", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(before, head(&one));
 }
 
 #[test]
-fn archive_backup_preserves_source_and_original_baseline() {
-    let tmp = DownloadDir::new("sync-archive").unwrap();
-    let ws = workspace(&tmp.path().join("root"));
-    let key = "repos/archive/example";
-    skill(&ws, key, "original");
-    let meta = skills::meta::SkillMeta {
-        source: Some(skills::meta::Source::Archive {
-            url: "https://example.com/skills.tar.gz".into(),
-            subpath: Some("example".into()),
-            revision: Some("a".repeat(64)),
-        }),
-        baseline: Some(skills::meta::Baseline {
-            hash: skills::hash::hash_directory(&ws.skill_path(key)).unwrap(),
-            hash_algo: skills::hash::HASH_ALGO,
-        }),
-        ..Default::default()
-    };
-    ws.meta.save(key, &meta).unwrap();
-    skill(&ws, key, "local edits");
-    let bare = tmp.path().join("backup.git");
-    remote(&ws, "backup", &bare);
-    Settings::load(&ws)
-        .unwrap()
-        .bind(&ws, &[key.into()], Some("backup"))
-        .unwrap();
-    run(&ws, "backup", true).unwrap();
-    let two = workspace(&tmp.path().join("two"));
-    Settings::load(&two)
-        .unwrap()
-        .add(&two, "backup", bare.to_str().unwrap(), "main")
-        .unwrap();
-    run(&two, "backup", false).unwrap();
-    let imported = two.meta.load(key).unwrap().unwrap();
-    assert_eq!(imported.source, meta.source);
-    assert_eq!(imported.baseline, meta.baseline);
+fn explicit_pull_does_not_push_and_push_does_not_overwrite_remote_history() {
+    let tmp = DownloadDir::new("root-direction").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "one", "base");
+    run(&one).unwrap();
+    let two = ws(&tmp.path().join("two"));
+    configure(&two, &repo);
+    run(&two).unwrap();
+    write(&one, "one", "remote");
+    run(&one).unwrap();
+    let remote_head = git(&["rev-parse", "HEAD"], Some(&repo)).unwrap();
+    write(&two, "two", "local");
+    assert!(sync::run(&two, Mode::Push, false, &mut |_| {}).is_err());
     assert_eq!(
-        two.scan().unwrap().get(key).unwrap().status,
-        skills::reconcile::SkillStatus::Modified
+        git(&["rev-parse", "HEAD"], Some(&repo)).unwrap(),
+        remote_head
     );
+    let report = sync::run(&two, Mode::Pull, false, &mut |_| {}).unwrap();
+    assert!(report.pulled && !report.pushed);
+    assert_eq!(
+        git(&["rev-parse", "HEAD"], Some(&repo)).unwrap(),
+        remote_head
+    );
+    assert_eq!(fs::read_to_string(two.root.join("one")).unwrap(), "remote");
+    run(&two).unwrap();
+    assert_eq!(git(&["show", "HEAD:two"], Some(&repo)).unwrap(), "local");
+}
+
+#[test]
+fn refuses_remote_runtime_files_and_metadata_symlinks_before_checkout() {
+    let tmp = DownloadDir::new("root-unsafe").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "one", "safe");
+    run(&one).unwrap();
+    let two = ws(&tmp.path().join("two"));
+    configure(&two, &repo);
+    run(&two).unwrap();
+    write(&one, ".skills-meta/.staging/unwanted", "transient");
+    git(
+        &["add", "-f", ".skills-meta/.staging/unwanted"],
+        Some(&one.root),
+    )
+    .unwrap();
+    git(
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-m",
+            "bad runtime data",
+        ],
+        Some(&one.root),
+    )
+    .unwrap();
+    git(&["push", "origin", "main"], Some(&one.root)).unwrap();
+    let before = head(&two);
+    assert!(run(&two).unwrap_err().to_string().contains("runtime file"));
+    assert_eq!(before, head(&two));
+    assert!(!two.root.join(".skills-meta/.staging/unwanted").exists());
+    git(
+        &["rm", "--cached", ".skills-meta/.staging/unwanted"],
+        Some(&one.root),
+    )
+    .unwrap();
+    fs::create_dir_all(one.root.join(".skills-meta")).unwrap();
+    std::os::unix::fs::symlink("/tmp", one.root.join(".skills-meta/escape")).unwrap();
+    git(&["add", ".skills-meta/escape"], Some(&one.root)).unwrap();
+    git(
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-m",
+            "bad metadata symlink",
+        ],
+        Some(&one.root),
+    )
+    .unwrap();
+    git(&["push", "origin", "main"], Some(&one.root)).unwrap();
+    assert!(
+        run(&two)
+            .unwrap_err()
+            .to_string()
+            .contains("metadata cannot be a symlink")
+    );
+    assert_eq!(before, head(&two));
+}
+
+#[test]
+fn first_pull_preserves_ignored_local_files_and_legacy_backups_require_migration() {
+    let tmp = DownloadDir::new("root-bootstrap").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "private.txt", "remote contents");
+    run(&one).unwrap();
+    let two = ws(&tmp.path().join("two"));
+    configure(&two, &repo);
+    let exclude = two.root.join(".git/info/exclude");
+    let mut text = fs::read_to_string(&exclude).unwrap();
+    text.push_str("\n/private.txt\n");
+    fs::write(exclude, text).unwrap();
+    write(&two, "private.txt", "local private contents");
+    assert!(run(&two).is_err());
+    assert_eq!(
+        fs::read_to_string(two.root.join("private.txt")).unwrap(),
+        "local private contents"
+    );
+    write(&one, ".skills-sync.json", "{\"skills\":{}}");
+    git(&["add", ".skills-sync.json"], Some(&one.root)).unwrap();
+    git(
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-m",
+            "legacy layout",
+        ],
+        Some(&one.root),
+    )
+    .unwrap();
+    git(&["push", "origin", "main"], Some(&one.root)).unwrap();
+    let three = ws(&tmp.path().join("three"));
+    configure(&three, &repo);
+    assert!(
+        run(&three)
+            .unwrap_err()
+            .to_string()
+            .contains("legacy per-skill backup")
+    );
+    assert!(!three.root.join(".skills-sync.json").exists());
 }
